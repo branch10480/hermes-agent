@@ -3995,6 +3995,28 @@ class TestRunConversation:
         assert "/thinkon" in result["final_response"]
 
 
+    def test_length_structured_reasoning_exhausted_skips_continuation(self, agent):
+        """Separate reasoning_content with no answer must not auto-continue."""
+        self._setup_agent(agent)
+        resp = _mock_response(
+            content=None,
+            reasoning_content="internal DeepSeek reasoning",
+            finish_reason="length",
+        )
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["api_calls"] == 1
+        assert "Thinking Budget Exhausted" in result["final_response"]
+
+
     def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
         self._setup_agent(agent)
         bad_tc = _mock_tool_call(

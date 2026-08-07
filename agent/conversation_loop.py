@@ -3246,12 +3246,25 @@ def run_conversation(
                             re.IGNORECASE,
                         )
                     )
+                    # OpenAI-compatible reasoning endpoints such as DeepSeek
+                    # expose thinking separately from visible ``content``.
+                    # Treat that structured field as positive evidence too;
+                    # otherwise a reasoning-only length stop is mistaken for
+                    # an ordinary truncated answer and Hermes launches up to
+                    # three more full-budget continuations.
+                    _structured_reasoning = (
+                        getattr(_trunc_msg, "reasoning", None)
+                        or getattr(_trunc_msg, "reasoning_content", None)
+                    ) if _trunc_msg else None
                     _thinking_exhausted = (
                         not _trunc_has_tool_calls
-                        and _has_think_tags
+                        and (_has_think_tags or bool(_structured_reasoning))
                         and (
-                            (_trunc_content is not None and not agent._has_content_after_think_block(_trunc_content))
-                            or _trunc_content is None
+                            not (_trunc_content or "").strip()
+                            or (
+                                _has_think_tags
+                                and not agent._has_content_after_think_block(_trunc_content)
+                            )
                         )
                     )
 
