@@ -97,7 +97,6 @@ from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
 
-
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
@@ -161,6 +160,38 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
     "awaiting your next message."
 )
 
+_THINKING_BUDGET_RECOVERY_PROMPT = (
+    "[System recovery: The previous generation used its entire output budget "
+    "on internal reasoning and produced no answer. Return the final answer now "
+    "using only the evidence already present in this conversation. Do not call "
+    "tools, do not continue the analysis, and keep the answer concise.]"
+)
+_THINKING_BUDGET_RECOVERY_MAX_TOKENS = 4096
+
+
+def _apply_thinking_budget_recovery_overrides(api_kwargs: dict[str, Any]) -> None:
+    """Constrain the one-shot reasoning-exhaustion recovery request in place."""
+    api_kwargs.pop("tools", None)
+    api_kwargs.pop("tool_choice", None)
+    api_kwargs.pop("parallel_tool_calls", None)
+
+    for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+        value = api_kwargs.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            api_kwargs[key] = min(value, _THINKING_BUDGET_RECOVERY_MAX_TOKENS)
+
+    if "reasoning_effort" in api_kwargs:
+        api_kwargs["reasoning_effort"] = "low"
+
+    extra_body = api_kwargs.get("extra_body")
+    if isinstance(extra_body, dict):
+        extra_body = dict(extra_body)
+        reasoning = extra_body.get("reasoning")
+        if isinstance(reasoning, dict):
+            reasoning = dict(reasoning)
+            reasoning["effort"] = "low"
+            extra_body["reasoning"] = reasoning
+        api_kwargs["extra_body"] = extra_body
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -1580,6 +1611,8 @@ def run_conversation(
     length_continue_retries = 0
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
+    thinking_budget_recovery_attempted = False
+    thinking_budget_recovery_active = False
     compression_attempts = 0
     # One resolved per-turn compression attempt cap, shared by every site that
     # consumes ``compression_attempts``: the pre-API pressure gate, the
@@ -2056,6 +2089,31 @@ def run_conversation(
         # manual message manipulation are always caught.
         api_messages = agent._sanitize_api_messages(api_messages)
 
+        # A reasoning-only length stop gets exactly one answer-only recovery
+        # call. Inject the instruction into the request copy, never the durable
+        # transcript, so the original user turn and prompt-cache history stay
+        # clean. The request is also tool-free and low-reasoning below.
+        if thinking_budget_recovery_active:
+            for _recovery_msg in reversed(api_messages):
+                if _recovery_msg.get("role") != "user":
+                    continue
+                _recovery_content = _recovery_msg.get("content")
+                if isinstance(_recovery_content, str):
+                    _recovery_msg["content"] = (
+                        _recovery_content.rstrip()
+                        + "\n\n"
+                        + _THINKING_BUDGET_RECOVERY_PROMPT
+                    )
+                elif isinstance(_recovery_content, list):
+                    _recovery_msg["content"] = [
+                        *_recovery_content,
+                        {
+                            "type": "text",
+                            "text": "\n\n" + _THINKING_BUDGET_RECOVERY_PROMPT,
+                        },
+                    ]
+                break
+
         # Drop thinking-only assistant turns (reasoning but no visible
         # output and no tool_calls) and merge any adjacent user messages
         # left behind. Prevents Anthropic 400s ("The final block in an
@@ -2111,7 +2169,7 @@ def run_conversation(
         # exactly the point the breakpoints were meant to protect. Marking
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
-        tools_for_api = agent.tools
+        tools_for_api = [] if thinking_budget_recovery_active else agent.tools
         if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
             _initial_cache_plan = build_prompt_cache_plan(
@@ -2159,7 +2217,7 @@ def run_conversation(
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
         approx_tokens = estimate_messages_tokens_rough(api_messages)
         request_pressure_tokens = approx_tokens + (
-            _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
+            _estimate_tools_tokens_rough(tools_for_api) if tools_for_api else 0
         )
         total_chars = approx_tokens * 4
         # Stash this request's rough estimate so update_from_response() can
@@ -2395,7 +2453,7 @@ def run_conversation(
         if not agent.quiet_mode:
             agent._vprint(f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{agent.max_iterations}...")
             agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
-            agent._vprint(f"{agent.log_prefix}   🔧 Available tools: {len(agent.tools) if agent.tools else 0}")
+            agent._vprint(f"{agent.log_prefix}   🔧 Available tools: {len(tools_for_api) if tools_for_api else 0}")
         else:
             # Animated thinking spinner in quiet mode
             face = random.choice(KawaiiSpinner.get_thinking_faces())
@@ -2413,7 +2471,7 @@ def run_conversation(
         
         # Log request details if verbose
         if agent.verbose_logging:
-            logging.debug(f"API Request - Model: {agent.model}, Messages: {len(messages)}, Tools: {len(agent.tools) if agent.tools else 0}")
+            logging.debug(f"API Request - Model: {agent.model}, Messages: {len(messages)}, Tools: {len(tools_for_api) if tools_for_api else 0}")
             logging.debug(f"Last message role: {messages[-1]['role'] if messages else 'none'}")
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
         
@@ -2425,6 +2483,7 @@ def run_conversation(
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
+        thinking_budget_recovery_requested = False
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
 
@@ -2509,6 +2568,8 @@ def run_conversation(
                         api_messages,
                         tools_for_api=tools_for_api,
                     )
+                if thinking_budget_recovery_active:
+                    _apply_thinking_budget_recovery_overrides(api_kwargs)
                 # Outbound-request surrogate chokepoint (#50959): the messages
                 # were scrubbed above, but the rest of the request body —
                 # tool/function descriptions (session_search's ±-heavy text is
@@ -2559,6 +2620,13 @@ def run_conversation(
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
 
+                # Middleware is extensible and may restore request fields.
+                # Reassert the answer-only boundary immediately before hooks
+                # and provider execution so recovery can never call a tool or
+                # silently return to the original reasoning effort.
+                if thinking_budget_recovery_active:
+                    _apply_thinking_budget_recovery_overrides(api_kwargs)
+
                 try:
                     from hermes_cli.lifecycle import (
                         has_hook,
@@ -2606,7 +2674,7 @@ def run_conversation(
                             if isinstance(request_messages, list)
                             else [],
                             message_count=len(api_messages),
-                            tool_count=len(agent.tools or []),
+                            tool_count=len(tools_for_api or []),
                             approx_input_tokens=approx_tokens,
                             request_char_count=total_chars,
                             max_tokens=agent.max_tokens,
@@ -3272,6 +3340,28 @@ def run_conversation(
                         )
                     )
 
+                    if _thinking_exhausted and not thinking_budget_recovery_attempted:
+                        thinking_budget_recovery_attempted = True
+                        thinking_budget_recovery_active = True
+                        agent._ephemeral_max_output_tokens = (
+                            _THINKING_BUDGET_RECOVERY_MAX_TOKENS
+                        )
+                        # This is a dedicated recovery allowance, not another
+                        # normal agent iteration. It remains available even if
+                        # the exhausted response consumed the turn's final
+                        # iteration, and is consumed exactly once at loop entry.
+                        agent._budget_grace_call = True
+                        agent._vprint(
+                            f"{agent.log_prefix}💭 Reasoning exhausted the output token budget — "
+                            "starting one answer-only recovery call.",
+                            force=True,
+                        )
+                        agent._emit_status(
+                            "Reasoning budget exhausted; recovering a concise final answer..."
+                        )
+                        thinking_budget_recovery_requested = True
+                        break
+
                     if _thinking_exhausted:
                         _exhaust_error = (
                             "Model used all output tokens on reasoning with none left "
@@ -3279,8 +3369,8 @@ def run_conversation(
                             "increasing max_tokens."
                         )
                         agent._vprint(
-                            f"{agent.log_prefix}💭 Reasoning exhausted the output token budget — "
-                            f"no visible response was produced.",
+                            f"{agent.log_prefix}💭 Answer-only recovery also exhausted the "
+                            "output token budget — stopping after one recovery attempt.",
                             force=True,
                         )
                         # Return a user-friendly message as the response so
@@ -6002,6 +6092,9 @@ def run_conversation(
                     # stale request.
                     break
         
+        if thinking_budget_recovery_requested:
+            continue
+
         if _retry.restart_with_redirected_messages:
             # The cancelled request produced no valid assistant item. Reuse the
             # same logical iteration after the outer loop appends the displayed
