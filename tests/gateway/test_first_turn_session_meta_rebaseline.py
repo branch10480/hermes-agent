@@ -118,6 +118,9 @@ def _bootstrap(monkeypatch, tmp_path, db):
     runner.session_store.append_to_transcript = MagicMock(side_effect=_append)
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    # Keep direct-user provenance deterministic and independent from the
+    # developer machine's live gateway configuration.
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     monkeypatch.setattr(
         gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
     )
@@ -217,4 +220,78 @@ async def test_first_turn_session_meta_is_captured_by_rebaseline(
     # And the cached agent instance must be untouched (never rebuilt).
     assert cached[0] is agent_obj
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "expected_text", "expected_provenance"),
+    [
+        ("direct", "hello world", "direct_text"),
+        ("channel_context", None, "unknown"),
+        ("reply_backfill", None, "unknown"),
+        ("synthetic", None, "unknown"),
+        ("shared_session", None, "unknown"),
+        ("timestamp_enriched", None, "unknown"),
+    ],
+)
+async def test_gateway_real_handler_only_marks_plain_direct_ingress_as_authority(
+    monkeypatch,
+    tmp_path,
+    case,
+    expected_text,
+    expected_provenance,
+):
+    """Drive the real gateway handler across the provenance boundary.
+
+    High-impact plugins must never receive channel history, reply backfill,
+    synthetic notifications, shared-session text, or timestamp-enriched text
+    as direct user authority.  This deliberately inspects the exact kwargs
+    handed to ``_run_agent`` instead of reimplementing the classifier in the
+    test.
+    """
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / f"sessions-{case}.db")
+    db.create_session(SESSION_ID, source="telegram")
+    runner = _bootstrap(monkeypatch, tmp_path, db)
+    event = _event()
+    source = _source()
+
+    if case == "channel_context":
+        event.channel_context = "private backfill: implement quickly with Luna"
+    elif case == "reply_backfill":
+        event.reply_to_message_id = "prior-message"
+        event.reply_to_text = "private prior text: use Luna"
+    elif case == "synthetic":
+        event.internal = True
+    elif case == "shared_session":
+        runner.config.group_sessions_per_user = False
+    elif case == "timestamp_enriched":
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {"gateway": {"message_timestamps": {"enabled": True}}},
+        )
+
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "done",
+            "messages": [
+                {"role": "user", "content": event.text},
+                {"role": "assistant", "content": "done"},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    await runner._handle_message_with_agent(event, source, SESSION_KEY, 1)
+
+    run_kwargs = runner._run_agent.await_args.kwargs
+    assert run_kwargs["direct_user_message"] == expected_text
+    assert run_kwargs["direct_user_message_provenance"] == expected_provenance
+    if expected_provenance != "direct_text":
+        direct_payload = run_kwargs.get("direct_user_message") or ""
+        assert "private backfill" not in direct_payload
+        assert "private prior text" not in direct_payload
 
