@@ -3997,14 +3997,75 @@ class TestRunConversation:
 
 
 
-    def test_length_thinking_exhausted_skips_continuation(self, agent):
-        """When finish_reason='length' but content is only thinking, skip retries."""
+    def test_length_thinking_exhausted_recovers_once_without_tools(self, agent):
+        """Reasoning-only length stops get one constrained answer recovery."""
         self._setup_agent(agent)
-        resp = _mock_response(
+        agent.model = "deepseek/deepseek-r1"
+        agent.max_iterations = 1
+        agent.tools = [{
+            "type": "function",
+            "function": {
+                "name": "search_files",
+                "description": "Search files",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }]
+        agent.reasoning_config = {"enabled": True, "effort": "medium"}
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(
+                content="<think>internal reasoning</think>",
+                finish_reason="length",
+            ),
+            _mock_response(content="Concise recovered answer.", finish_reason="stop"),
+        ]
+
+        def middleware_that_restores_normal_fields(payload, **kwargs):
+            mutated = dict(payload)
+            if kwargs["api_call_count"] == 2:
+                mutated["tools"] = agent.tools
+                mutated["max_tokens"] = 16384
+                mutated["extra_body"] = {
+                    "reasoning": {"enabled": True, "effort": "high"},
+                }
+            return SimpleNamespace(
+                payload=mutated,
+                original_payload=dict(payload),
+                trace=[],
+            )
+
+        with (
+            patch(
+                "hermes_cli.middleware.apply_llm_request_middleware",
+                side_effect=middleware_that_restores_normal_fields,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["api_calls"] == 2
+        assert result["final_response"] == "Concise recovered answer."
+        recovery_kwargs = agent.client.chat.completions.create.call_args_list[1].kwargs
+        assert "tools" not in recovery_kwargs
+        assert recovery_kwargs["max_tokens"] == 4096
+        assert recovery_kwargs["extra_body"]["reasoning"]["effort"] == "low"
+        assert "Return the final answer now" in recovery_kwargs["messages"][-1]["content"]
+        assert all(
+            "Return the final answer now" not in str(message.get("content", ""))
+            for message in result["messages"]
+        )
+
+
+    def test_length_thinking_exhausted_stops_after_one_failed_recovery(self, agent):
+        """A second reasoning-only length stop must not start a third call."""
+        self._setup_agent(agent)
+        exhausted = _mock_response(
             content="<think>internal reasoning</think>",
             finish_reason="length",
         )
-        agent.client.chat.completions.create.return_value = resp
+        agent.client.chat.completions.create.side_effect = [exhausted, exhausted]
 
         with (
             patch.object(agent, "_persist_session"),
@@ -4013,26 +4074,26 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("hello")
 
-        # Should return immediately — no continuation, only 1 API call
         assert result["completed"] is False
-        assert result["api_calls"] == 1
+        assert result["api_calls"] == 2
         assert "reasoning" in result["error"].lower()
         assert "output tokens" in result["error"].lower()
-        # Should have a user-friendly response (not None)
         assert result["final_response"] is not None
         assert "Thinking Budget Exhausted" in result["final_response"]
         assert "/thinkon" in result["final_response"]
 
 
-    def test_length_structured_reasoning_exhausted_skips_continuation(self, agent):
-        """Separate reasoning_content with no answer must not auto-continue."""
+    def test_length_structured_reasoning_exhausted_recovers_once(self, agent):
+        """Separate reasoning_content follows the same one-shot recovery."""
         self._setup_agent(agent)
-        resp = _mock_response(
-            content=None,
-            reasoning_content="internal DeepSeek reasoning",
-            finish_reason="length",
-        )
-        agent.client.chat.completions.create.return_value = resp
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(
+                content=None,
+                reasoning_content="internal DeepSeek reasoning",
+                finish_reason="length",
+            ),
+            _mock_response(content="Recovered.", finish_reason="stop"),
+        ]
 
         with (
             patch.object(agent, "_persist_session"),
@@ -4041,9 +4102,9 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("hello")
 
-        assert result["completed"] is False
-        assert result["api_calls"] == 1
-        assert "Thinking Budget Exhausted" in result["final_response"]
+        assert result["completed"] is True
+        assert result["api_calls"] == 2
+        assert result["final_response"] == "Recovered."
 
 
     def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
