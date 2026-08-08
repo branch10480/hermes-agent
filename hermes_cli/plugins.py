@@ -162,6 +162,11 @@ VALID_HOOKS: Set[str] = {
     "on_session_end",
     "on_session_finalize",
     "on_session_reset",
+    # Fired synchronously whenever a live turn accepts user steer/redirect
+    # text. Policy plugins use the monotonic revision to revoke authority that
+    # came from the original prompt; the correction body is intentionally not
+    # exposed to hooks.
+    "on_user_correction",
     # Successful skill lifecycle facts. The local skill name is available to
     # plugins, while built-in shared metrics emit only bounded classifications.
     "on_skill_lifecycle",
@@ -447,6 +452,7 @@ class PluginContext:
         is_async: bool = False,
         description: str = "",
         emoji: str = "",
+        halt_on_error: bool = False,
         override: bool = False,
     ) -> None:
         """Register a tool in the global registry **and** track it as plugin-provided.
@@ -463,6 +469,11 @@ class PluginContext:
         any enabled plugin could silently replace a privileged built-in
         like ``shell_exec`` or ``write_file`` and exfiltrate everything
         the model invokes through it.
+
+        ``halt_on_error=True`` is for orchestration tools whose structured
+        failure is already the complete result for the user. Hermes persists
+        the tool row, returns its bounded ``final_response`` directly, and
+        does not spend another model generation attempting a replacement.
         """
         if override and not self._tool_override_allowed(name):
             plugin_id = self.manifest.key or self.manifest.name
@@ -485,6 +496,7 @@ class PluginContext:
             is_async=is_async,
             description=description,
             emoji=emoji,
+            halt_on_error=halt_on_error,
             override=override,
         )
         self._manager._plugin_tool_names.add(name)
@@ -2484,6 +2496,7 @@ def _get_pre_tool_call_directive_details(
     tool_call_id: str = "",
     turn_id: str = "",
     api_request_id: str = "",
+    direct_user_authority_revision: int = 0,
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> _PreToolCallDirective:
     """Check ``pre_tool_call`` hooks for a blocking or approval directive.
@@ -2531,6 +2544,7 @@ def _get_pre_tool_call_directive_details(
         tool_call_id=tool_call_id,
         turn_id=turn_id,
         api_request_id=api_request_id,
+        direct_user_authority_revision=direct_user_authority_revision,
         middleware_trace=list(middleware_trace or []),
     )
 
@@ -2563,6 +2577,7 @@ def get_pre_tool_call_directive(
     tool_call_id: str = "",
     turn_id: str = "",
     api_request_id: str = "",
+    direct_user_authority_revision: int = 0,
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Check ``pre_tool_call`` hooks for a blocking or approval directive.
@@ -2575,7 +2590,9 @@ def get_pre_tool_call_directive(
     details = _get_pre_tool_call_directive_details(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
-        api_request_id=api_request_id, middleware_trace=middleware_trace,
+        api_request_id=api_request_id,
+        direct_user_authority_revision=direct_user_authority_revision,
+        middleware_trace=middleware_trace,
     )
     return (details.action, details.message)
 
@@ -2588,6 +2605,7 @@ def get_pre_tool_call_block_message(
     tool_call_id: str = "",
     turn_id: str = "",
     api_request_id: str = "",
+    direct_user_authority_revision: int = 0,
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
     """Back-compat shim: return only a ``block`` message (or ``None``).
@@ -2600,7 +2618,9 @@ def get_pre_tool_call_block_message(
     directive, message = get_pre_tool_call_directive(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
-        api_request_id=api_request_id, middleware_trace=middleware_trace,
+        api_request_id=api_request_id,
+        direct_user_authority_revision=direct_user_authority_revision,
+        middleware_trace=middleware_trace,
     )
     return message if directive == "block" else None
 
@@ -2613,6 +2633,7 @@ def resolve_pre_tool_block(
     tool_call_id: str = "",
     turn_id: str = "",
     api_request_id: str = "",
+    direct_user_authority_revision: int = 0,
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
     """Resolve the pre_tool_call directive to a final block message (or None).
@@ -2632,7 +2653,9 @@ def resolve_pre_tool_block(
     details = _get_pre_tool_call_directive_details(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
-        api_request_id=api_request_id, middleware_trace=middleware_trace,
+        api_request_id=api_request_id,
+        direct_user_authority_revision=direct_user_authority_revision,
+        middleware_trace=middleware_trace,
     )
     if details.action == "block":
         return details.message

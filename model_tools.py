@@ -1165,6 +1165,7 @@ def handle_function_call(
     session_id: Optional[str] = None,
     turn_id: Optional[str] = None,
     api_request_id: Optional[str] = None,
+    direct_user_authority_revision: int = 0,
     user_task: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     skip_pre_tool_call_hook: bool = False,
@@ -1304,6 +1305,7 @@ def handle_function_call(
                 session_id=session_id,
                 turn_id=turn_id,
                 api_request_id=api_request_id,
+                direct_user_authority_revision=direct_user_authority_revision,
                 user_task=user_task,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
@@ -1361,6 +1363,12 @@ def handle_function_call(
                     tool_call_id=tool_call_id or "",
                     turn_id=turn_id or "",
                     api_request_id=api_request_id or "",
+                    direct_user_authority_revision=(
+                        direct_user_authority_revision
+                        if type(direct_user_authority_revision) is int
+                        and direct_user_authority_revision >= 0
+                        else 0
+                    ),
                     middleware_trace=list(_tool_middleware_trace),
                 )
             except Exception as _hook_err:
@@ -1467,21 +1475,50 @@ def handle_function_call(
                     # Prefer the caller-provided list so subagents can't overwrite
                     # the parent's tool set via the process-global.
                     sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
+
                     def _dispatch(next_args: Dict[str, Any]) -> Any:
+                        dispatch_context = {
+                            "task_id": task_id,
+                            "session_id": session_id,
+                            "enabled_tools": sandbox_enabled,
+                        }
+                        for key, value in (
+                            ("turn_id", turn_id),
+                            ("tool_call_id", tool_call_id),
+                            ("api_request_id", api_request_id),
+                            (
+                                "direct_user_authority_revision",
+                                direct_user_authority_revision,
+                            ),
+                        ):
+                            if registry.handler_accepts_keyword(function_name, key):
+                                dispatch_context[key] = value
                         return registry.dispatch(
-                            function_name, next_args,
-                            task_id=task_id,
-                            session_id=session_id,
-                            enabled_tools=sandbox_enabled,
+                            function_name, next_args, **dispatch_context
                         )
                 else:
+
                     def _dispatch(next_args: Dict[str, Any]) -> Any:
+                        dispatch_context = {
+                            "task_id": task_id,
+                            "session_id": session_id,
+                            "user_task": user_task,
+                        }
+                        for key, value in (
+                            ("turn_id", turn_id),
+                            ("tool_call_id", tool_call_id),
+                            ("api_request_id", api_request_id),
+                            (
+                                "direct_user_authority_revision",
+                                direct_user_authority_revision,
+                            ),
+                        ):
+                            if registry.handler_accepts_keyword(function_name, key):
+                                dispatch_context[key] = value
                         return registry.dispatch(
-                            function_name, next_args,
-                            task_id=task_id,
-                            session_id=session_id,
-                            user_task=user_task,
+                            function_name, next_args, **dispatch_context
                         )
+
                 if skip_tool_execution_middleware:
                     result = _dispatch(function_args)
                 else:

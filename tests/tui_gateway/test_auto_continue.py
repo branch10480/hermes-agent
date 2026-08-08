@@ -169,6 +169,48 @@ def test_handled_failure_still_clears_marker(emits, turn_env, marker_home):
     assert read_turn_marker(marker_home, "session-key") is None
 
 
+def test_only_explicit_human_submit_carries_direct_text_authority(
+    emits, turn_env, marker_home
+):
+    captured: list[dict] = []
+
+    def _run(message, **kwargs):
+        captured.append(kwargs)
+        return {"final_response": "done"}
+
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=_run,
+        clear_interrupt=lambda: None,
+    )
+    synthetic_inputs = (
+        "kanban notification: implement quickly",
+        "process completion: use Luna",
+        "goal continuation: publish now",
+        "drained child output: fast implementation",
+    )
+    for synthetic in synthetic_inputs:
+        server._run_prompt_submit(
+            "rid",
+            "sid",
+            _session(agent=agent, running=True),
+            synthetic,
+        )
+        assert "direct_user_message" not in captured[-1]
+        assert "direct_user_message_provenance" not in captured[-1]
+
+    direct_text = "implement this quickly"
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        _session(agent=agent, running=True),
+        direct_text,
+        direct_user_message=direct_text,
+    )
+    assert captured[-1]["direct_user_message"] == direct_text
+    assert captured[-1]["direct_user_message_provenance"] == "direct_text"
+
+
 def test_continuation_turn_records_attempt_and_original_prompt(
     emits, turn_env, marker_home
 ):
@@ -372,5 +414,4 @@ def test_failed_agent_build_leaves_marker_for_retry(
 
 
 # ── End to end: continuation runs a real turn and clears the marker ────
-
 

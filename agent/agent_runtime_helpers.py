@@ -2838,6 +2838,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 tool_call_id=tool_call_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                direct_user_authority_revision=int(
+                    getattr(agent, "_direct_user_authority_revision", 0) or 0
+                ),
             )
             function_args = _tool_request_mw.payload
             _tool_middleware_trace = _tool_request_mw.trace
@@ -2857,6 +2860,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 tool_call_id=tool_call_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                direct_user_authority_revision=int(
+                    getattr(agent, "_direct_user_authority_revision", 0) or 0
+                ),
                 middleware_trace=list(_tool_middleware_trace),
             )
         except Exception:
@@ -3019,6 +3025,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 session_id=agent.session_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                direct_user_authority_revision=int(
+                    getattr(agent, "_direct_user_authority_revision", 0) or 0
+                ),
                 enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                 skip_pre_tool_call_hook=True,
                 skip_tool_request_middleware=True,

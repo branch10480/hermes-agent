@@ -25,6 +25,11 @@ def _bare_agent() -> AIAgent:
     agent._pending_steer_lock = threading.Lock()
     agent._pending_redirect = None
     agent._pending_redirect_lock = threading.Lock()
+    agent._direct_user_authority_revision = 0
+    agent._direct_user_authority_lock = threading.Lock()
+    agent.session_id = "session"
+    agent._current_task_id = "task"
+    agent._current_turn_id = "turn"
     agent._model_request_active = threading.Event()
     agent._executing_tools = False
     agent._execution_thread_id = None
@@ -48,6 +53,35 @@ class TestSteerAcceptance:
         agent = _bare_agent()
         assert agent.steer("go ahead and check the logs") is True
         assert agent._pending_steer == "go ahead and check the logs"
+
+    def test_accepted_steer_revokes_direct_authority_synchronously(
+        self, monkeypatch
+    ):
+        from hermes_cli import lifecycle
+
+        calls = []
+        monkeypatch.setattr(
+            lifecycle,
+            "invoke_hook",
+            lambda name, **kwargs: calls.append((name, kwargs)) or [],
+        )
+        agent = _bare_agent()
+
+        assert agent.steer("keep it local") is True
+
+        assert agent._direct_user_authority_revision == 1
+        assert calls == [
+            (
+                "on_user_correction",
+                {
+                    "session_id": "session",
+                    "task_id": "task",
+                    "turn_id": "turn",
+                    "direct_user_authority_revision": 1,
+                    "source": "steer",
+                },
+            )
+        ]
 
 
 
@@ -78,6 +112,7 @@ class TestActiveTurnRedirect:
         assert agent._pending_redirect == "use Postgres"
         assert agent._interrupt_requested is True
         assert agent._interrupt_message is None
+        assert agent._direct_user_authority_revision == 1
 
     def test_multiple_redirects_preserve_message_boundaries(self):
         agent = _bare_agent()
@@ -187,6 +222,7 @@ class TestActiveTurnRedirect:
         assert agent._pending_redirect is None
         assert agent._pending_steer == "also check migrations"
         assert agent._interrupt_requested is False
+        assert agent._direct_user_authority_revision == 1
 
 
 class TestActiveTurnRedirectCheckpoint:

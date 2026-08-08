@@ -147,6 +147,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 self.rows.append(m["content"])
             return list(range(1, len(messages) + 1))
 
+        def flush_token_counts(self):
+            return None
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -1930,6 +1933,7 @@ class TestConcurrentToolExecution:
 
     def test_invoke_tool_dispatches_to_handle_function_call(self, agent):
         """_invoke_tool should route regular tools through handle_function_call."""
+        agent._direct_user_authority_revision = 7
         with patch("run_agent.handle_function_call", return_value="result") as mock_hfc:
             result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
             mock_hfc.assert_called_once_with(
@@ -1938,6 +1942,7 @@ class TestConcurrentToolExecution:
                 session_id=agent.session_id,
                 turn_id="",
                 api_request_id="",
+                direct_user_authority_revision=7,
                 enabled_tools=list(agent.valid_tool_names),
                 skip_pre_tool_call_hook=True,
                 skip_tool_request_middleware=True,
@@ -1946,6 +1951,25 @@ class TestConcurrentToolExecution:
                 tool_request_middleware_trace=[],
             )
             assert result == "result"
+
+    def test_sequential_tool_forwards_direct_user_authority_revision(self, agent):
+        agent._direct_user_authority_revision = 9
+        agent._current_turn_id = "turn-authority"
+        agent._current_api_request_id = "request-authority"
+        tool_call = _mock_tool_call(
+            name="web_search",
+            arguments='{"q":"authority"}',
+            call_id="authority-call",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+
+        with patch("run_agent.handle_function_call", return_value="result") as mock_hfc:
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        assert mock_hfc.call_args.kwargs["direct_user_authority_revision"] == 9
+        assert mock_hfc.call_args.kwargs["turn_id"] == "turn-authority"
+        assert mock_hfc.call_args.kwargs["api_request_id"] == "request-authority"
 
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")
@@ -2781,6 +2805,88 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+
+    def test_halt_on_error_tool_returns_without_another_model_call(self, agent):
+        """A trusted orchestration failure is already the turn's final answer."""
+        from tools.registry import registry
+
+        self._setup_agent(agent)
+        tool_name = "test_halt_on_error"
+        sibling_name = "test_must_not_run_after_halt"
+        registry.register(
+            name=tool_name,
+            toolset="test",
+            schema={
+                "name": tool_name,
+                "description": "Test terminal orchestration failure.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda _args, **_kwargs: "unused",
+            halt_on_error=True,
+        )
+        registry.register(
+            name=sibling_name,
+            toolset="test",
+            schema={
+                "name": sibling_name,
+                "description": "Must be skipped after the orchestration halt.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda _args, **_kwargs: "must not execute",
+        )
+        agent.valid_tool_names = set(agent.valid_tool_names) | {
+            tool_name,
+            sibling_name,
+        }
+        tool_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(name=tool_name, arguments="{}", call_id="c1"),
+                _mock_tool_call(
+                    name=sibling_name,
+                    arguments="{}",
+                    call_id="c2",
+                ),
+            ],
+        )
+        agent.client.chat.completions.create.return_value = tool_turn
+        failure = json.dumps(
+            {
+                "error": "implementation did not complete",
+                "final_response": "実装委譲に失敗したため、このターンを終了しました。",
+                "status": "failed",
+            },
+            ensure_ascii=False,
+        )
+        handle_call = MagicMock(return_value=failure)
+        try:
+            with (
+                patch("run_agent.handle_function_call", handle_call),
+                patch.object(agent, "_persist_session"),
+                patch.object(agent, "_save_trajectory"),
+                patch.object(agent, "_cleanup_task_resources"),
+            ):
+                result = agent.run_conversation("implement this")
+        finally:
+            registry.deregister(tool_name)
+            registry.deregister(sibling_name)
+
+        assert result["api_calls"] == 1
+        assert result["turn_exit_reason"] == "tool_error_halt"
+        assert result["failed"] is True
+        assert result["completed"] is False
+        assert result["final_response"] == (
+            "実装委譲に失敗したため、このターンを終了しました。"
+        )
+        assert handle_call.call_count == 1
+        assert [message["role"] for message in result["messages"][-4:]] == [
+            "assistant",
+            "tool",
+            "tool",
+            "assistant",
+        ]
+        assert "was not started" in result["messages"][-2]["content"]
 
     def test_prompt_cache_marks_static_system_prefix_on_wire(self, agent):
         self._setup_agent(agent)

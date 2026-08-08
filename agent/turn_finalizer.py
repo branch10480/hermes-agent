@@ -776,6 +776,13 @@ def finalize_turn(
     # Fired at the very end of every run_conversation call.
     # Plugins can use this for cleanup, flushing buffers, etc.
     try:
+        from agent.direct_user_authority import close_turn
+
+        close_turn(agent.session_id or "", effective_task_id, turn_id)
+    except Exception:
+        logger.warning("direct-user authority turn close failed", exc_info=True)
+
+    try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _invoke_hook(
             "on_session_end",
