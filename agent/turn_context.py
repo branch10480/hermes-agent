@@ -346,6 +346,8 @@ def build_turn_context(
     *,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+    direct_user_message: Optional[str] = None,
+    direct_user_message_provenance: str = "unknown",
     restore_or_build_system_prompt,
     install_safe_stdio,
     sanitize_surrogates,
@@ -455,6 +457,15 @@ def build_turn_context(
     agent._relay_pending_turn_id = None
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
+    from agent.direct_user_authority import begin_turn as _begin_direct_authority
+
+    _begin_direct_authority(agent.session_id or "", effective_task_id, turn_id)
+    _authority_lock = getattr(agent, "_direct_user_authority_lock", None)
+    if _authority_lock is None:
+        agent._direct_user_authority_revision = 0
+    else:
+        with _authority_lock:
+            agent._direct_user_authority_revision = 0
     # Tripwire: warn (with both turn ids) when this turn starts before the
     # previous turn's turn-end persist — concurrent turns on one session
     # interleave transcript writes. Cleared in _persist_session.
@@ -475,6 +486,7 @@ def build_turn_context(
     agent._unicode_sanitization_passes = 0
     agent._tool_guardrails.reset_for_turn()
     agent._tool_guardrail_halt_decision = None
+    agent._tool_error_halt = None
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
     if callable(_reset_consol):
         _reset_consol()
@@ -1066,6 +1078,19 @@ def build_turn_context(
             task_id=effective_task_id,
             turn_id=turn_id,
             user_message=original_user_message,
+            direct_user_message=(
+                direct_user_message
+                if direct_user_message_provenance == "direct_text"
+                and isinstance(direct_user_message, str)
+                else None
+            ),
+            direct_user_message_provenance=(
+                "direct_text"
+                if direct_user_message_provenance == "direct_text"
+                and isinstance(direct_user_message, str)
+                else "unknown"
+            ),
+            direct_user_authority_revision=0,
             conversation_history=list(messages),
             is_first_turn=(not bool(conversation_history)),
             model=agent.model,

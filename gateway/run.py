@@ -5377,6 +5377,15 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            if (
+                ctx.direct_user_message_provenance == "direct_text"
+                and isinstance(ctx.direct_user_message, str)
+                and isinstance(_api_run_message, str)
+                and _api_run_message == ctx.direct_user_message
+                and not observed_group_context
+            ):
+                _conversation_kwargs["direct_user_message"] = ctx.direct_user_message
+                _conversation_kwargs["direct_user_message_provenance"] = "direct_text"
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
@@ -17386,6 +17395,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _vc_note:
             turn_sidecar_notes.append(_vc_note)
 
+        # Preserve a raw direct-text authority channel separately from the
+        # model-facing message. Any enrichment, attachment, shared-session
+        # prefix, reply/backfill, synthetic event, or timestamp rendering
+        # makes the authority unknown for this turn. Downstream plugins may
+        # use the raw field for high-impact routing, but never the enriched
+        # prompt itself.
+        direct_user_message: Optional[str] = None
+        direct_user_message_provenance = "unknown"
+        try:
+            _shared_ingress = is_shared_multi_user_session(
+                source,
+                group_sessions_per_user=getattr(
+                    self.config, "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=getattr(
+                    self.config, "thread_sessions_per_user", False
+                ),
+            )
+            _timestamp_enriched = _message_timestamps_enabled(_load_gateway_config())
+            if (
+                isinstance(event.text, str)
+                and event.message_type == MessageType.TEXT
+                and not getattr(event, "internal", False)
+                and not getattr(event, "channel_context", None)
+                and not getattr(event, "channel_prompt", None)
+                and not getattr(event, "reply_to_text", None)
+                and not getattr(event, "reply_to_message_id", None)
+                and not getattr(event, "media_urls", None)
+                and not hasattr(event, "_gateway_pending_stt_text")
+                and not turn_sidecar_notes
+                and not _shared_ingress
+                and not _timestamp_enriched
+                and source.platform not in {
+                    Platform.RELAY,
+                    Platform.WEBHOOK,
+                    Platform.MSGRAPH_WEBHOOK,
+                    Platform.API_SERVER,
+                }
+            ):
+                direct_user_message = event.text
+                direct_user_message_provenance = "direct_text"
+        except Exception:
+            direct_user_message = None
+            direct_user_message_provenance = "unknown"
+
         # -----------------------------------------------------------------
         # Auto-analyze images sent by the user
         #
@@ -17492,6 +17546,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                direct_user_message=direct_user_message,
+                direct_user_message_provenance=direct_user_message_provenance,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -23965,6 +24021,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        direct_user_message: Optional[str] = None,
+        direct_user_message_provenance: str = "unknown",
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -23984,6 +24042,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                direct_user_message=direct_user_message,
+                direct_user_message_provenance=direct_user_message_provenance,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -23996,6 +24056,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                direct_user_message=direct_user_message,
+                direct_user_message_provenance=direct_user_message_provenance,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -24118,6 +24180,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        direct_user_message: Optional[str] = None,
+        direct_user_message_provenance: str = "unknown",
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -24402,6 +24466,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            direct_user_message=direct_user_message,
+            direct_user_message_provenance=direct_user_message_provenance,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

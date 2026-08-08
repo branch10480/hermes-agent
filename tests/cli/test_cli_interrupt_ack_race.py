@@ -154,6 +154,53 @@ def test_unacknowledged_interrupt_message_is_requeued_not_dropped():
     assert agent.clear_calls >= 1
 
 
+def test_requeued_direct_interrupt_preserves_authority_marker():
+    cli = _make_cli()
+    from cli import _DirectTextInput, _is_direct_text_input
+
+    agent = _StubAgent(cli.session_id)
+    cli.agent = agent
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+    cli._interrupt_queue.put(_DirectTextInput("implement this quickly"))
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
+         patch.object(cli, "_resolve_turn_agent_config", return_value={
+             "signature": cli._active_agent_route_signature,
+             "model": None, "runtime": None, "request_overrides": None,
+         }), \
+         patch.object(cli, "_init_agent", return_value=True):
+        cli.chat("original")
+
+    queued = cli._pending_input.get_nowait()
+    assert _is_direct_text_input(queued)
+    assert str(queued) == "implement this quickly"
+
+
+def test_requeued_mixed_interrupt_drops_authority_marker():
+    cli = _make_cli()
+    from cli import _DirectTextInput
+
+    agent = _StubAgent(cli.session_id)
+    cli.agent = agent
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+    cli._interrupt_queue.put(_DirectTextInput("implement this quickly"))
+    cli._interrupt_queue.put("synthetic follow-up")
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
+         patch.object(cli, "_resolve_turn_agent_config", return_value={
+             "signature": cli._active_agent_route_signature,
+             "model": None, "runtime": None, "request_overrides": None,
+         }), \
+         patch.object(cli, "_init_agent", return_value=True):
+        cli.chat("original")
+
+    queued = cli._pending_input.get_nowait()
+    assert type(queued) is str
+    assert queued == "implement this quickly\nsynthetic follow-up"
+
+
 
 
 def test_chat_persists_clean_input_when_a_queued_note_changes_api_message():
@@ -193,6 +240,114 @@ def test_chat_persists_clean_input_when_a_queued_note_changes_api_message():
     assert agent.captured is not None
     assert agent.captured["user_message"] == "[MODEL SWITCH NOTE]\n\nclean prompt"
     assert agent.captured["persist_user_message"] == "clean prompt"
+    assert agent.captured["direct_user_message"] is None
+    assert agent.captured["direct_user_message_provenance"] == "unknown"
+
+
+def _capture_direct_provenance(
+    message: str,
+    *,
+    direct_message: str | None,
+    single_query: bool = False,
+    session_source: str = "cli",
+):
+    cli = _make_cli()
+
+    class _CaptureAgent(_StubAgent):
+        def __init__(self, session_id):
+            super().__init__(session_id, turn_seconds=0)
+            self.captured = None
+
+        def run_conversation(self, **kwargs):
+            self.captured = kwargs
+            return {
+                "final_response": "done",
+                "messages": [{"role": "assistant", "content": "done"}],
+                "api_calls": 1,
+                "completed": True,
+                "partial": True,
+                "response_previewed": True,
+            }
+
+    agent = _CaptureAgent(cli.session_id)
+    cli.agent = agent
+    cli._single_query_mode = single_query
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+
+    with patch.dict("os.environ", {"HERMES_SESSION_SOURCE": session_source}), \
+         patch.object(cli, "_ensure_runtime_credentials", return_value=True), \
+         patch.object(cli, "_resolve_turn_agent_config", return_value={
+             "signature": cli._active_agent_route_signature,
+             "model": None, "runtime": None, "request_overrides": None,
+         }), \
+         patch.object(cli, "_init_agent", return_value=True):
+        cli.chat(message, _direct_cli_message=direct_message)
+
+    assert agent.captured is not None
+    return agent.captured
+
+
+def test_chat_marks_only_exact_interactive_prompt_text_as_direct():
+    captured = _capture_direct_provenance(
+        "implement this quickly",
+        direct_message="implement this quickly",
+    )
+
+    assert captured["direct_user_message"] == "implement this quickly"
+    assert captured["direct_user_message_provenance"] == "direct_text"
+
+
+def test_chat_does_not_trust_one_shot_or_automation_sources():
+    one_shot = _capture_direct_provenance(
+        "implement this quickly",
+        direct_message="implement this quickly",
+        single_query=True,
+    )
+    assert one_shot["direct_user_message"] is None
+    assert one_shot["direct_user_message_provenance"] == "unknown"
+
+    for source in ("tool", "kanban"):
+        automated = _capture_direct_provenance(
+            "implement this quickly",
+            direct_message="implement this quickly",
+            session_source=source,
+        )
+        assert automated["direct_user_message"] is None
+        assert automated["direct_user_message_provenance"] == "unknown"
+
+
+def test_chat_does_not_infer_direct_authority_from_plain_caller_text():
+    captured = _capture_direct_provenance(
+        "implement this quickly",
+        direct_message=None,
+    )
+
+    assert captured["direct_user_message"] is None
+    assert captured["direct_user_message_provenance"] == "unknown"
+
+
+def test_chat_context_expansion_revokes_direct_text_provenance():
+    expanded = types.SimpleNamespace(
+        expanded=True,
+        blocked=False,
+        references=["plan.md"],
+        injected_tokens=12,
+        warnings=[],
+        message="implement this quickly\n\nprivate plan contents",
+    )
+    with patch(
+        "agent.context_references.preprocess_context_references",
+        return_value=expanded,
+    ), patch("agent.model_metadata.get_model_context_length", return_value=128_000):
+        captured = _capture_direct_provenance(
+            "implement @file:plan.md quickly",
+            direct_message="implement @file:plan.md quickly",
+        )
+
+    assert captured["user_message"] == expanded.message
+    assert captured["direct_user_message"] is None
+    assert captured["direct_user_message_provenance"] == "unknown"
 
 
 def test_chat_preserves_clean_multimodal_input_when_note_changes_api_message():

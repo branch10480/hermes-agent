@@ -4202,6 +4202,26 @@ class _VoiceInputMessage:
         return self.text
 
 
+class _DirectTextInput(str):
+    """Marker for text submitted by the interactive prompt itself.
+
+    Plain strings can also enter ``_pending_input`` from retries, synthetic
+    seeds, background work, and one-shot callers.  Keep direct-user authority
+    attached only to the prompt-toolkit ingress that observed the keystrokes;
+    later enrichment still has to preserve the exact bytes before the marker
+    is forwarded to plugins.
+    """
+
+    _hermes_direct_text_input = True
+
+
+def _is_direct_text_input(value: object) -> bool:
+    """Recognize the trusted marker across test/plugin module reloads."""
+    return isinstance(value, str) and bool(
+        getattr(type(value), "_hermes_direct_text_input", False) is True
+    )
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -7092,11 +7112,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # Agent busy → honour the configured busy-input behaviour by
             # queueing for the next turn (the safe default; interrupt/steer
             # remain reachable via the normal Enter path).
-            self._interrupt_queue.put(text) if self.busy_input_mode == "interrupt" else self._pending_input.put(text)
+            direct_text = _DirectTextInput(text)
+            self._interrupt_queue.put(direct_text) if self.busy_input_mode == "interrupt" else self._pending_input.put(direct_text)
             preview = text[:80] + ("..." if len(text) > 80 else "")
             _cprint(f"  Queued for the next turn: {preview}")
         else:
-            self._pending_input.put(text)
+            self._pending_input.put(_DirectTextInput(text))
 
         self._reset_input_buffer(buffer)
         if app is not None:
@@ -13635,7 +13656,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+    def chat(
+        self,
+        message,
+        images: list = None,
+        voice_input: bool = False,
+        *,
+        _direct_cli_message: Optional[str] = None,
+    ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -13979,6 +14007,32 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
+                        direct_user_message=(
+                            _direct_cli_message
+                            if isinstance(_direct_cli_message, str)
+                            and isinstance(message, str)
+                            and isinstance(agent_message, str)
+                            and _direct_cli_message == message == agent_message
+                            and not voice_input
+                            and not images
+                            and not getattr(self, "_single_query_mode", False)
+                            and os.environ.get("HERMES_SESSION_SOURCE", "")
+                            in ("", "cli")
+                            else None
+                        ),
+                        direct_user_message_provenance=(
+                            "direct_text"
+                            if isinstance(_direct_cli_message, str)
+                            and isinstance(message, str)
+                            and isinstance(agent_message, str)
+                            and _direct_cli_message == message == agent_message
+                            and not voice_input
+                            and not images
+                            and not getattr(self, "_single_query_mode", False)
+                            and os.environ.get("HERMES_SESSION_SOURCE", "")
+                            in ("", "cli")
+                            else "unknown"
+                        ),
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
@@ -14439,7 +14493,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             all_parts.append(extra)
                     except queue.Empty:
                         break
-                combined = "\n".join(all_parts)
+                all_parts_direct = all(_is_direct_text_input(part) for part in all_parts)
+                combined_text = "\n".join(str(part) for part in all_parts)
+                combined = (
+                    _DirectTextInput(combined_text)
+                    if all_parts_direct
+                    else combined_text
+                )
                 n = len(all_parts)
                 preview = combined[:50] + ("..." if len(combined) > 50 else "")
                 if n > 1:
@@ -15372,7 +15432,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self._attached_images.clear()
                 event.app.invalidate()
                 # Bundle text + images as a tuple when images are present
-                payload = (text, images) if images else text
+                payload = (text, images) if images else _DirectTextInput(text)
                 # A bang command is treated like a slash command while the
                 # agent is busy: it must never be routed into steer/redirect
                 # (which would inject `!git status` into the model's context as
@@ -17321,6 +17381,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 pass
                         continue
 
+                    direct_cli_message = (
+                        str(user_input)
+                        if _is_direct_text_input(user_input)
+                        else None
+                    )
+
                     # Voice-transcribed messages arrive wrapped in a sentinel
                     # so only genuine STT output gets the voice prefix (#65827).
                     is_voice_input = isinstance(user_input, _VoiceInputMessage)
@@ -17441,7 +17507,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self.chat(
+                            user_input,
+                            images=submit_images or None,
+                            voice_input=is_voice_input,
+                            _direct_cli_message=direct_cli_message,
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""

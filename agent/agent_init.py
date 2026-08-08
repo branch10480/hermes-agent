@@ -775,6 +775,7 @@ def init_agent(
     agent._executing_tools = False
     agent._tool_guardrails = ToolCallGuardrailController()
     agent._tool_guardrail_halt_decision: ToolGuardrailDecision | None = None
+    agent._tool_error_halt: dict | None = None
 
     # Interrupt mechanism for breaking out of tool loops
     agent._interrupt_requested = False
@@ -804,6 +805,12 @@ def init_agent(
     # the correction. The loop drains this slot at a role-safe boundary.
     agent._pending_redirect: Optional[str] = None
     agent._pending_redirect_lock = threading.Lock()
+    # Direct-user authority is monotonic within a turn. Any accepted steer or
+    # redirect increments this revision and notifies policy plugins, so a
+    # cloud/publish decision captured from the original text cannot survive a
+    # later user correction.
+    agent._direct_user_authority_revision = 0
+    agent._direct_user_authority_lock = threading.Lock()
 
     # Concurrent-tool worker thread tracking.  `_execute_tool_calls_concurrent`
     # runs each tool on its own ThreadPoolExecutor worker — those worker

@@ -16,6 +16,7 @@ Import chain (circular-import safe):
 
 import ast
 import importlib
+import inspect
 import json
 import logging
 import sys
@@ -163,12 +164,13 @@ class ToolEntry:
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
-        "max_result_size_chars", "dynamic_schema_overrides",
+        "max_result_size_chars", "dynamic_schema_overrides", "halt_on_error",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 halt_on_error=False):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -187,6 +189,10 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        # A trusted tool can declare that an error result is already the
+        # complete answer for this turn. The conversation loop then returns
+        # it without asking the model to improvise retries or a replacement.
+        self.halt_on_error = halt_on_error is True
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +537,7 @@ class ToolRegistry:
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
+        halt_on_error: bool = False,
         override: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
@@ -591,6 +598,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                halt_on_error=halt_on_error,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -788,6 +796,28 @@ class ToolRegistry:
             except Exception:
                 sanitized = raw  # defensive: never let the sanitizer block error propagation
             return tool_error(sanitized)
+
+    def handler_accepts_keyword(self, name: str, keyword: str) -> bool:
+        """Return whether a registered handler accepts one runtime keyword.
+
+        Runtime authority such as ``turn_id`` and ``tool_call_id`` must reach
+        handlers that explicitly opt into it without changing the calling
+        contract of older tools.  Signature inspection is fail-closed for the
+        new keyword: an opaque callable keeps the pre-existing kwargs only.
+        """
+        entry = self.get_entry(name)
+        if entry is None:
+            return False
+        try:
+            parameters = inspect.signature(entry.handler).parameters
+        except (TypeError, ValueError):
+            return False
+        parameter = parameters.get(keyword)
+        return bool(
+            parameter is not None
+            and parameter.kind
+            in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
+        )
 
     # ------------------------------------------------------------------
     # Query helpers  (replace redundant dicts in model_tools.py)

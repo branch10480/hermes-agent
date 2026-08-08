@@ -253,6 +253,7 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
         assert fake_supervisor.frames[0]["type"] == "turn.start"
         assert fake_supervisor.frames[0]["sid"] == "iso-sid"
         assert fake_supervisor.frames[0]["text"] == "hello"
+        assert fake_supervisor.frames[0]["direct_user_message"] == "hello"
         assert fake_supervisor.frames[0]["history"] == seed_history
         assert server._sessions["iso-sid"]["history"] == seed_history
         assert parent_writes == {"ensure_session": 0, "persist_seed": 0}
@@ -324,7 +325,9 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda rid, sid, _session, text: inline_calls.append((rid, sid, text)),
+        lambda rid, sid, _session, text, **kwargs: inline_calls.append(
+            (rid, sid, text, kwargs)
+        ),
     )
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
 
@@ -344,7 +347,14 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
         "id": "fallback-turn",
         "result": {"status": "streaming"},
     }
-    assert inline_calls == [("fallback-turn", "iso-fallback", "hello")]
+    assert inline_calls == [
+        (
+            "fallback-turn",
+            "iso-fallback",
+            "hello",
+            {"direct_user_message": "hello"},
+        )
+    ]
     assert session.get("_compute_host_active") is not True
 
 

@@ -102,6 +102,49 @@ _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
 # to cover slow-but-legitimate authorization (e.g. an approval round-trip),
 # short enough that one wedged dispatch cannot starve the batch forever.
 _START_ORDER_GATE_TIMEOUT_S = 120.0
+_MAX_HALT_ON_ERROR_RESPONSE_CHARS = 128 * 1024
+
+
+def _record_halt_on_error_result(
+    agent,
+    function_name: str,
+    function_result: Any,
+    *,
+    failed: bool,
+    blocked: bool = False,
+) -> None:
+    """Capture one trusted tool failure as this turn's direct response."""
+    if not failed or blocked or getattr(agent, "_tool_error_halt", None) is not None:
+        return
+    try:
+        from tools.registry import registry
+
+        entry = registry.get_entry(function_name)
+        if entry is None or entry.halt_on_error is not True:
+            return
+        if not isinstance(function_result, str):
+            return
+        payload = json.loads(function_result)
+        if not isinstance(payload, dict):
+            return
+        final_response = payload.get("final_response")
+        if (
+            not isinstance(final_response, str)
+            or not final_response.strip()
+            or len(final_response) > _MAX_HALT_ON_ERROR_RESPONSE_CHARS
+        ):
+            final_response = (
+                f"{function_name} failed and stopped this turn. "
+                "Its persisted tool result contains the bounded failure details."
+            )
+        agent._tool_error_halt = {
+            "tool_name": function_name,
+            "final_response": final_response,
+        }
+    except (AttributeError, TypeError, ValueError):
+        # Missing or malformed opt-in metadata must never alter normal tool
+        # execution. The original error result still reaches the model.
+        return
 
 
 class _BatchAbandoned(BaseException):
@@ -482,6 +525,10 @@ def _run_agent_tool_execution_middleware(
                         turn_id=getattr(agent, "_current_turn_id", "") or "",
                         api_request_id=getattr(agent, "_current_api_request_id", "")
                         or "",
+                        direct_user_authority_revision=int(
+                            getattr(agent, "_direct_user_authority_revision", 0)
+                            or 0
+                        ),
                         middleware_trace=list(state["middleware_trace"]),
                     )
                 except Exception:
@@ -1362,6 +1409,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if blocked:
                 effect_disposition = "none"
 
+            _record_halt_on_error_result(
+                agent,
+                function_name,
+                function_result,
+                failed=is_error,
+                blocked=blocked,
+            )
             if not blocked:
                 function_result = agent._append_guardrail_observation(
                     function_name,
@@ -1528,6 +1582,48 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         ))
 
 
+def _append_halt_skipped_tool_results(
+    agent,
+    messages: list,
+    tool_calls,
+    *,
+    effective_task_id: str,
+) -> bool:
+    """Complete a halted batch without starting any remaining tool call."""
+    for tc in tool_calls:
+        name = getattr(getattr(tc, "function", None), "name", "") or "tool"
+        result = (
+            f"[Tool execution skipped — {name} was not started because an "
+            "earlier halt-on-error tool ended this turn]"
+        )
+        messages.append(
+            make_tool_result_message(
+                name,
+                result,
+                getattr(tc, "id", "") or "",
+                effect_disposition="none",
+            )
+        )
+        _emit_terminal_post_tool_call(
+            agent,
+            function_name=name,
+            function_args={},
+            result=result,
+            effective_task_id=effective_task_id,
+            tool_call_id=getattr(tc, "id", "") or "",
+            status="cancelled",
+            error_type="halt_on_error",
+            error_message=result,
+        )
+        if not _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"halt-on-error skipped tool result {name}",
+        ):
+            return False
+    return True
+
+
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
@@ -1540,6 +1636,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        if getattr(agent, "_tool_error_halt", None) is not None:
+            _append_halt_skipped_tool_results(
+                agent,
+                messages,
+                assistant_message.tool_calls[i - 1 :],
+                effective_task_id=effective_task_id,
+            )
+            break
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
         # do NOT start any more tools -- skip them all immediately.
@@ -1940,6 +2044,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         turn_id=getattr(agent, "_current_turn_id", "") or "",
                         api_request_id=getattr(agent, "_current_api_request_id", "")
                         or "",
+                        direct_user_authority_revision=int(
+                            getattr(agent, "_direct_user_authority_revision", 0)
+                            or 0
+                        ),
                         enabled_tools=(
                             list(agent.valid_tool_names)
                             if agent.valid_tool_names
@@ -2019,6 +2127,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         turn_id=getattr(agent, "_current_turn_id", "") or "",
                         api_request_id=getattr(agent, "_current_api_request_id", "")
                         or "",
+                        direct_user_authority_revision=int(
+                            getattr(agent, "_direct_user_authority_revision", 0)
+                            or 0
+                        ),
                         enabled_tools=(
                             list(agent.valid_tool_names)
                             if agent.valid_tool_names
@@ -2091,6 +2203,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+        _record_halt_on_error_result(
+            agent,
+            function_name,
+            function_result,
+            failed=_is_error_result,
+            blocked=_execution_blocked,
+        )
         # The agent-runtime tools above (todo, session_search, memory,
         # context-engine, memory-manager, clarify, delegate_task) are
         # dispatched inline — they never reach handle_function_call, so the
@@ -2235,6 +2354,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 response_preview = _fr_str[:agent.log_prefix_chars] + "..." if len(_fr_str) > agent.log_prefix_chars else _fr_str
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
 
+        if (
+            getattr(agent, "_tool_error_halt", None) is not None
+            and i < len(assistant_message.tool_calls)
+        ):
+            _append_halt_skipped_tool_results(
+                agent,
+                messages,
+                assistant_message.tool_calls[i:],
+                effective_task_id=effective_task_id,
+            )
+            break
+
         if agent._interrupt_requested and i < len(assistant_message.tool_calls):
             remaining = len(assistant_message.tool_calls) - i
             agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {remaining} remaining tool call(s)", force=True)
@@ -2301,9 +2432,22 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
-    for kind, calls in segments:
+    for segment_index, (kind, calls) in enumerate(segments):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        if getattr(agent, "_tool_error_halt", None) is not None:
+            remaining_calls = [
+                tc
+                for _remaining_kind, segment_calls in segments[segment_index:]
+                for tc in segment_calls
+            ]
+            _append_halt_skipped_tool_results(
+                agent,
+                messages,
+                remaining_calls,
+                effective_task_id=effective_task_id,
+            )
+            break
         segment_message = SimpleNamespace(tool_calls=list(calls))
         if kind == "parallel":
             execute_tool_calls_concurrent(

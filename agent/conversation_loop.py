@@ -1242,6 +1242,8 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    direct_user_message: Optional[str] = None,
+    direct_user_message_provenance: str = "unknown",
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1318,6 +1320,8 @@ def run_conversation(
         persist_user_timestamp,
         persist_user_display_kind=persist_user_display_kind,
         persist_user_display_metadata=persist_user_display_metadata,
+        direct_user_message=direct_user_message,
+        direct_user_message_provenance=direct_user_message_provenance,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
         install_safe_stdio=_install_safe_stdio,
         sanitize_surrogates=_sanitize_surrogates,
@@ -6384,6 +6388,30 @@ def run_conversation(
                     _turn_exit_reason = "session_persistence_failed"
                     final_response = ""
                     failed = True
+                    break
+
+                tool_error_halt = getattr(agent, "_tool_error_halt", None)
+                if isinstance(tool_error_halt, dict):
+                    _turn_exit_reason = "tool_error_halt"
+                    final_response = str(
+                        tool_error_halt.get("final_response")
+                        or "A terminal tool failure stopped this turn."
+                    )
+                    failed = True
+                    agent._tool_error_halt = None
+                    tool_name = str(tool_error_halt.get("tool_name") or "tool")
+                    agent._emit_status(
+                        f"⚠️ {tool_name} returned a terminal failure; turn stopped"
+                    )
+                    messages.append({"role": "assistant", "content": final_response})
+                    if final_response:
+                        agent._safe_print(f"\n{final_response}\n")
+                        if agent.stream_delta_callback:
+                            try:
+                                agent.stream_delta_callback(final_response)
+                                agent.stream_delta_callback(None)
+                            except Exception:
+                                pass
                     break
 
                 if agent._tool_guardrail_halt_decision is not None:

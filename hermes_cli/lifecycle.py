@@ -49,6 +49,12 @@ def finalize_session(**kwargs: Any) -> List[Any]:
     session_id = str(kwargs.get("session_id") or "")
     if session_id:
         try:
+            from agent.direct_user_authority import forget_session
+
+            forget_session(session_id)
+        except Exception:
+            logger.warning("Direct-user authority cleanup failed", exc_info=True)
+        try:
             from agent import relay_runtime
 
             relay_runtime.SESSION_COORDINATOR.finalize_conversation(

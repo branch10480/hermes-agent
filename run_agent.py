@@ -3222,6 +3222,51 @@ class AIAgent:
                 self._pending_steer = None
         return True
 
+    def _revoke_direct_user_authority(self, source: str) -> None:
+        """Monotonically revoke original-prompt authority for this live turn."""
+        session_id = str(getattr(self, "session_id", "") or "")
+        task_id = str(getattr(self, "_current_task_id", "") or "")
+        turn_id = str(getattr(self, "_current_turn_id", "") or "")
+        try:
+            from agent.direct_user_authority import revoke_for_correction
+
+            core_revision = revoke_for_correction(session_id, task_id, turn_id)
+        except Exception:
+            core_revision = None
+        lock = getattr(self, "_direct_user_authority_lock", None)
+        if lock is None:
+            revision = (
+                core_revision
+                if type(core_revision) is int
+                else int(getattr(self, "_direct_user_authority_revision", 0) or 0)
+                + 1
+            )
+            self._direct_user_authority_revision = revision
+        else:
+            with lock:
+                revision = (
+                    core_revision
+                    if type(core_revision) is int
+                    else int(
+                        getattr(self, "_direct_user_authority_revision", 0) or 0
+                    )
+                    + 1
+                )
+                self._direct_user_authority_revision = revision
+        try:
+            from hermes_cli.lifecycle import invoke_hook
+
+            invoke_hook(
+                "on_user_correction",
+                session_id=session_id,
+                task_id=task_id,
+                turn_id=turn_id,
+                direct_user_authority_revision=revision,
+                source=source,
+            )
+        except Exception:
+            logger.debug("on_user_correction hook failed", exc_info=True)
+
     def steer(self, text: str) -> bool:
         """
         Inject a user message into the next tool result without interrupting.
@@ -3250,12 +3295,14 @@ class AIAgent:
             # in those stubs.
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            self._revoke_direct_user_authority("steer")
             return True
         with _lock:
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
+        self._revoke_direct_user_authority("steer")
         return True
 
     def redirect(self, text: str) -> bool:
@@ -3290,7 +3337,10 @@ class AIAgent:
                 elif self._interrupt_requested:
                     return False
                 try:
-                    return bool(_native_steer(cleaned))
+                    accepted = bool(_native_steer(cleaned))
+                    if accepted:
+                        self._revoke_direct_user_authority("redirect")
+                    return accepted
                 except Exception:
                     logger.debug("Codex app-server turn/steer failed", exc_info=True)
                     return False
@@ -3348,6 +3398,7 @@ class AIAgent:
                 _abort_active_request("redirect_abort")
             except Exception:
                 logger.debug("Failed to abort request for redirect", exc_info=True)
+        self._revoke_direct_user_authority("redirect")
         return True
 
     def _has_pending_redirect(self) -> bool:
@@ -7764,6 +7815,8 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        direct_user_message: Optional[str] = None,
+        direct_user_message_provenance: str = "unknown",
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -7858,6 +7911,8 @@ class AIAgent:
                     persist_user_display_kind=persist_user_display_kind,
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
+                    direct_user_message=direct_user_message,
+                    direct_user_message_provenance=direct_user_message_provenance,
                 )
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:

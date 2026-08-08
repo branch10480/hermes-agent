@@ -1634,6 +1634,7 @@ def _compute_host_turn_frame(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    direct_user_message: str | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -1660,6 +1661,7 @@ def _compute_host_turn_frame(
         "source": _session_source(session),
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
+        "direct_user_message": direct_user_message,
     }
 
 
@@ -1737,6 +1739,7 @@ def _submit_prompt_to_compute_host(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    direct_user_message: str | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -1746,6 +1749,7 @@ def _submit_prompt_to_compute_host(
         text,
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
+        direct_user_message=direct_user_message,
     )
 
     def _complete(done: dict) -> None:
@@ -7325,6 +7329,7 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    direct_user_message: str | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -7339,6 +7344,8 @@ def _enqueue_prompt(
     queued = {"text": text, "transport": transport}
     if image_paths:
         queued["image_paths"] = image_paths
+    elif isinstance(direct_user_message, str) and direct_user_message == text:
+        queued["direct_user_message"] = direct_user_message
     existing = session.get("queued_prompt")
     if (
         existing
@@ -7350,6 +7357,16 @@ def _enqueue_prompt(
     ):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
+        previous_direct = existing.get("direct_user_message")
+        if (
+            isinstance(previous_direct, str)
+            and isinstance(direct_user_message, str)
+            and previous_direct == prev
+            and direct_user_message == text
+        ):
+            existing["direct_user_message"] = existing["text"]
+        else:
+            existing.pop("direct_user_message", None)
         return
     if existing:
         session.setdefault("queued_prompts", []).append(queued)
@@ -7393,7 +7410,13 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    queued: bool = False,
+    direct_user_message: str | None = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -7466,7 +7489,13 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(
+            session,
+            text,
+            transport,
+            image_paths=image_paths,
+            direct_user_message=direct_user_message,
+        )
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -7511,10 +7540,16 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    direct_user_message=queued.get("direct_user_message"),
                 )
             else:
                 resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    queued_prompt_generation=queue_generation,
+                    direct_user_message=queued.get("direct_user_message"),
                 )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
@@ -7532,6 +7567,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    direct_user_message=queued.get("direct_user_message"),
                 )
             else:
                 _run_prompt_submit(
@@ -7540,6 +7576,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
+                    direct_user_message=queued.get("direct_user_message"),
                 )
     except Exception as exc:
         print(
@@ -9359,6 +9396,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    direct_user_message: str | None = None,
 ) -> None:
     with session["history_lock"]:
         if (
@@ -9644,6 +9682,16 @@ def _run_prompt_submit(
                     _build_persist_user_message(prompt, images, run_message) if images else prompt
                 ),
             }
+            if (
+                isinstance(direct_user_message, str)
+                and isinstance(prompt, str)
+                and isinstance(run_message, str)
+                and direct_user_message == run_message == prompt
+                and not images
+                and not display_kind
+            ):
+                run_kwargs["direct_user_message"] = direct_user_message
+                run_kwargs["direct_user_message_provenance"] = "direct_text"
             # Type a synthesized turn at turn START so the crash persist writes
             # its row as a timeline event, instead of leaving a raw user bubble
             # until the turn ends — and forever if it never does, which is
