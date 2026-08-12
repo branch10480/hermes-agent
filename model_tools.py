@@ -1455,41 +1455,49 @@ def handle_function_call(
         except Exception:
             reset_current_observability_context = None
         try:
-            if function_name == "execute_code":
-                # Prefer the caller-provided list so subagents can't overwrite
-                # the parent's tool set via the process-global.
-                sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
-                def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
-                        function_name, next_args,
-                        task_id=task_id,
-                        session_id=session_id,
-                        enabled_tools=sandbox_enabled,
-                    )
-            else:
-                def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
-                        function_name, next_args,
-                        task_id=task_id,
-                        session_id=session_id,
-                        user_task=user_task,
-                    )
-            if skip_tool_execution_middleware:
-                result = _dispatch(function_args)
-            else:
-                from hermes_cli.middleware import run_tool_execution_middleware
+            from agent.turn_control import tool_execution_context
 
-                result = run_tool_execution_middleware(
-                    function_name,
-                    function_args,
-                    _dispatch,
-                    original_args=_tool_original_args,
-                    task_id=task_id or "",
-                    session_id=session_id or "",
-                    tool_call_id=tool_call_id or "",
-                    turn_id=turn_id or "",
-                    api_request_id=api_request_id or "",
-                )
+            with tool_execution_context(
+                session_id=session_id,
+                turn_id=turn_id,
+                tool_call_id=tool_call_id,
+                tool_name=function_name,
+            ):
+                if function_name == "execute_code":
+                    # Prefer the caller-provided list so subagents can't overwrite
+                    # the parent's tool set via the process-global.
+                    sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
+                    def _dispatch(next_args: Dict[str, Any]) -> Any:
+                        return registry.dispatch(
+                            function_name, next_args,
+                            task_id=task_id,
+                            session_id=session_id,
+                            enabled_tools=sandbox_enabled,
+                        )
+                else:
+                    def _dispatch(next_args: Dict[str, Any]) -> Any:
+                        return registry.dispatch(
+                            function_name, next_args,
+                            task_id=task_id,
+                            session_id=session_id,
+                            user_task=user_task,
+                        )
+                if skip_tool_execution_middleware:
+                    result = _dispatch(function_args)
+                else:
+                    from hermes_cli.middleware import run_tool_execution_middleware
+
+                    result = run_tool_execution_middleware(
+                        function_name,
+                        function_args,
+                        _dispatch,
+                        original_args=_tool_original_args,
+                        task_id=task_id or "",
+                        session_id=session_id or "",
+                        tool_call_id=tool_call_id or "",
+                        turn_id=turn_id or "",
+                        api_request_id=api_request_id or "",
+                    )
         finally:
             if _approval_tokens is not None and reset_current_observability_context is not None:
                 try:

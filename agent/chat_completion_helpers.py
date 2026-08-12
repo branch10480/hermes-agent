@@ -3110,7 +3110,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             agent._close_request_openai_client(request_client, reason=reason)
 
     first_delta_fired = {"done": False}
-    deltas_were_sent = {"yes": False}  # Track if any deltas were fired (for fallback)
+    deltas_were_sent = {"yes": False}  # Track if any text deltas were fired
+    stream_delivery_started = {"yes": False}
+    stream_opened = {"yes": False}
     provider_tool_in_flight = {"yes": False}
     # Wall-clock timestamp of the last real streaming chunk.  The outer
     # poll loop uses this to detect stale connections that keep receiving
@@ -3152,6 +3154,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         with stream_attempt_lock:
             stream_attempt_state["current"] += 1
             attempt_id = int(stream_attempt_state["current"])
+        stream_opened["yes"] = False
         provider_tool_in_flight["yes"] = False
         return attempt_id
 
@@ -3308,6 +3311,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             return request_client.chat.completions.create(**stream_kwargs)
 
         def _stream_created(raw_stream: Any) -> None:
+            stream_opened["yes"] = True
             response = getattr(raw_stream, "response", None)
             agent._capture_rate_limits(response)
             agent._capture_credits(response)
@@ -3469,6 +3473,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     reasoning_text,
                 )
                 reasoning_parts.append(reasoning_text)
+                stream_delivery_started["yes"] = True
                 _fire_first_delta()
                 agent._fire_reasoning_delta(reasoning_text)
 
@@ -3476,6 +3481,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if delta and delta.content:
                 content_parts.append(delta.content)
                 if not tool_calls_acc:
+                    stream_delivery_started["yes"] = True
                     _fire_first_delta()
                     agent._fire_stream_delta(delta.content)
                     deltas_were_sent["yes"] = True
@@ -3492,6 +3498,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # box is already closed (tool boundary flush).
                 elif agent.stream_delta_callback:
                     try:
+                        stream_delivery_started["yes"] = True
                         agent.stream_delta_callback(delta.content)
                         agent._record_streamed_assistant_text(delta.content)
                     except Exception:
@@ -3563,6 +3570,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     name = entry["function"]["name"]
                     if name and idx not in tool_gen_notified:
                         tool_gen_notified.add(idx)
+                        stream_delivery_started["yes"] = True
                         _fire_first_delta()
                         agent._fire_tool_gen_started(name)
                         # Record the partial tool-call name so the outer
@@ -3818,6 +3826,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             return manager.__enter__()
 
         def _anthropic_stream_created(raw_stream: Any) -> None:
+            stream_opened["yes"] = True
             _stream_context["stream"] = raw_stream
             # The Anthropic SDK exposes the raw httpx response on
             # ``stream.response``. Snapshot diagnostics immediately so they
@@ -3888,8 +3897,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     block = getattr(event, "content_block", None)
                     if block and getattr(block, "type", None) == "tool_use":
                         has_tool_use = True
+                        provider_tool_in_flight["yes"] = True
+                        stream_delivery_started["yes"] = True
                         tool_name = getattr(block, "name", None)
                         if tool_name:
+                            result["partial_tool_names"].append(tool_name)
                             _fire_first_delta()
                             agent._fire_tool_gen_started(tool_name)
                 elif event_type == "content_block_delta":
@@ -3899,12 +3911,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         if delta_type == "text_delta":
                             text = getattr(delta, "text", "")
                             if text and not has_tool_use:
+                                stream_delivery_started["yes"] = True
                                 _fire_first_delta()
                                 agent._fire_stream_delta(text)
                                 deltas_were_sent["yes"] = True
                         elif delta_type == "thinking_delta":
                             thinking_text = getattr(delta, "thinking", "")
                             if thinking_text:
+                                stream_delivery_started["yes"] = True
                                 _fire_first_delta()
                                 agent._fire_reasoning_delta(thinking_text)
             if not agent._interrupt_requested:
@@ -3995,6 +4009,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         import httpx as _httpx
 
         _max_stream_retries = env_int("HERMES_STREAM_RETRIES", 2)
+        # A provider can corrupt the first SSE frame before the OpenAI SDK
+        # delivers anything to Hermes.  This is a narrower recovery than the
+        # normal stream retry budget: reconnect at most once within that
+        # configured budget, then surface the error.
+        unicode_decode_retry_attempted = False
 
         try:
             for _stream_attempt in range(_max_stream_retries + 1):
@@ -4048,6 +4067,35 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     )
                     _is_stream_parse_err = agent._is_provider_stream_parse_error(e)
                     _is_empty_stream = isinstance(e, EmptyStreamError)
+
+                    if (
+                        isinstance(e, UnicodeDecodeError)
+                        and not unicode_decode_retry_attempted
+                        and stream_opened["yes"]
+                        and _stream_attempt < _max_stream_retries
+                        and not stream_delivery_started["yes"]
+                        and not provider_tool_in_flight["yes"]
+                        and not result.get("partial_tool_names")
+                    ):
+                        # _open_stream creates a request-local client on every
+                        # attempt. Closing it before continue therefore gives
+                        # the provider a genuinely fresh connection, while the
+                        # dedicated guard keeps this recovery to one retry.
+                        unicode_decode_retry_attempted = True
+                        agent._emit_stream_drop(
+                            error=e,
+                            attempt=2,
+                            max_attempts=2,
+                            mid_tool_call=False,
+                            diag=request_client_holder.get("diag"),
+                        )
+                        _cancel_current_stream_attempt(
+                            "stream_unicode_decode_retry_cleanup"
+                        )
+                        _close_request_client_once(
+                            "stream_unicode_decode_retry_cleanup"
+                        )
+                        continue
 
                     # If the stream died AFTER some tokens were delivered:
                     # normally we don't retry (the user already saw text,
@@ -4511,7 +4559,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
     if result["error"] is not None:
-        if deltas_were_sent["yes"]:
+        if stream_delivery_started["yes"]:
             # Streaming failed AFTER some tokens were already delivered to
             # the platform.  Re-raising would let the outer retry loop make
             # Return a partial response stub with finish_reason="length"

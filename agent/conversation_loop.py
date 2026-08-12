@@ -6769,9 +6769,81 @@ def run_conversation(
                     # A tool result could not be made canonical. Do not send
                     # the in-memory result back to the model or project any
                     # later events from this turn.
+                    try:
+                        from agent.turn_control import discard_deferred_turn
+
+                        discard_deferred_turn(
+                            session_id=getattr(agent, "session_id", "") or "",
+                            turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        )
+                    except Exception:
+                        logger.debug("failed to discard deferred turn", exc_info=True)
                     _turn_exit_reason = "session_persistence_failed"
                     final_response = ""
                     failed = True
+                    break
+
+                try:
+                    from agent.turn_control import peek_deferred_turn
+
+                    _deferred_turn = peek_deferred_turn(
+                        session_id=getattr(agent, "session_id", "") or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                    )
+                except Exception:
+                    logger.warning("deferred-turn consume failed", exc_info=True)
+                    _deferred_turn = None
+
+                if _deferred_turn is not None:
+                    _turn_exit_reason = "tool_deferred_turn"
+                    final_response = _deferred_turn.acknowledgement
+                    messages.append({"role": "assistant", "content": final_response})
+                    _deferred_ack_persisted = False
+                    try:
+                        _deferred_ack_persisted = agent._flush_messages_to_session_db(
+                            messages, conversation_history
+                        ) is not False
+                    except Exception:
+                        logger.warning(
+                            "deferred-turn acknowledgement flush failed (session=%s)",
+                            getattr(agent, "session_id", None) or "none",
+                            exc_info=True,
+                        )
+                    if _deferred_ack_persisted:
+                        try:
+                            from agent.turn_control import consume_deferred_turn
+
+                            consume_deferred_turn(
+                                session_id=getattr(agent, "session_id", "") or "",
+                                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                            )
+                        except Exception:
+                            logger.warning(
+                                "deferred-turn completion cleanup failed",
+                                exc_info=True,
+                            )
+                    else:
+                        # The job may already be running, but the harness must
+                        # not claim a durable handoff when its acknowledgement
+                        # could not be committed. Keep the defer request pending
+                        # for in-process recovery and stop without another LLM
+                        # call so the parent cannot re-enter the busy loop.
+                        messages.pop()
+                        final_response = (
+                            "Knowledgeジョブは開始されましたが、受理記録の保存に失敗しました。"
+                            "knowledge_status で状態を確認してください。"
+                        )
+                        messages.append({"role": "assistant", "content": final_response})
+                        _turn_exit_reason = "tool_deferred_ack_persistence_failed"
+                        failed = True
+                    if final_response:
+                        agent._safe_print(f"\n{final_response}\n")
+                        if agent.stream_delta_callback:
+                            try:
+                                agent.stream_delta_callback(final_response)
+                                agent.stream_delta_callback(None)
+                            except Exception:
+                                pass
                     break
 
                 if agent._tool_guardrail_halt_decision is not None:

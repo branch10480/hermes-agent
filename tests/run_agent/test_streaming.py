@@ -3,6 +3,8 @@
 Tests the unified streaming API call, delta callbacks, tool-call
 suppression, provider fallback, and CLI streaming display.
 """
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -51,6 +53,78 @@ def _make_tool_call_delta(index=0, tc_id=None, name=None, arguments=None, extra_
 def _make_empty_chunk(model=None, usage=None):
     """Build a chunk with no choices (usage-only final chunk)."""
     return SimpleNamespace(choices=[], model=model, usage=usage)
+
+
+class _FailingProviderStream:
+    """Provider stream that fails while the SDK is consuming SSE bytes."""
+
+    def __init__(self, error, chunks=()):
+        self.error = error
+        self.chunks = tuple(chunks)
+        self.response = SimpleNamespace(headers={})
+        self.closed = False
+
+    def __iter__(self):
+        yield from self.chunks
+        raise self.error
+
+    def close(self):
+        self.closed = True
+
+
+class _UnicodeDecodeRetryHandler(BaseHTTPRequestHandler):
+    """Local OpenAI-wire endpoint for the real transport retry test."""
+
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self):  # noqa: N802 - stdlib handler API
+        if self.path != "/v1/chat/completions":
+            self.send_error(404)
+            return
+        content_length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(content_length)
+        self.server.connections.append(self.connection)
+        self.server.request_count += 1
+
+        if self.server.request_count == 1:
+            # OpenAI's SSE parser decodes this line as UTF-8 before Hermes
+            # receives any event, reproducing the provider-side failure.
+            payload = b"data: \x80\n\n"
+        else:
+            def event(delta, finish_reason=None):
+                return (
+                    "data: "
+                    + json.dumps({
+                        "id": "chatcmpl-test",
+                        "object": "chat.completion.chunk",
+                        "created": 0,
+                        "model": "test-model",
+                        "choices": [{
+                            "index": 0,
+                            "delta": delta,
+                            "finish_reason": finish_reason,
+                        }],
+                    })
+                    + "\n\n"
+                ).encode("utf-8")
+
+            payload = (
+                event({"role": "assistant", "content": "recovered"})
+                + event({}, "stop")
+                + b"data: [DONE]\n\n"
+            )
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+        self.wfile.flush()
+
+    def log_message(self, format, *args):
+        return
 
 
 # ── Test: Streaming Accumulator ──────────────────────────────────────────
@@ -467,6 +541,292 @@ class TestStreamingFallback:
         assert mock_client.chat.completions.create.call_count == 3
         # Connection cleanup should happen for each failed retry
         assert mock_close.call_count >= 2
+
+
+    def test_pre_delivery_unicode_decode_reconnects_once(
+        self, monkeypatch
+    ):
+        """A corrupt first frame gets one fresh TCP connection before delivery."""
+        from run_agent import AIAgent
+
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+        monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _UnicodeDecodeRetryHandler)
+        server.connections = []
+        server.request_count = 0
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        agent = None
+        try:
+            agent = AIAgent(
+                api_key="test-key",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                model="test-model",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            agent.api_mode = "chat_completions"
+            agent._interrupt_requested = False
+
+            response = agent._interruptible_streaming_api_call({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            })
+
+            assert response.choices[0].message.content == "recovered"
+            assert server.request_count == 2
+            assert server.connections[0] is not server.connections[1]
+        finally:
+            if agent is not None:
+                agent.close()
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_pre_delivery_unicode_decode_retry_is_bounded(
+        self, mock_close, mock_create, monkeypatch
+    ):
+        """A repeated decode failure stops after the one dedicated retry."""
+        from run_agent import AIAgent
+
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+        decode_error = UnicodeDecodeError(
+            "utf-8", b"\x80", 0, 1, "invalid start byte"
+        )
+        first_client = MagicMock()
+        second_client = MagicMock()
+        first_client.chat.completions.create.return_value = _FailingProviderStream(
+            decode_error
+        )
+        second_client.chat.completions.create.return_value = _FailingProviderStream(
+            decode_error
+        )
+        mock_create.side_effect = [first_client, second_client]
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        with pytest.raises(UnicodeDecodeError):
+            agent._interruptible_streaming_api_call({})
+
+        assert mock_create.call_count == 2
+        mock_close.assert_called()
+
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_unicode_decode_after_delivery_is_not_retried(
+        self, mock_close, mock_create, monkeypatch
+    ):
+        """Once text was delivered, a decode error must not duplicate it."""
+        from run_agent import AIAgent
+
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+        decode_error = UnicodeDecodeError(
+            "utf-8", b"\x80", 0, 1, "invalid start byte"
+        )
+
+        first_client = MagicMock()
+        second_client = MagicMock()
+        first_client.chat.completions.create.return_value = _FailingProviderStream(
+            decode_error, chunks=[_make_stream_chunk(content="already visible")]
+        )
+        second_client.chat.completions.create.return_value = iter([
+            _make_stream_chunk(content="duplicate"),
+            _make_stream_chunk(finish_reason="stop"),
+        ])
+        mock_create.side_effect = [first_client, second_client]
+
+        deltas = []
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_delta_callback=deltas.append,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert mock_create.call_count == 1
+        assert deltas == ["already visible"]
+        assert response.choices[0].message.content == "already visible"
+        mock_close.assert_called()
+
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_pre_delivery_unicode_decode_respects_retry_budget(
+        self, mock_close, mock_create, monkeypatch
+    ):
+        """HERMES_STREAM_RETRIES=0 remains a hard no-retry setting."""
+        from run_agent import AIAgent
+
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+        decode_error = UnicodeDecodeError(
+            "utf-8", b"\x80", 0, 1, "invalid start byte"
+        )
+        client = MagicMock()
+        client.chat.completions.create.return_value = _FailingProviderStream(
+            decode_error
+        )
+        mock_create.return_value = client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        with pytest.raises(UnicodeDecodeError):
+            agent._interruptible_streaming_api_call({})
+
+        assert mock_create.call_count == 1
+        mock_close.assert_called_once()
+
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_unicode_decode_on_final_stream_slot_does_not_add_attempt(
+        self, mock_close, mock_create, monkeypatch
+    ):
+        """A prior transient retry must not grant Unicode an extra attempt."""
+        import httpx
+        from run_agent import AIAgent
+
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+        decode_error = UnicodeDecodeError(
+            "utf-8", b"\x80", 0, 1, "invalid start byte"
+        )
+        first_client = MagicMock()
+        second_client = MagicMock()
+        first_client.chat.completions.create.side_effect = httpx.ConnectError(
+            "transient"
+        )
+        second_client.chat.completions.create.return_value = _FailingProviderStream(
+            decode_error
+        )
+        mock_create.side_effect = [first_client, second_client]
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        with pytest.raises(UnicodeDecodeError):
+            agent._interruptible_streaming_api_call({})
+
+        assert mock_create.call_count == 2
+        mock_close.assert_called()
+
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_unicode_decode_after_reasoning_delivery_returns_partial_stub(
+        self, mock_close, mock_create, monkeypatch
+    ):
+        """Visible reasoning also counts as delivery and cannot be duplicated."""
+        from run_agent import AIAgent
+
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+        decode_error = UnicodeDecodeError(
+            "utf-8", b"\x80", 0, 1, "invalid start byte"
+        )
+        first_client = MagicMock()
+        second_client = MagicMock()
+        first_client.chat.completions.create.return_value = _FailingProviderStream(
+            decode_error,
+            chunks=[_make_stream_chunk(reasoning_content="visible reasoning")],
+        )
+        mock_create.side_effect = [first_client, second_client]
+        reasoning = []
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            reasoning_callback=reasoning.append,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert mock_create.call_count == 1
+        assert reasoning == ["visible reasoning"]
+        assert response.choices[0].finish_reason == "length"
+        mock_close.assert_called()
+
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_unicode_decode_after_tool_generation_is_not_retried(
+        self, mock_close, mock_create, monkeypatch
+    ):
+        """A partial tool call is delivery and must not be issued twice."""
+        from run_agent import AIAgent
+
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+        decode_error = UnicodeDecodeError(
+            "utf-8", b"\x80", 0, 1, "invalid start byte"
+        )
+        first_client = MagicMock()
+        second_client = MagicMock()
+        first_client.chat.completions.create.return_value = _FailingProviderStream(
+            decode_error,
+            chunks=[_make_stream_chunk(tool_calls=[
+                _make_tool_call_delta(index=0, tc_id="call-1", name="terminal")
+            ])],
+        )
+        mock_create.side_effect = [first_client, second_client]
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert mock_create.call_count == 1
+        assert response.choices[0].finish_reason == "length"
+        mock_close.assert_called()
 
 
 
@@ -1634,4 +1994,3 @@ class TestBedrockReasoningStaleFloor:
         from agent.chat_completion_helpers import _bedrock_reasoning_stale_floor
 
         assert _bedrock_reasoning_stale_floor(model_id) == expected
-

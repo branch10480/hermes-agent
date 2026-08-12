@@ -1443,6 +1443,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
 
             if is_error:
+                _discard_failed_tool_defer(agent, getattr(tc, "id", "") or "")
                 _err_text = _multimodal_text_summary(function_result)
                 result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
@@ -1598,6 +1599,77 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
             getattr(tc, "id", "") or "",
             effect_disposition="none",
         ))
+
+
+def _turn_is_deferred(agent) -> bool:
+    """Return whether a trusted tool requested an end to this exact turn."""
+
+    try:
+        from agent.turn_control import peek_deferred_turn
+
+        return peek_deferred_turn(
+            session_id=getattr(agent, "session_id", "") or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+        ) is not None
+    except Exception:
+        logging.debug("turn defer lookup failed", exc_info=True)
+        return False
+
+
+def _discard_failed_tool_defer(agent, tool_call_id: str) -> None:
+    """Roll back a defer unless this exact tool call completed successfully."""
+
+    try:
+        from agent.turn_control import discard_deferred_turn_for_tool
+
+        discard_deferred_turn_for_tool(
+            session_id=getattr(agent, "session_id", "") or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            tool_call_id=tool_call_id,
+        )
+    except Exception:
+        logging.debug("failed to discard failed tool defer", exc_info=True)
+
+
+def _append_deferred_tool_results(
+    agent,
+    messages: list,
+    tool_calls,
+    *,
+    effective_task_id: str,
+) -> bool:
+    """Close unexecuted sibling calls without starting their side effects."""
+
+    for tool_call in tool_calls:
+        name = getattr(getattr(tool_call, "function", None), "name", "") or "tool"
+        result = (
+            f"[Tool execution skipped — {name} was not started because a prior "
+            "tool handed this turn to a background job]"
+        )
+        messages.append(make_tool_result_message(
+            name,
+            result,
+            getattr(tool_call, "id", "") or "",
+            effect_disposition="none",
+        ))
+        _emit_terminal_post_tool_call(
+            agent,
+            function_name=name,
+            function_args={},
+            result=result,
+            effective_task_id=effective_task_id,
+            tool_call_id=getattr(tool_call, "id", "") or "",
+            status="cancelled",
+            error_type="turn_deferred",
+            error_message="Tool execution skipped because the turn was deferred",
+        )
+        if not _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"deferred tool result {name}",
+        ):
+            return False
+    return True
 
 
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
@@ -2182,6 +2254,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+        if _is_error_result:
+            _discard_failed_tool_defer(
+                agent,
+                getattr(tool_call, "id", "") or "",
+            )
         # The agent-runtime tools above (todo, session_search, memory,
         # context-engine, memory-manager, clarify, delegate_task) are
         # dispatched inline — they never reach handle_function_call, so the
@@ -2326,6 +2403,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 response_preview = _fr_str[:agent.log_prefix_chars] + "..." if len(_fr_str) > agent.log_prefix_chars else _fr_str
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
 
+        if _turn_is_deferred(agent) and i < len(assistant_message.tool_calls):
+            remaining_calls = assistant_message.tool_calls[i:]
+            agent._vprint(
+                f"{agent.log_prefix}↪ Turn deferred: skipping "
+                f"{len(remaining_calls)} remaining tool call(s)",
+                force=True,
+            )
+            if not _append_deferred_tool_results(
+                agent,
+                messages,
+                remaining_calls,
+                effective_task_id=effective_task_id,
+            ):
+                return
+            break
+
         if agent._interrupt_requested and i < len(assistant_message.tool_calls):
             remaining = len(assistant_message.tool_calls) - i
             agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {remaining} remaining tool call(s)", force=True)
@@ -2392,9 +2485,25 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
-    for kind, calls in segments:
+    for segment_index, (kind, calls) in enumerate(segments):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+
+        if _turn_is_deferred(agent):
+            remaining_calls = [
+                tool_call
+                for _, later_calls in segments[segment_index:]
+                for tool_call in later_calls
+            ]
+            if remaining_calls:
+                if not _append_deferred_tool_results(
+                    agent,
+                    messages,
+                    remaining_calls,
+                    effective_task_id=effective_task_id,
+                ):
+                    return
+            break
         segment_message = SimpleNamespace(tool_calls=list(calls))
         if kind == "parallel":
             execute_tool_calls_concurrent(
