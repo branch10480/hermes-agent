@@ -568,6 +568,8 @@ class TestPreToolCallDirective:
                     "tool_call_id": "call-1",
                     "turn_id": "",
                     "api_request_id": "",
+                    "direct_user_authority_revision": 0,
+                    "direct_user_authority_kind": "untrusted",
                     "middleware_trace": [],
                 },
             )

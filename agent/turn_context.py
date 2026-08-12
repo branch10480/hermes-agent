@@ -552,7 +552,24 @@ def build_turn_context(
     agent._current_api_request_id = ""
     from agent.direct_user_authority import begin_turn as _begin_direct_authority
 
-    _begin_direct_authority(agent.session_id or "", effective_task_id, turn_id)
+    _authority_provenance = "untrusted"
+    if (
+        direct_user_message_provenance == "direct_text"
+        and isinstance(direct_user_message, str)
+    ):
+        _authority_provenance = "direct_user"
+    elif (
+        getattr(agent, "platform", None) == "cron"
+        and getattr(agent, "_scheduled_turn_authority_attested", False) is True
+    ):
+        _authority_provenance = "scheduled"
+    _begin_direct_authority(
+        agent.session_id or "",
+        effective_task_id,
+        turn_id,
+        provenance=_authority_provenance,
+    )
+    agent._direct_user_authority_kind = _authority_provenance
     _authority_lock = getattr(agent, "_direct_user_authority_lock", None)
     if _authority_lock is None:
         agent._direct_user_authority_revision = 0

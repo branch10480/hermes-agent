@@ -603,6 +603,10 @@ def _run_agent_tool_execution_middleware(
                             getattr(agent, "_direct_user_authority_revision", 0)
                             or 0
                         ),
+                        direct_user_authority_kind=str(
+                            getattr(agent, "_direct_user_authority_kind", "untrusted")
+                            or "untrusted"
+                        ),
                         middleware_trace=list(state["middleware_trace"]),
                     )
                 except Exception:
@@ -2213,6 +2217,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             getattr(agent, "_direct_user_authority_revision", 0)
                             or 0
                         ),
+                        direct_user_authority_kind=str(
+                            getattr(agent, "_direct_user_authority_kind", "untrusted")
+                            or "untrusted"
+                        ),
                         enabled_tools=(
                             list(agent.valid_tool_names)
                             if agent.valid_tool_names
@@ -2295,6 +2303,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         direct_user_authority_revision=int(
                             getattr(agent, "_direct_user_authority_revision", 0)
                             or 0
+                        ),
+                        direct_user_authority_kind=str(
+                            getattr(agent, "_direct_user_authority_kind", "untrusted")
+                            or "untrusted"
                         ),
                         enabled_tools=(
                             list(agent.valid_tool_names)

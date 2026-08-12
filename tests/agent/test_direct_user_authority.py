@@ -8,7 +8,9 @@ from agent.direct_user_authority import (
     claim_publication,
     close_turn,
     current_revision,
+    consume_bound_capability,
     forget_session,
+    issue_bound_capability,
     revoke_for_correction,
 )
 
@@ -110,10 +112,8 @@ def test_publication_claim_linearizes_before_or_after_correction():
     task_id = "authority-task"
     turn_id = "authority-turn"
     forget_session(session_id)
-    assert begin_turn(session_id, task_id, turn_id)
 
-    # The untouched direct turn can make more than one serialized attempt,
-    # which supports a safe retry token after a transient publication error.
+    assert begin_turn(session_id, task_id, turn_id)
     assert claim_publication(session_id, task_id, turn_id, 0)
     assert claim_publication(session_id, task_id, turn_id, 0)
     assert not claim_publication(session_id, task_id, turn_id, False)
@@ -122,13 +122,102 @@ def test_publication_claim_linearizes_before_or_after_correction():
     assert not claim_publication(session_id, task_id, turn_id, 1)
     forget_session(session_id)
 
-    # If correction wins the same registry lock first, no publication boundary
-    # can be crossed afterward in that turn.
     assert begin_turn(session_id, task_id, "turn-corrected-first")
     assert revoke_for_correction(session_id, task_id, "turn-corrected-first") == 1
     assert not claim_publication(
         session_id, task_id, "turn-corrected-first", 0
     )
+    forget_session(session_id)
+
+
+def test_bound_capability_is_opaque_exact_and_one_shot():
+    session_id = "authority-bound-publication"
+    task_id = "authority-task"
+    turn_id = "authority-turn"
+    binding = "plugin-validated:exact-binding-v1"
+    forget_session(session_id)
+    assert begin_turn(session_id, task_id, turn_id)
+    token = issue_bound_capability(
+        session_id, task_id, turn_id, 0, binding,
+    )
+    assert isinstance(token, str) and token not in binding
+    assert not consume_bound_capability(token, binding + " ")
+    assert not consume_bound_capability(token, binding)
+    forget_session(session_id)
+
+    assert begin_turn(session_id, task_id, "authority-turn-2")
+    token = issue_bound_capability(
+        session_id, task_id, "authority-turn-2", 0, binding,
+    )
+    assert token is not None
+    assert consume_bound_capability(token, binding)
+    assert not consume_bound_capability(token, binding)
+    forget_session(session_id)
+
+
+def test_untrusted_turn_never_opens_direct_authority():
+    session_id = "authority-untrusted"
+    forget_session(session_id)
+    assert not begin_turn(
+        session_id, "task", "turn", provenance="untrusted"
+    )
+    assert current_revision(session_id, "task", "turn") is None
+    assert issue_bound_capability(
+        session_id, "task", "turn", 0, "binding"
+    ) is None
+    forget_session(session_id)
+
+
+def test_scheduled_bound_capability_survives_turn_close():
+    session_id = "authority-scheduled"
+    task_id = "authority-task"
+    turn_id = "authority-turn"
+    grant = "plugin-validated:scheduled-grant-v1"
+    forget_session(session_id)
+    assert begin_turn(
+        session_id, task_id, turn_id, provenance="scheduled"
+    )
+    token = issue_bound_capability(
+        session_id,
+        task_id,
+        turn_id,
+        0,
+        grant,
+        authority_kind="scheduled",
+    )
+    assert token is not None
+    close_turn(session_id, task_id, turn_id)
+    assert consume_bound_capability(token, grant)
+    assert not consume_bound_capability(token, grant)
+    forget_session(session_id)
+
+
+def test_replayed_scheduled_turn_revokes_its_original_capability():
+    session_id = "authority-scheduled-replay"
+    task_id = "authority-task"
+    turn_id = "authority-turn"
+    grant = "plugin-validated:scheduled-grant-v1"
+    forget_session(session_id)
+    assert begin_turn(session_id, task_id, turn_id, provenance="scheduled")
+    token = issue_bound_capability(
+        session_id, task_id, turn_id, 0, grant, authority_kind="scheduled",
+    )
+    assert token is not None
+    assert not begin_turn(session_id, task_id, turn_id, provenance="scheduled")
+    assert not consume_bound_capability(token, grant)
+    forget_session(session_id)
+
+
+def test_bound_capability_rejects_empty_or_oversized_bindings():
+    session_id = "authority-invalid-binding"
+    forget_session(session_id)
+    assert begin_turn(session_id, "task", "turn")
+    assert issue_bound_capability(
+        session_id, "task", "turn", 0, ""
+    ) is None
+    assert issue_bound_capability(
+        session_id, "task", "turn", 0, "x" * 4097
+    ) is None
     forget_session(session_id)
 
 

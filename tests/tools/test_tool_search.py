@@ -563,9 +563,15 @@ class TestDeferredCallSchemaProbe:
     def _register(name, toolset, required=("document_id",)):
         from tools.registry import registry
 
-        def _handler(args, task_id=None, **kw):
+        def _handler(
+            args, task_id=None, direct_user_authority_kind=None, **kw,
+        ):
             # Simulates a tool that crashes opaquely on a missing required arg.
-            return json.dumps({"ok": True, "doc": args["document_id"]})
+            return json.dumps({
+                "ok": True,
+                "doc": args["document_id"],
+                "authority_kind": direct_user_authority_kind,
+            })
 
         params = {
             "type": "object",
@@ -616,3 +622,18 @@ class TestDeferredCallSchemaProbe:
         ))
         assert result.get("ok") is True
         assert result.get("doc") == "abc"
+
+    def test_tool_call_bridge_preserves_scheduled_authority_kind(self):
+        import model_tools
+
+        self._register("mcp_probe_authority", "mcp-probe-authority")
+        result = json.loads(model_tools.handle_function_call(
+            function_name="tool_call",
+            function_args={
+                "name": "mcp_probe_authority",
+                "arguments": {"document_id": "abc"},
+            },
+            direct_user_authority_kind="scheduled",
+            enabled_toolsets=["mcp-probe-authority"],
+        ))
+        assert result["authority_kind"] == "scheduled"

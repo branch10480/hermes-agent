@@ -760,6 +760,7 @@ def _run_claimed_job(
                 processed = run_one_job(
                     job, adapters=adapters, loop=gateway_loop,
                     extra_prompt=extra_prompt,
+                    fire_provenance="manual",
                 )
             finally:
                 _heartbeat_stop.set()

@@ -2863,6 +2863,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 direct_user_authority_revision=int(
                     getattr(agent, "_direct_user_authority_revision", 0) or 0
                 ),
+                direct_user_authority_kind=str(
+                    getattr(agent, "_direct_user_authority_kind", "untrusted")
+                    or "untrusted"
+                ),
                 middleware_trace=list(_tool_middleware_trace),
             )
         except Exception:
@@ -3027,6 +3031,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 direct_user_authority_revision=int(
                     getattr(agent, "_direct_user_authority_revision", 0) or 0
+                ),
+                direct_user_authority_kind=str(
+                    getattr(agent, "_direct_user_authority_kind", "untrusted")
+                    or "untrusted"
                 ),
                 enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                 skip_pre_tool_call_hook=True,

@@ -3168,6 +3168,7 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
+    fire_provenance: str = "untrusted",
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -4078,6 +4079,25 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
+        # A cron surface alone is not publication authority. Trusted plugin
+        # code must attest the exact server-loaded job record before the turn
+        # prologue may open scheduled authority.
+        _scheduled_authority_attested = False
+        try:
+            from hermes_cli.plugins import scheduled_turn_authority_attested
+
+            _scheduled_authority_attested = scheduled_turn_authority_attested(
+                job,
+                fire_provenance=fire_provenance,
+                has_extra_prompt=extra_prompt is not None,
+            )
+        except Exception as _attestation_exc:
+            logger.warning(
+                "Job '%s': scheduled authority attestation failed closed: %s",
+                job_id,
+                _attestation_exc,
+            )
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -4112,6 +4132,7 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        agent._scheduled_turn_authority_attested = _scheduled_authority_attested
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -4539,6 +4560,7 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
 def run_one_job(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None,
+    fire_provenance: str = "untrusted",
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -4609,6 +4631,7 @@ def run_one_job(
             success, output, final_response, error = run_job(
                 job, defer_agent_teardown=_deferred_agents,
                 extra_prompt=extra_prompt,
+                fire_provenance=fire_provenance,
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -4961,7 +4984,10 @@ def tick(
             module-level ``run_one_job`` so ``tick`` and external providers
             (Chronos ``fire_due``) use the identical execute→save→deliver→mark
             body."""
-            return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
+            return run_one_job(
+                job, adapters=adapters, loop=loop, verbose=verbose,
+                fire_provenance="scheduled_due",
+            )
 
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so

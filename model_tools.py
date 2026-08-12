@@ -1166,6 +1166,7 @@ def handle_function_call(
     turn_id: Optional[str] = None,
     api_request_id: Optional[str] = None,
     direct_user_authority_revision: int = 0,
+    direct_user_authority_kind: str = "untrusted",
     user_task: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     skip_pre_tool_call_hook: bool = False,
@@ -1306,6 +1307,7 @@ def handle_function_call(
                 turn_id=turn_id,
                 api_request_id=api_request_id,
                 direct_user_authority_revision=direct_user_authority_revision,
+                direct_user_authority_kind=direct_user_authority_kind,
                 user_task=user_task,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
@@ -1490,6 +1492,7 @@ def handle_function_call(
                                 "direct_user_authority_revision",
                                 direct_user_authority_revision,
                             ),
+                            ("direct_user_authority_kind", direct_user_authority_kind),
                         ):
                             if registry.handler_accepts_keyword(function_name, key):
                                 dispatch_context[key] = value
@@ -1512,6 +1515,7 @@ def handle_function_call(
                                 "direct_user_authority_revision",
                                 direct_user_authority_revision,
                             ),
+                            ("direct_user_authority_kind", direct_user_authority_kind),
                         ):
                             if registry.handler_accepts_keyword(function_name, key):
                                 dispatch_context[key] = value

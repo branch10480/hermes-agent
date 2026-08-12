@@ -34,6 +34,7 @@ so plugin-defined tools appear alongside the built-in tools.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -134,6 +135,10 @@ _install_plugin_debug_handler()
 # ---------------------------------------------------------------------------
 
 VALID_HOOKS: Set[str] = {
+    # Synchronous scheduler-owned authority attestation. Plugins inspect a
+    # defensive copy of the server-loaded cron record and may attest only an
+    # exact tracked job identity; model-authored prompt text is never enough.
+    "attest_scheduled_turn",
     "pre_tool_call",
     "post_tool_call",
     "transform_terminal_output",
@@ -2444,6 +2449,33 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
 
 
+def scheduled_turn_authority_attested(
+    job: Mapping[str, Any], *, fire_provenance: str, has_extra_prompt: bool,
+) -> bool:
+    """Return whether trusted plugin code attests this exact scheduled fire."""
+
+    if not isinstance(job, Mapping):
+        return False
+    if fire_provenance != "scheduled_due" or has_extra_prompt is not False:
+        return False
+    job_id = job.get("id")
+    if not isinstance(job_id, str) or not job_id:
+        return False
+    discover_plugins()
+    results = invoke_hook(
+        "attest_scheduled_turn",
+        job=copy.deepcopy(dict(job)),
+        fire_provenance=fire_provenance,
+        has_extra_prompt=has_extra_prompt,
+    )
+    expected = {
+        "schema_version": 1,
+        "authority": "scheduled",
+        "job_id": job_id,
+    }
+    return any(result == expected for result in results)
+
+
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
     """Invoke registered middleware callbacks.
 
@@ -2497,6 +2529,7 @@ def _get_pre_tool_call_directive_details(
     turn_id: str = "",
     api_request_id: str = "",
     direct_user_authority_revision: int = 0,
+    direct_user_authority_kind: str = "untrusted",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> _PreToolCallDirective:
     """Check ``pre_tool_call`` hooks for a blocking or approval directive.
@@ -2545,6 +2578,7 @@ def _get_pre_tool_call_directive_details(
         turn_id=turn_id,
         api_request_id=api_request_id,
         direct_user_authority_revision=direct_user_authority_revision,
+        direct_user_authority_kind=direct_user_authority_kind,
         middleware_trace=list(middleware_trace or []),
     )
 
@@ -2578,6 +2612,7 @@ def get_pre_tool_call_directive(
     turn_id: str = "",
     api_request_id: str = "",
     direct_user_authority_revision: int = 0,
+    direct_user_authority_kind: str = "untrusted",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Check ``pre_tool_call`` hooks for a blocking or approval directive.
@@ -2592,6 +2627,7 @@ def get_pre_tool_call_directive(
         tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id,
         direct_user_authority_revision=direct_user_authority_revision,
+        direct_user_authority_kind=direct_user_authority_kind,
         middleware_trace=middleware_trace,
     )
     return (details.action, details.message)
@@ -2606,6 +2642,7 @@ def get_pre_tool_call_block_message(
     turn_id: str = "",
     api_request_id: str = "",
     direct_user_authority_revision: int = 0,
+    direct_user_authority_kind: str = "untrusted",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
     """Back-compat shim: return only a ``block`` message (or ``None``).
@@ -2620,6 +2657,7 @@ def get_pre_tool_call_block_message(
         tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id,
         direct_user_authority_revision=direct_user_authority_revision,
+        direct_user_authority_kind=direct_user_authority_kind,
         middleware_trace=middleware_trace,
     )
     return message if directive == "block" else None
@@ -2634,6 +2672,7 @@ def resolve_pre_tool_block(
     turn_id: str = "",
     api_request_id: str = "",
     direct_user_authority_revision: int = 0,
+    direct_user_authority_kind: str = "untrusted",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
     """Resolve the pre_tool_call directive to a final block message (or None).
@@ -2655,6 +2694,7 @@ def resolve_pre_tool_block(
         tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id,
         direct_user_authority_revision=direct_user_authority_revision,
+        direct_user_authority_kind=direct_user_authority_kind,
         middleware_trace=middleware_trace,
     )
     if details.action == "block":

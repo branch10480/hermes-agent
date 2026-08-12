@@ -225,6 +225,23 @@ class TestJobCRUD:
         assert fetched is not None
         assert fetched["prompt"] == "Check server status"
 
+    def test_managed_job_id_is_exact_and_cannot_be_duplicated(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Managed task", schedule="every 1h",
+            _managed_job_id="e28031e0acf8",
+        )
+        assert job["id"] == "e28031e0acf8"
+        with pytest.raises(ValueError, match="already exists"):
+            create_job(
+                prompt="Impostor", schedule="every 1h",
+                _managed_job_id="e28031e0acf8",
+            )
+        with pytest.raises(ValueError, match="12 lowercase hex"):
+            create_job(
+                prompt="Bad", schedule="every 1h",
+                _managed_job_id="not-managed",
+            )
+
     def test_list_jobs(self, tmp_cron_dir):
         create_job(prompt="Job 1", schedule="every 1h")
         create_job(prompt="Job 2", schedule="every 2h")

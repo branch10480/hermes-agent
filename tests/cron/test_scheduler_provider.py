@@ -247,10 +247,13 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
     ran = []
     monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid: True, raising=False)
     monkeypatch.setattr(jobs, "get_job", lambda jid: {"id": jid, "name": "t"})
-    monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
+    monkeypatch.setattr(
+        sched, "run_one_job",
+        lambda job, **kw: ran.append((job["id"], kw.get("fire_provenance"))) or True,
+    )
 
     assert InProcessCronScheduler().fire_due("j1") is True
-    assert ran == ["j1"]
+    assert ran == [("j1", "external_provider")]
 
 
 # ── F2a: ticker liveness — survival, heartbeat, honest status (#32612, #32895) ──
@@ -412,5 +415,4 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
     # With 2 profiles and multiple iterations, we should have seen at least 2 calls.
     assert len(tick_count) >= len(profile_homes), \
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
-
 

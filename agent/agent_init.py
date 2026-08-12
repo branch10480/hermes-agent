@@ -820,6 +820,8 @@ def init_agent(
     # cloud/publish decision captured from the original text cannot survive a
     # later user correction.
     agent._direct_user_authority_revision = 0
+    agent._direct_user_authority_kind = "untrusted"
+    agent._scheduled_turn_authority_attested = False
     agent._direct_user_authority_lock = threading.Lock()
 
     # Concurrent-tool worker thread tracking.  `_execute_tool_calls_concurrent`

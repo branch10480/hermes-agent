@@ -70,6 +70,7 @@ class TestCronjobRunExecutesImmediately:
             adapters=adapters,
             loop=gateway_loop,
             extra_prompt=None,
+            fire_provenance="manual",
         )
 
     def test_execute_job_now_remains_standalone_without_gateway(self):
@@ -83,7 +84,10 @@ class TestCronjobRunExecutesImmediately:
             res = _execute_job_now(dict(_JOB))
 
         assert res["success"] is True
-        m_run.assert_called_once_with(_JOB, adapters=None, loop=None, extra_prompt=None)
+        m_run.assert_called_once_with(
+            _JOB, adapters=None, loop=None, extra_prompt=None,
+            fire_provenance="manual",
+        )
 
     def test_execute_job_now_marks_failure_on_exception(self):
         """An exception during fire is captured, marked failed, not propagated."""

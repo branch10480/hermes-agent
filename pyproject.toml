@@ -428,6 +428,7 @@ gateway = ["assets/**/*"]
 testpaths = ["tests"]
 markers = [
     "integration: marks tests requiring external services (API keys, Modal, etc.)",
+    "real_audio_playback: opts into tests that may invoke the operating system audio player",
     "real_concurrent_gate: opt out of the autouse stub that disables _detect_concurrent_hermes_instances",
     "real_agent_prewarm: opt out of the autouse stub that disables the tui_gateway deferred agent pre-warm timer",
     "requires_wal: needs the runtime to actually enable SQLite WAL mode (skipped where Hermes falls back to journal_mode=DELETE)",
@@ -438,7 +439,7 @@ markers = [
     "windows_only: exercises native-Windows behaviour; skipped on other hosts",
 ]
 # integration tests take way too long to run in the normal CI environments
-addopts = "-m 'not integration'"
+addopts = "-m 'not integration and not real_audio_playback'"
 
 [tool.ty.environment]
 python-version = "3.13"

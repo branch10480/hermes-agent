@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.context_compressor import ContextCompressor
+from agent.direct_user_authority import current_revision, forget_session
 from agent.turn_context import TurnContext, build_turn_context
 from hermes_state import SessionDB
 
@@ -206,6 +207,38 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.messages[-1] == {"role": "user", "content": "hello"}
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
     assert ctx.active_system_prompt == "SYSTEM"
+
+
+@pytest.mark.parametrize(
+    (
+        "platform", "scheduled_attested", "direct_message",
+        "message_provenance", "expected_kind", "is_open",
+    ),
+    (
+        ("cli", False, "hello", "direct_text", "direct_user", True),
+        ("cron", True, None, "unknown", "scheduled", True),
+        ("cron", False, None, "unknown", "untrusted", False),
+        ("gateway", False, None, "unknown", "untrusted", False),
+    ),
+)
+def test_turn_authority_provenance_is_core_derived(
+    platform, scheduled_attested, direct_message, message_provenance,
+    expected_kind, is_open,
+):
+    agent = _FakeAgent()
+    agent.platform = platform
+    agent._scheduled_turn_authority_attested = scheduled_attested
+    forget_session(agent.session_id)
+    ctx = _build(
+        agent,
+        direct_user_message=direct_message,
+        direct_user_message_provenance=message_provenance,
+    )
+
+    assert agent._direct_user_authority_kind == expected_kind
+    revision = current_revision(agent.session_id, ctx.effective_task_id, ctx.turn_id)
+    assert (revision == 0) is is_open
+    forget_session(agent.session_id)
 
 
 # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
@@ -405,4 +438,3 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     overwritten or never read.
     """
     assert not _title_turn(platform).called
-

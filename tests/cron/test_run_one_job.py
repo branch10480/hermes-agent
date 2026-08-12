@@ -54,6 +54,25 @@ def test_tick_process_job_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j1", True)
 
 
+def test_tick_marks_due_fire_as_scheduled_provenance(monkeypatch):
+    observed = []
+
+    def fake_run_job(job, *, defer_agent_teardown=None, **kwargs):
+        observed.append(kwargs.get("fire_provenance"))
+        return True, "out", "final", None
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda *_: "/tmp/out")
+    monkeypatch.setattr(s, "_deliver_result", lambda *_, **__: None)
+    monkeypatch.setattr(s, "mark_job_run", lambda *_, **__: None)
+    monkeypatch.setattr(s, "get_due_jobs", lambda: [{"id": "j-due", "name": "due"}])
+    monkeypatch.setattr(s, "advance_next_runs", lambda ids: 1)
+
+    s.tick(verbose=False, sync=True)
+
+    assert observed == ["scheduled_due"]
+
+
 def test_run_one_job_success_sequence(monkeypatch):
     """The extracted helper runs the same execute→save→deliver→mark sequence
     for a successful job."""
@@ -107,5 +126,4 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert scope_during_run["base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after run_one_job returned (no leak).
     assert ss.current_secret_scope() is None
-
 

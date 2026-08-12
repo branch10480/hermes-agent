@@ -1934,6 +1934,7 @@ class TestConcurrentToolExecution:
     def test_invoke_tool_dispatches_to_handle_function_call(self, agent):
         """_invoke_tool should route regular tools through handle_function_call."""
         agent._direct_user_authority_revision = 7
+        agent._direct_user_authority_kind = "direct_user"
         with patch("run_agent.handle_function_call", return_value="result") as mock_hfc:
             result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
             mock_hfc.assert_called_once_with(
@@ -1943,6 +1944,7 @@ class TestConcurrentToolExecution:
                 turn_id="",
                 api_request_id="",
                 direct_user_authority_revision=7,
+                direct_user_authority_kind="direct_user",
                 enabled_tools=list(agent.valid_tool_names),
                 skip_pre_tool_call_hook=True,
                 skip_tool_request_middleware=True,
@@ -1954,6 +1956,7 @@ class TestConcurrentToolExecution:
 
     def test_sequential_tool_forwards_direct_user_authority_revision(self, agent):
         agent._direct_user_authority_revision = 9
+        agent._direct_user_authority_kind = "scheduled"
         agent._current_turn_id = "turn-authority"
         agent._current_api_request_id = "request-authority"
         tool_call = _mock_tool_call(
@@ -1968,6 +1971,7 @@ class TestConcurrentToolExecution:
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
         assert mock_hfc.call_args.kwargs["direct_user_authority_revision"] == 9
+        assert mock_hfc.call_args.kwargs["direct_user_authority_kind"] == "scheduled"
         assert mock_hfc.call_args.kwargs["turn_id"] == "turn-authority"
         assert mock_hfc.call_args.kwargs["api_request_id"] == "request-authority"
 

@@ -1586,6 +1586,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    _managed_job_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1661,7 +1662,12 @@ def create_job(
     if deliver is None:
         deliver = "origin" if origin else "local"
 
-    job_id = uuid.uuid4().hex[:12]
+    if _managed_job_id is None:
+        job_id = uuid.uuid4().hex[:12]
+    elif re.fullmatch(r"[0-9a-f]{12}", _managed_job_id):
+        job_id = _managed_job_id
+    else:
+        raise ValueError("managed cron job ID must be exactly 12 lowercase hex characters")
     now = _hermes_now().isoformat()
 
     normalized_skills = _normalize_skill_list(skill, skills)
@@ -1786,6 +1792,8 @@ def create_job(
 
     with _jobs_lock():
         jobs = load_jobs()
+        if any(existing.get("id") == job_id for existing in jobs):
+            raise ValueError(f"Cron job ID already exists: {job_id}")
         jobs.append(job)
         save_jobs(jobs)
 
