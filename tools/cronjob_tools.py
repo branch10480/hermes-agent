@@ -860,6 +860,16 @@ def _try_dispatch_background_run(
         — dispatch pool was at capacity; the run executed inline (the claim
         was already taken and must not be stranded).
     """
+    # A real in-process tool invocation always carries the agent's durable
+    # session_id.  Standalone CLI commands do not.  Do not infer ownership
+    # from HERMES_SESSION_KEY alone: ``hermes cron run`` may be launched from
+    # an agent terminal and inherit that routing key through the subprocess
+    # environment, while its completion queue and daemon executor remain
+    # process-local.  Treating the inherited key as a live consumer makes the
+    # CLI report a background dispatch and then kill the worker on exit.
+    if not session_id:
+        return None
+
     # Finite sessions cannot route a detached result back after the turn
     # ends — mirror delegate_task's gate and fall back to sync execution.
     try:
@@ -882,17 +892,11 @@ def _try_dispatch_background_run(
         session_key = get_current_session_key(default="")
     except Exception:
         session_key = ""
-    if not session_key and session_id:
-        # CLI path: the approval contextvar is only bound during gateway/TUI
-        # turns. The CLI drain filters completions by the durable agent
-        # session id (#64240), so stamp it as the key — an empty key would
-        # fail closed and the completion could never be claimed.
-        session_key = str(session_id)
     if not session_key:
-        # Direct Python callers (`hermes cron run`, tests) have no agent
-        # session to deliver a completion to — the process exits right after
-        # the tool returns. Run synchronously.
-        return None
+        # Some in-process runtimes bind the durable agent session without an
+        # approval routing key. The CLI drain filters completions by this id,
+        # so use it as the process-local completion key.
+        session_key = str(session_id)
 
     # ---- synchronous claim (same semantics as _execute_job_now) ----
     try:

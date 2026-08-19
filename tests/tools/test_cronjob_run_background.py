@@ -71,7 +71,9 @@ class TestBackgroundDispatch:
                  patch("cron.scheduler.run_one_job", side_effect=slow_run_one_job), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None}):
-                res = _try_dispatch_background_run(_job('job-bg-01'))
+                res = _try_dispatch_background_run(
+                    _job('job-bg-01'), session_id="session-bg-01"
+                )
 
         try:
             # Returned BEFORE the job finished — that's the whole point.
@@ -100,7 +102,9 @@ class TestBackgroundDispatch:
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None,
                                      "next_run_at": "2026-08-07T09:00:00"}):
-                res = _try_dispatch_background_run(_job('job-bg-02'))
+                res = _try_dispatch_background_run(
+                    _job('job-bg-02'), session_id="session-bg-02"
+                )
                 assert res["dispatched"] is True
 
                 found = None
@@ -133,7 +137,9 @@ class TestBackgroundDispatch:
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "error",
                                      "last_error": "provider exploded"}):
-                res = _try_dispatch_background_run(_job('job-bg-03'))
+                res = _try_dispatch_background_run(
+                    _job('job-bg-03'), session_id="session-bg-03"
+                )
                 assert res["dispatched"] is True
 
                 found = None
@@ -160,7 +166,9 @@ class TestBackgroundDispatch:
                  patch("tools.cronjob_tools.get_job",
                        return_value={**_JOB, "enabled": False}), \
                  patch("tools.async_delegation.dispatch_async_delegation") as m_disp:
-                res = _try_dispatch_background_run(_job('job-bg-04'))
+                res = _try_dispatch_background_run(
+                    _job('job-bg-04'), session_id="session-bg-04"
+                )
         assert res["claimed"] is False
         assert "paused/disabled" in res["error"]
         m_disp.assert_not_called()
@@ -172,12 +180,24 @@ class TestSyncFallbacks:
         res = _try_dispatch_background_run(_job('job-bg-05'))
         assert res is None
 
+    def test_inherited_session_env_does_not_background_cli(self, monkeypatch):
+        """A CLI child may inherit gateway routing env, but has no in-process
+        completion consumer or worker owner and must therefore run inline."""
+        monkeypatch.setenv("HERMES_SESSION_KEY", "agent:main:discord:dm:123")
+        monkeypatch.setenv("HERMES_SESSION_ASYNC_DELIVERY", "1")
+        with patch("tools.async_delegation.dispatch_async_delegation") as m_disp:
+            res = _try_dispatch_background_run(_job('job-bg-05-env'))
+        assert res is None
+        m_disp.assert_not_called()
+
     def test_async_delivery_unsupported_falls_back_to_sync(self):
         """One-shot runtimes (hermes -z, cron child, Kanban) keep sync."""
         with _bound_session_key():
             with patch("gateway.session_context.async_delivery_supported",
                        return_value=False):
-                res = _try_dispatch_background_run(_job('job-bg-06'))
+                res = _try_dispatch_background_run(
+                    _job('job-bg-06'), session_id="session-bg-06"
+                )
         assert res is None
 
     def test_pool_at_capacity_runs_inline(self):
@@ -189,7 +209,9 @@ class TestSyncFallbacks:
                  patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None}):
-                res = _try_dispatch_background_run(_job('job-bg-07'))
+                res = _try_dispatch_background_run(
+                    _job('job-bg-07'), session_id="session-bg-07"
+                )
         assert res["dispatched"] is False
         assert res["success"] is True
         m_run.assert_called_once()   # ran inline on this thread
@@ -247,7 +269,9 @@ class TestInFlightDedupe:
             with _bound_session_key():
                 with patch("tools.cronjob_tools.claim_job_for_fire") as m_claim, \
                      patch("tools.async_delegation.dispatch_async_delegation") as m_disp:
-                    res = _try_dispatch_background_run(_job('job-bg-10'))
+                    res = _try_dispatch_background_run(
+                        _job('job-bg-10'), session_id="session-bg-10"
+                    )
             assert res["claimed"] is False
             assert "already running" in res["error"]
             m_claim.assert_not_called()   # no claim consumed for a skipped run
@@ -283,7 +307,13 @@ class TestCronjobRunToolIntegration:
                  patch("tools.cronjob_tools.get_job",
                        return_value={"id": "job-bg-12", "name": "bg run",
                                      "last_status": "ok", "last_error": None}):
-                out = json.loads(cronjob(action="run", job_id="job-bg-12"))
+                out = json.loads(
+                    cronjob(
+                        action="run",
+                        job_id="job-bg-12",
+                        session_id="session-bg-12",
+                    )
+                )
 
         assert out["success"] is True
         assert out["job"]["executed"] is True
@@ -291,9 +321,11 @@ class TestCronjobRunToolIntegration:
         assert out["job"]["delegation_id"]
         assert "background" in out["note"]
 
-    def test_run_action_sync_path_unchanged_without_session(self):
-        """No session context → the legacy synchronous behavior (executed +
-        execution_success populated from the completed run)."""
+    def test_run_action_sync_path_unchanged_without_session(self, monkeypatch):
+        """No explicit agent session means synchronous CLI behavior even when
+        gateway routing variables leaked through a parent tool subprocess."""
+        monkeypatch.setenv("HERMES_SESSION_KEY", "agent:main:discord:dm:123")
+        monkeypatch.setenv("HERMES_SESSION_ASYNC_DELIVERY", "1")
         ran = {"job": "after-run", "last_status": "ok", "last_error": None}
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=_job('job-bg-13')), \
              patch("tools.cronjob_tools.claim_job_for_fire", return_value=True) as m_claim, \
