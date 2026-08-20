@@ -1,9 +1,9 @@
 """Tests for the consecutive-denial circuit breaker in smart approvals.
 
 After ``approvals.denial_breaker_threshold`` consecutive guardian DENY
-verdicts in one session, the deny message returned to the model escalates
+verdicts in one user turn, the deny message returned to the model escalates
 from "Do NOT retry" to a hard-stop CIRCUIT BREAKER instruction. Any
-approval resets the tally. State is per-session and capped in size.
+approval resets the tally. State is per-session/turn and capped in size.
 
 Follows the existing smart-approval mocking patterns from
 tests/tools/test_execute_code_approval_cluster.py: monkeypatch
@@ -269,9 +269,9 @@ def test_tally_evicts_oldest_sessions():
         with A._lock:
             assert len(A._denial_tally) == A._DENIAL_TALLY_MAX_SESSIONS
             # Oldest entries were evicted, newest survive.
-            assert "evict-session-0" not in A._denial_tally
+            assert ("evict-session-0", "") not in A._denial_tally
             assert (
-                f"evict-session-{A._DENIAL_TALLY_MAX_SESSIONS + 9}"
+                (f"evict-session-{A._DENIAL_TALLY_MAX_SESSIONS + 9}", "")
                 in A._denial_tally
             )
     finally:
@@ -302,6 +302,32 @@ def test_clear_session_resets_denial_tally(breaker_session):
     _register_resolver(breaker_session, "deny")
     after = _denied_terminal("dangerous after clear")
     assert BREAKER_MARKER not in after["message"]
+
+
+def test_denials_do_not_carry_into_a_new_turn(breaker_session):
+    """Old denied work must not make a fresh user request stop early."""
+    _register_resolver(breaker_session, "deny")
+
+    old_tokens = A.set_current_observability_context(turn_id="old-turn")
+    try:
+        first = _denied_terminal("dangerous old one")
+        second = _denied_terminal("dangerous old two")
+    finally:
+        A.reset_current_observability_context(old_tokens)
+
+    fresh_tokens = A.set_current_observability_context(turn_id="fresh-turn")
+    try:
+        fresh_first = _denied_terminal("dangerous fresh one")
+        fresh_second = _denied_terminal("dangerous fresh two")
+        fresh_third = _denied_terminal("dangerous fresh three")
+    finally:
+        A.reset_current_observability_context(fresh_tokens)
+
+    assert BREAKER_MARKER not in first["message"]
+    assert BREAKER_MARKER not in second["message"]
+    assert BREAKER_MARKER not in fresh_first["message"]
+    assert BREAKER_MARKER not in fresh_second["message"]
+    assert BREAKER_MARKER in fresh_third["message"]
 
 
 def test_pending_trip_is_scoped_to_exact_turn_and_tool_call(breaker_session):

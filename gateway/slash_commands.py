@@ -25,6 +25,7 @@ import re
 import shlex
 import sys
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -59,6 +60,42 @@ _RESET_CLEANUP_TIMEOUT_S = 30.0
 def _clean_str(value: Any) -> str:
     """Strip and return a non-empty string value, or empty string."""
     return value.strip() if isinstance(value, str) and value.strip() else ""
+
+
+_STATUS_PLAIN_TRANSLATION = str.maketrans(
+    {
+        "@": "＠",
+        "*": "＊",
+        "_": "＿",
+        "`": "｀",
+        "~": "～",
+        "[": "［",
+        "]": "］",
+        "(": "（",
+        ")": "）",
+        "<": "＜",
+        ">": "＞",
+        "\\": "＼",
+        "|": "｜",
+    }
+)
+
+
+def _plain_status_label(value: Any, *, limit: int = 160) -> str:
+    """Render untrusted activity text without mentions, markup, or bidi controls."""
+    if not isinstance(value, str):
+        return ""
+    cleaned = []
+    for character in value:
+        if character in "\r\n\t":
+            cleaned.append(" ")
+            continue
+        if unicodedata.category(character) in {"Cc", "Cf", "Cs"}:
+            continue
+        cleaned.append(character)
+    return " ".join("".join(cleaned).split()).translate(
+        _STATUS_PLAIN_TRANSLATION
+    )[:limit]
 
 
 def _int_value(value: Any) -> int:
@@ -649,6 +686,38 @@ class GatewaySlashCommandsMixin:
             if isinstance(configured_context, int) and configured_context > 0:
                 context_total = configured_context
 
+        # /status is intentionally available while a turn is busy. Surface
+        # the same in-process activity snapshot used by the stall watchdog so
+        # users can distinguish generation, tool work, and a genuinely stale
+        # run without opening logs or interrupting anything.
+        activity_line = ""
+        if is_running and hasattr(agent, "get_activity_summary"):
+            try:
+                activity = agent.get_activity_summary()
+            except Exception:
+                activity = None
+            if isinstance(activity, dict):
+                description = _plain_status_label(
+                    activity.get("last_activity_description")
+                    or activity.get("last_activity_desc")
+                    or activity.get("current_tool")
+                )
+                iteration = _int_value(activity.get("api_call_count"))
+                max_iterations = _int_value(activity.get("max_iterations"))
+                try:
+                    idle_seconds = max(
+                        0, int(float(activity.get("seconds_since_activity") or 0))
+                    )
+                except (TypeError, ValueError):
+                    idle_seconds = 0
+                details = []
+                if description:
+                    details.append(description)
+                if max_iterations:
+                    details.append(f"API {iteration}/{max_iterations}")
+                details.append(f"updated {idle_seconds}s ago")
+                activity_line = "⚙️ " + " · ".join(details)
+
         model_line = ""
         if model_name:
             if provider_name:
@@ -687,6 +756,8 @@ class GatewaySlashCommandsMixin:
             t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
             t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
         ])
+        if activity_line:
+            lines.append(activity_line)
         if queue_depth:
             lines.append(t("gateway.status.queued", count=queue_depth))
         if source.platform == Platform.MATRIX:

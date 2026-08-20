@@ -37,7 +37,7 @@ import copy
 import hashlib
 import json
 import logging
-logger = logging.getLogger(__name__)
+import math
 import os
 import re
 import sys
@@ -47,6 +47,8 @@ import threading
 import uuid
 import warnings
 from typing import List, Dict, Any, Optional, Callable
+
+logger = logging.getLogger(__name__)
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
 # that imports the SDK on first call/isinstance check. This preserves:
@@ -64,6 +66,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from hermes_constants import get_hermes_home
+
+
+# ``_spawn_background_review`` receives ``focus=None`` explicitly from manual
+# ``/refine`` (including the no-argument form), while automatic post-turn
+# callers omit the parameter.  A sentinel preserves that distinction without
+# changing the public command call sites.
+_BACKGROUND_REVIEW_AUTO = object()
 
 
 def _launch_cwd_for_session(source: str) -> Optional[str]:
@@ -1798,12 +1807,94 @@ class AIAgent:
             notification_mode=notification_mode,
         )
 
+    @staticmethod
+    def _background_review_idle_delay_seconds() -> float:
+        """Return the configured delay before an automatic review starts.
+
+        Invalid, missing, negative, and non-finite values are treated as the
+        backwards-compatible default of zero seconds.  The setting lives with
+        the other auxiliary task options so it can be changed without
+        rebuilding the agent.
+        """
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            config = load_config_readonly()
+            auxiliary = config.get("auxiliary", {})
+            task = (
+                auxiliary.get("background_review", {})
+                if isinstance(auxiliary, dict)
+                else {}
+            )
+            raw_delay = (
+                task.get("idle_delay_seconds", 0)
+                if isinstance(task, dict)
+                else 0
+            )
+            delay = float(raw_delay)
+            if not math.isfinite(delay) or delay <= 0:
+                return 0.0
+            return delay
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return 0.0
+
+    def _cancel_background_review_timer(self) -> None:
+        """Cancel a deferred review, including its timer-to-worker hand-off."""
+        lock = getattr(self, "_background_review_lock", None)
+        if lock is None:
+            timer = getattr(self, "_background_review_timer", None)
+            cancel_event = getattr(
+                self, "_background_review_cancel_event", None
+            )
+            self._background_review_timer = None
+            self._background_review_cancel_event = None
+        else:
+            with lock:
+                timer = getattr(self, "_background_review_timer", None)
+                cancel_event = getattr(
+                    self, "_background_review_cancel_event", None
+                )
+                self._background_review_timer = None
+                self._background_review_cancel_event = None
+                if cancel_event is not None:
+                    cancel_event.set()
+        if lock is None and cancel_event is not None:
+            cancel_event.set()
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                logger.debug(
+                    "Failed to cancel pending background review timer",
+                    exc_info=True,
+                )
+
+    def _fence_background_review_launches(self) -> Any:
+        """Permanently stop delayed reviews for an evicted/closed agent."""
+        background_child = None
+        lock = getattr(self, "_background_review_lock", None)
+        if lock is None:
+            self._background_review_closing = True
+            background_child = getattr(
+                self, "_background_review_agent", None
+            )
+            self._background_review_agent = None
+        else:
+            with lock:
+                self._background_review_closing = True
+                background_child = getattr(
+                    self, "_background_review_agent", None
+                )
+                self._background_review_agent = None
+        self._cancel_background_review_timer()
+        return background_child
+
     def _spawn_background_review(
         self,
         messages_snapshot: List[Dict],
         review_memory: bool = False,
         review_skills: bool = False,
-        focus: Optional[str] = None,
+        focus: Optional[str] = _BACKGROUND_REVIEW_AUTO,
     ) -> None:
         """Spawn the background memory/skill review thread.
 
@@ -1815,23 +1906,100 @@ class AIAgent:
 
         ``focus`` is optional user-supplied steering (from ``/refine``)
         appended to the review prompt — e.g. "save the deploy workflow as a
-        skill". The automatic post-turn triggers never set it.
+        skill". Automatic post-turn triggers omit it.  That omission is
+        intentionally distinct from an explicit ``focus=None`` so a manual
+        no-argument ``/refine`` remains immediate.
         """
         from agent.background_review import spawn_background_review_thread
         from tools.thread_context import propagate_context_to_thread
+
+        automatic = focus is _BACKGROUND_REVIEW_AUTO
+        if automatic:
+            focus = None
+        delay = self._background_review_idle_delay_seconds() if automatic else 0.0
+        cancel_event = threading.Event() if delay > 0 else None
         target, _prompt = spawn_background_review_thread(
             self,
             messages_snapshot,
             review_memory=review_memory,
             review_skills=review_skills,
             focus=focus,
+            cancellation_event=cancel_event,
         )
-        # Carry the active profile into the review thread so MEMORY.md / skill
-        # review writes land in the right profile (#54937).
-        t = threading.Thread(
-            target=propagate_context_to_thread(target), daemon=True, name="bg-review"
-        )
-        t.start()
+        # Capture the caller's context before deferring the worker.  Creating
+        # the wrapper from the Timer thread would lose the active profile and
+        # session context that the review needs for its writes.
+        wrapped_target = propagate_context_to_thread(target)
+
+        def _launch_allowed() -> bool:
+            lock = getattr(self, "_background_review_lock", None)
+            if lock is None:
+                return not getattr(self, "_background_review_closing", False)
+            with lock:
+                return not getattr(self, "_background_review_closing", False)
+
+        def _start_review_thread() -> None:
+            t = threading.Thread(
+                target=wrapped_target, daemon=True, name="bg-review"
+            )
+            t.start()
+
+        if not _launch_allowed():
+            return
+
+        if not automatic:
+            # Manual /refine is an explicit user request and always runs now.
+            self._cancel_background_review_timer()
+            if _launch_allowed():
+                _start_review_thread()
+            return
+
+        if delay <= 0:
+            self._cancel_background_review_timer()
+            if _launch_allowed():
+                _start_review_thread()
+            return
+
+        self._cancel_background_review_timer()
+        timer_ref = None
+
+        def _delayed_start() -> None:
+            lock = getattr(self, "_background_review_lock", None)
+            if lock is None:
+                current = getattr(self, "_background_review_timer", None)
+                if current is not timer_ref:
+                    return
+                self._background_review_timer = None
+            else:
+                with lock:
+                    if getattr(self, "_background_review_timer", None) is not timer_ref:
+                        return
+                    self._background_review_timer = None
+            # Keep ``_background_review_cancel_event`` installed until the
+            # review fork registers itself. A foreground turn arriving after
+            # the Timer fired but before registration can therefore still
+            # cancel the launch without racing a hidden API call.
+            _start_review_thread()
+
+        timer_ref = threading.Timer(delay, _delayed_start)
+        timer_ref.daemon = True
+        lock = getattr(self, "_background_review_lock", None)
+        if lock is None:
+            if getattr(self, "_background_review_closing", False):
+                return
+            self._background_review_timer = timer_ref
+            self._background_review_cancel_event = cancel_event
+        else:
+            with lock:
+                if getattr(self, "_background_review_closing", False):
+                    return
+                self._background_review_timer = timer_ref
+                self._background_review_cancel_event = cancel_event
+        try:
+            timer_ref.start()
+        except Exception:
+            self._cancel_background_review_timer()
+            raise
 
     def _build_memory_write_metadata(
         self,
@@ -4304,17 +4472,35 @@ class AIAgent:
           - OpenAI/httpx client pool (big chunk of held memory + sockets;
             the rebuilt agent gets a fresh client anyway)
           - Active child subagents (per-turn artefacts; safe to drop)
+          - Pending or active background reviews for this evicted agent
 
         Safe to call multiple times.  Distinct from close() — which is the
         hard teardown for actual session boundaries (/new, /reset, session
         expiry).
         """
+        # Fence delayed review registration before snapshotting children. The
+        # replacement cache entry owns all future review work for this session.
+        try:
+            background_child = self._fence_background_review_launches()
+        except Exception:
+            background_child = None
+
         # Close active child agents (per-turn; no cross-turn persistence).
         try:
             with self._active_children_lock:
                 children = list(self._active_children)
                 self._active_children.clear()
+            if background_child is not None and not any(
+                child is background_child for child in children
+            ):
+                children.append(background_child)
             for child in children:
+                try:
+                    interrupt = getattr(child, "interrupt", None)
+                    if callable(interrupt):
+                        interrupt("parent agent evicted")
+                except Exception:
+                    pass
                 try:
                     child.release_clients()
                 except Exception:
@@ -4356,6 +4542,7 @@ class AIAgent:
         - Browser daemon sessions
         - Computer-use backend sessions and target/ref state
         - Active child agents (subagent delegation)
+        - Deferred background-review timers
         - OpenAI/httpx client connections
 
         Safe to call multiple times (idempotent).  Each cleanup step is
@@ -4394,12 +4581,35 @@ class AIAgent:
         except Exception:
             pass
 
-        # 5. Close active child agents
+        # 5. Fence background-review registration before cancelling the Timer.
+        # Registration uses the same background-review -> active-children lock
+        # order, so close sees either the complete child registration or none
+        # at all — never the old pointer/list gap.
+        try:
+            background_child = self._fence_background_review_launches()
+        except Exception:
+            background_child = None
+            pass
+
+        # 6. Close active child agents
         try:
             with self._active_children_lock:
                 children = list(self._active_children)
                 self._active_children.clear()
+            if background_child is not None and not any(
+                child is background_child for child in children
+            ):
+                # Compatibility fallback for an agent created by older code
+                # where the direct pointer and child-list registration were
+                # not atomic.
+                children.append(background_child)
             for child in children:
+                try:
+                    interrupt = getattr(child, "interrupt", None)
+                    if callable(interrupt):
+                        interrupt("parent agent closing")
+                except Exception:
+                    pass
                 try:
                     child.close()
                 except Exception:
@@ -4407,7 +4617,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 6. Close the OpenAI/httpx client
+        # 7. Close the OpenAI/httpx client
         try:
             client = getattr(self, "client", None)
             if client is not None:
@@ -4416,7 +4626,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 6b. Close the cached per-request wire client (reused across
+        # 7b. Close the cached per-request wire client (reused across
         # sequential LLM calls; see _create_request_openai_client).
         try:
             self._close_cached_request_openai_client(reason="agent_close")

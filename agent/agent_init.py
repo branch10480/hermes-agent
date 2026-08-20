@@ -851,6 +851,17 @@ def init_agent(
     # Ctrl+C-proof lockup when a live turn started before a review fired at
     # the end of the prior turn had finished).
     agent._background_review_agent = None
+    # Automatic post-turn reviews may wait for a configured idle window before
+    # starting.  A new live turn cancels this timer before it can spawn work;
+    # manual /refine requests remain immediate.
+    agent._background_review_timer = None
+    # A Timer may already have fired while its worker is still constructing
+    # the review fork.  Keep a cancellation signal across that hand-off so a
+    # new foreground turn can still win the race before any review API call.
+    agent._background_review_cancel_event = None
+    # Monotonic lifecycle fence: once the owning agent begins close/eviction,
+    # no delayed review may register against that retired session.
+    agent._background_review_closing = False
     agent._background_review_lock = threading.Lock()
 
     # Store OpenRouter provider preferences

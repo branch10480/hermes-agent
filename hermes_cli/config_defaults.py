@@ -1103,6 +1103,10 @@ DEFAULT_CONFIG = {
             "base_url": "",
             "api_key": "",
             "timeout": 120,
+            # Automatic reviews wait this many idle seconds after a turn.
+            # Zero preserves the historical immediate post-turn behavior;
+            # manual /refine requests are always immediate.
+            "idle_delay_seconds": 0,
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },

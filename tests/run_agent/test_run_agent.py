@@ -2959,7 +2959,12 @@ class TestRunConversation:
         assert result["api_calls"] == 1
         assert result["turn_exit_reason"] == "approval_denial_breaker"
         assert result["failed"] is False
-        assert result["final_response"].startswith("連続して承認が拒否されたため")
+        assert result["final_response"].startswith(
+            "このターンで terminal の危険操作が3回連続で拒否されたため"
+        )
+        assert "次のメッセージでは通常の読み取り・編集・テストをそのまま" in result[
+            "final_response"
+        ]
         assert handle_call.call_count == 1
         assert sum(message["role"] == "tool" for message in result["messages"]) == 2
         assert [message["role"] for message in result["messages"][-4:]] == [

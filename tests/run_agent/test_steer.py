@@ -256,7 +256,8 @@ class TestActiveTurnRedirectCheckpoint:
         into an assistant row's ``content`` or ``api_content`` painted raw
         scaffolding as the model's own prior reply (#81841). Scaffold bytes
         ride only in the *user correction's* ``api_content``; assistant
-        placeholders stay clean (or ``display_kind="hidden"`` when empty).
+        placeholders stay clean (or ``display_kind="hidden"`` when no text
+        reached the screen).
         """
         from agent.conversation_loop import _apply_active_turn_redirect
 
@@ -349,6 +350,7 @@ class TestActiveTurnRedirectCheckpoint:
 
     def test_checkpoint_omits_reasoning_label_when_nothing_visible(self):
         from agent.conversation_loop import _apply_active_turn_redirect
+        from agent.agent_runtime_helpers import repair_empty_non_final_messages
 
         agent = _bare_agent()
         agent._current_streamed_reasoning_text = "thinking only, no text yet"
@@ -358,17 +360,20 @@ class TestActiveTurnRedirectCheckpoint:
 
         placeholder = messages[-2]
         correction = messages[-1]
-        # Nothing was on screen: empty hidden placeholder for alternation;
+        # Nothing was on screen: hidden placeholder for alternation;
         # scaffold rides only on the user correction's api_content.
         assert placeholder["role"] == "assistant"
         assert placeholder["display_kind"] == "hidden"
-        assert placeholder.get("content") == ""
+        assert placeholder.get("content") == "[response interrupted]"
         assert not placeholder.get("api_content")
         assert correction["content"] == "New direction."
         assert (
             "[This response was interrupted by a user correction.]"
             in correction["api_content"]
         )
+        # New redirects are valid at rest; the legacy send-time sanitizer has
+        # nothing to heal or warn about on this and every later request.
+        assert repair_empty_non_final_messages(messages) is messages
 
     def test_tool_tail_scaffold_never_on_assistant_api_content(self):
         """#81841: mid-tool steer must not put the interrupt scaffold on the
@@ -388,7 +393,7 @@ class TestActiveTurnRedirectCheckpoint:
         correction = messages[-1]
         assert placeholder["role"] == "assistant"
         assert placeholder.get("display_kind") == "hidden"
-        assert placeholder.get("content") == ""
+        assert placeholder.get("content") == "[response interrupted]"
         assert not placeholder.get("api_content")
         assert correction["role"] == "user"
         assert correction["content"] == "Stop and do X instead."

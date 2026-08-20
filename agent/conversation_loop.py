@@ -100,6 +100,11 @@ logger = logging.getLogger(__name__)
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
+# Stored on a hidden, reasoning-free placeholder when a redirect arrives
+# before any visible response text. This mirrors the send-time legacy repair
+# in agent_runtime_helpers, but fixes new turns at the source so every later
+# request does not have to heal (and warn about) the same empty row again.
+_INTERRUPTED_PLACEHOLDER = "[response interrupted]"
 
 
 def _restore_user_after_reference_handoff(
@@ -261,9 +266,10 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
     reply*, echo it, and self-replicate ghost rows across turns (#81841).
     Carry the scaffolded form only in the *user correction's* ``api_content``
     sidecar — never on the placeholder assistant row. When nothing was on
-    screen the placeholder is marked ``display_kind="hidden"`` (empty
-    content) so every transcript surface drops it, exactly like
-    compaction-reference rows.
+    screen the placeholder is marked ``display_kind="hidden"`` and gets a
+    minimal interruption token. Transcript surfaces drop the row, while
+    strict providers receive a valid non-empty turn without repeated repair
+    warnings.
     """
     visible = agent._strip_think_blocks(
         getattr(agent, "_current_streamed_assistant_text", "") or ""
@@ -298,7 +304,7 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
         # then echoes (#81841 / incomplete #73146 else branch).
         placeholder: Dict[str, Any] = {
             "role": "assistant",
-            "content": visible or "",
+            "content": visible or _INTERRUPTED_PLACEHOLDER,
         }
         if not visible:
             placeholder["display_kind"] = "hidden"
@@ -1528,6 +1534,14 @@ def run_conversation(
     # review fork's own copy of this attribute stays None — reviews don't
     # spawn nested reviews), so this is a no-op on every other run_conversation
     # caller (subagents, the review fork itself, etc).
+    # A configured idle delay leaves automatic review work in a cancellable
+    # timer after the prior turn.  A new user message supersedes that pending
+    # work before it starts; an already-running fork is interrupted below.
+    try:
+        agent._cancel_background_review_timer()
+    except AttributeError:
+        pass
+
     _pending_review = getattr(agent, "_background_review_agent", None)
     if _pending_review is not None:
         try:
@@ -6985,17 +6999,26 @@ def run_conversation(
                 )
                 if isinstance(approval_breaker_halt, dict):
                     _turn_exit_reason = "approval_denial_breaker"
+                    count = approval_breaker_halt.get("count")
+                    threshold = approval_breaker_halt.get("threshold")
+                    tool_name = str(
+                        approval_breaker_halt.get("tool_name") or "terminal"
+                    )
+                    denial_count = (
+                        f"{count}回連続で" if isinstance(count, int) else "連続で"
+                    )
                     final_response = (
-                        "連続して承認が拒否されたため、安全のためこのターンを停止しました。"
-                        "拒否された操作を確認してから続けてください。"
+                        f"このターンで {tool_name} の危険操作が{denial_count}拒否されたため、"
+                        "危険操作の自動再試行を止め、このターンを終了しました。"
+                        "次のメッセージでは通常の読み取り・編集・テストをそのまま"
+                        "続けられます。必要な操作なら内容を確認して明示承認するか、"
+                        "手元の端末で実行してください。"
                     )
                     # This is an intentional policy stop, not an
                     # infrastructure/tool failure. Keep the turn successful
                     # so gateway resume/queue bookkeeping can clear it.
                     failed = False
                     agent._approval_breaker_halt = None
-                    count = approval_breaker_halt.get("count")
-                    threshold = approval_breaker_halt.get("threshold")
                     agent._emit_status(
                         "⚠️ Approval denial circuit breaker stopped the turn"
                         + (

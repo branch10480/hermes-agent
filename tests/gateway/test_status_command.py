@@ -131,6 +131,13 @@ async def test_status_command_includes_live_agent_model_and_context():
             context_length=100_000,
         ),
         interrupt=MagicMock(),
+        get_activity_summary=lambda: {
+            "last_activity_description": "waiting for local model",
+            "seconds_since_activity": 2.8,
+            "api_call_count": 4,
+            "max_iterations": 16,
+            "current_tool": None,
+        },
     )
     runner._running_agents[build_session_key(_make_source())] = running_agent
 
@@ -139,6 +146,48 @@ async def test_status_command_includes_live_agent_model_and_context():
     assert "**Model:** `openai/gpt-test` (openai)" in result
     assert "**Context:** 12,345 / 100,000 (12%)" in result
     assert "**Lifetime tokens billed:** 1,250" in result
+    assert "⚙️ waiting for local model · API 4/16 · updated 2s ago" in result
+
+
+@pytest.mark.asyncio
+async def test_status_activity_is_plain_and_cannot_ping_or_spoof():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source(Platform.DISCORD)),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.DISCORD,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry, platform=Platform.DISCORD)
+    running_agent = SimpleNamespace(
+        model="local/test",
+        provider="custom",
+        context_compressor=None,
+        interrupt=MagicMock(),
+        get_activity_summary=lambda: {
+            "last_activity_description": (
+                "tool @everyone <@123> **fake**\nnext\u202eline"
+            ),
+            "seconds_since_activity": 1,
+            "api_call_count": 1,
+            "max_iterations": 16,
+        },
+    )
+    runner._running_agents[
+        build_session_key(_make_source(Platform.DISCORD))
+    ] = running_agent
+
+    result = await runner._handle_message(
+        _make_event("/status", platform=Platform.DISCORD)
+    )
+
+    assert "@everyone" not in result
+    assert "<@123>" not in result
+    assert "**fake**" not in result
+    assert "\u202e" not in result
+    assert "tool ＠everyone ＜＠123＞ ＊＊fake＊＊ nextline" in result
 
 
 @pytest.mark.asyncio
@@ -486,5 +535,3 @@ async def test_context_all_appends_expanded_listings():
     assert "hermes-agent" in result
     # Expanded view drops the hint
     assert "Use /context all" not in result
-
-

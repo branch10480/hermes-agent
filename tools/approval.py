@@ -2373,7 +2373,7 @@ def human_wait_seconds(session_key: str | None = None) -> float:
 # Nothing stops the model from retrying variants of a smart-denied command —
 # each retry burns another guardian LLM call and agent iteration. After
 # ``approvals.denial_breaker_threshold`` consecutive guardian DENY verdicts
-# in one session (default 3; 0 disables), the deny message returned to the
+# in one user turn (default 3; 0 disables), the deny message returned to the
 # model escalates to a hard-stop instruction. Any approval resets the tally.
 # The blocked tool result also carries a small diagnostic marker for model and
 # gateway observability. Structural turn control uses a bounded in-process
@@ -2385,9 +2385,11 @@ def human_wait_seconds(session_key: str | None = None) -> float:
 APPROVAL_BREAKER_METADATA_KEY = "approval_breaker"
 _APPROVAL_BREAKER_METADATA_VERSION = 1
 _APPROVAL_BREAKER_METADATA_TYPE = "consecutive_smart_denials"
-_denial_tally: dict[str, int] = {}
-# Plain dict with a small cap so an army of short-lived session keys cannot
-# grow it without bound; oldest (least recently denied) entries are evicted.
+_denial_tally: dict[tuple[str, str], int] = {}
+# Plain dict with a small cap so an army of short-lived session/turn keys
+# cannot grow it without bound; oldest (least recently denied) entries are
+# evicted.  Turn scoping matters for usability: a denial from an old user
+# request must never make a later request hit the breaker early.
 _DENIAL_TALLY_MAX_SESSIONS = 256
 _approval_breaker_trips: dict[tuple[str, str, str], dict] = {}
 _APPROVAL_BREAKER_MAX_TRIPS = 256
@@ -2405,24 +2407,45 @@ def _get_denial_breaker_threshold() -> int:
         return 3
 
 
+def _denial_tally_key(
+    session_key: str,
+    *,
+    turn_id: str | None = None,
+) -> tuple[str, str]:
+    """Return the exact session/turn key for a denial sequence.
+
+    Direct approval tests and legacy callers may not install observability
+    context.  Their empty turn ID deliberately remains a stable per-session
+    fallback instead of disabling the breaker.
+    """
+    if turn_id is None:
+        turn_id = _approval_turn_id.get()
+    return str(session_key or ""), str(turn_id or "")
+
+
 def _record_denial(session_key: str) -> int:
-    """Increment and return the session's consecutive guardian-denial count.
+    """Increment and return this turn's consecutive guardian-denial count.
 
     Pop-and-reinsert keeps actively-denying sessions at the most-recent end
     of the dict so eviction (insertion-ordered) drops genuinely idle keys.
     """
     with _lock:
-        count = _denial_tally.pop(session_key, 0) + 1
-        _denial_tally[session_key] = count
+        key = _denial_tally_key(session_key)
+        count = _denial_tally.pop(key, 0) + 1
+        _denial_tally[key] = count
         while len(_denial_tally) > _DENIAL_TALLY_MAX_SESSIONS:
             _denial_tally.pop(next(iter(_denial_tally)))
         return count
 
 
 def _reset_denials(session_key: str) -> None:
-    """Clear the session's consecutive-denial tally (an approval happened)."""
+    """Clear this turn's denial tally after an approval.
+
+    A sibling turn can share a gateway session, so an approval must not reset
+    or otherwise mutate that sibling's independent sequence.
+    """
     with _lock:
-        _denial_tally.pop(session_key, None)
+        _denial_tally.pop(_denial_tally_key(session_key), None)
 
 
 def _approval_breaker_trip_key(
@@ -2503,7 +2526,7 @@ def _denial_breaker_metadata(session_key: str) -> dict | None:
     separately by :func:`_record_approval_breaker_trip`.
     """
     with _lock:
-        count = _denial_tally.get(session_key, 0)
+        count = _denial_tally.get(_denial_tally_key(session_key), 0)
     threshold = _get_denial_breaker_threshold()
     if threshold <= 0 or count < threshold:
         return None
@@ -2702,7 +2725,9 @@ def clear_session(session_key: str) -> None:
     with _lock:
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
-        _denial_tally.pop(session_key, None)
+        for key in tuple(_denial_tally):
+            if key[0] == session_key:
+                _denial_tally.pop(key, None)
         for key in tuple(_approval_breaker_trips):
             if key[0] == session_key:
                 _approval_breaker_trips.pop(key, None)

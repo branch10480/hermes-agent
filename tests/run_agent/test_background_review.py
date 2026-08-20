@@ -31,6 +31,9 @@ def _bare_agent() -> AIAgent:
     agent._safe_print = lambda *_args, **_kwargs: None
     import threading as _threading
     agent._background_review_agent = None
+    agent._background_review_timer = None
+    agent._background_review_cancel_event = None
+    agent._background_review_closing = False
     agent._background_review_lock = _threading.Lock()
     agent._active_children = []
     agent._active_children_lock = _threading.Lock()
@@ -201,6 +204,385 @@ def test_new_live_turn_cancels_still_running_background_review(monkeypatch):
     _pending_review.interrupt("superseded by a new live turn")
 
     assert calls == ["superseded by a new live turn"]
+
+
+def test_auto_background_review_waits_for_idle_delay_and_new_turn_cancels(monkeypatch):
+    """Automatic reviews are deferred, but a new turn cancels the timer."""
+    events = []
+
+    class DeferredTimer:
+        instances = []
+
+        def __init__(self, interval, target):
+            self.interval = interval
+            self.target = target
+            self.cancelled = False
+            self.started = False
+            self.daemon = False
+            self.instances.append(self)
+
+        def start(self):
+            self.started = True
+
+        def cancel(self):
+            self.cancelled = True
+
+        def fire(self):
+            if not self.cancelled:
+                self.target()
+
+    class RecordingThread:
+        def __init__(self, *, target, daemon=None, name=None):
+            events.append(("thread_created", daemon, name))
+            self._target = target
+
+        def start(self):
+            events.append(("thread_started",))
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "auxiliary": {
+                "background_review": {"idle_delay_seconds": 12.5}
+            }
+        },
+    )
+    monkeypatch.setattr(run_agent_module.threading, "Timer", DeferredTimer)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", RecordingThread)
+
+    agent = _bare_agent()
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    timer = DeferredTimer.instances[-1]
+    assert timer.interval == 12.5
+    assert timer.started is True
+    assert events == []
+    assert agent._background_review_timer is timer
+
+    # This is the cancellation path used at the start of the next live turn.
+    agent._cancel_background_review_timer()
+    assert timer.cancelled is True
+    timer.fire()
+    assert events == []
+
+
+def test_new_turn_cancels_after_timer_fires_before_worker_runs(monkeypatch):
+    """The Timer-to-worker hand-off remains cancellable until registration."""
+    queued_targets = []
+    review_inits = []
+
+    class DeferredTimer:
+        def __init__(self, interval, target):
+            self.target = target
+            self.daemon = False
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+        def fire(self):
+            self.target()
+
+    class DeferredThread:
+        def __init__(self, *, target, daemon=None, name=None):
+            queued_targets.append(target)
+
+        def start(self):
+            pass
+
+    class UnexpectedReviewAgent:
+        def __init__(self, **kwargs):
+            review_inits.append(kwargs)
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "auxiliary": {
+                "background_review": {"idle_delay_seconds": 12.5}
+            }
+        },
+    )
+    monkeypatch.setattr(run_agent_module.threading, "Timer", DeferredTimer)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(run_agent_module, "AIAgent", UnexpectedReviewAgent)
+
+    agent = _bare_agent()
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    timer = agent._background_review_timer
+    timer.fire()
+    assert len(queued_targets) == 1
+    assert agent._background_review_timer is None
+    assert agent._background_review_cancel_event is not None
+
+    # This is the narrow race that used to slip past both the fired Timer and
+    # the not-yet-registered review fork.
+    agent._cancel_background_review_timer()
+    queued_targets[0]()
+
+    assert review_inits == []
+    assert agent._background_review_agent is None
+
+
+def test_cancellation_during_fork_construction_prevents_review_api_call(monkeypatch):
+    """A cancellation that lands during construction wins before registration."""
+    events = []
+
+    class ImmediateTimer:
+        def __init__(self, interval, target):
+            self.target = target
+            self.daemon = False
+
+        def start(self):
+            self.target()
+
+        def cancel(self):
+            pass
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            events.append("init")
+            self._session_messages = []
+            agent._cancel_background_review_timer()
+
+        def run_conversation(self, **kwargs):
+            events.append("run")
+
+        def shutdown_memory_provider(self):
+            events.append("shutdown")
+
+        def close(self):
+            events.append("close")
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "auxiliary": {
+                "background_review": {"idle_delay_seconds": 12.5}
+            }
+        },
+    )
+    monkeypatch.setattr(run_agent_module.threading, "Timer", ImmediateTimer)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+
+    agent = _bare_agent()
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    assert "run" not in events
+    assert events == ["init", "shutdown", "close"]
+    assert agent._background_review_agent is None
+
+
+def test_agent_close_cancels_deferred_background_review():
+    """A closed/evicted session must not launch its old review minutes later."""
+    import threading
+
+    class RecordingTimer:
+        def __init__(self):
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    agent = _bare_agent()
+    timer = RecordingTimer()
+    cancel_event = threading.Event()
+    agent._background_review_timer = timer
+    agent._background_review_cancel_event = cancel_event
+
+    AIAgent.close(agent)
+
+    assert timer.cancelled is True
+    assert cancel_event.is_set() is True
+    assert agent._background_review_timer is None
+    assert agent._background_review_cancel_event is None
+    assert agent._background_review_closing is True
+
+
+def test_release_clients_cancels_deferred_background_review():
+    """Soft cache eviction also fences a not-yet-fired review Timer."""
+    import threading
+
+    class RecordingTimer:
+        def __init__(self):
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    agent = _bare_agent()
+    timer = RecordingTimer()
+    cancel_event = threading.Event()
+    agent._background_review_timer = timer
+    agent._background_review_cancel_event = cancel_event
+
+    AIAgent.release_clients(agent)
+
+    assert timer.cancelled is True
+    assert cancel_event.is_set() is True
+    assert agent._background_review_timer is None
+    assert agent._background_review_cancel_event is None
+    assert agent._background_review_closing is True
+
+
+def test_fenced_agent_cannot_schedule_a_new_delayed_review(monkeypatch):
+    """A turn-finalizer race cannot re-arm a Timer after soft eviction."""
+    timer_inits = []
+    thread_inits = []
+
+    class UnexpectedTimer:
+        def __init__(self, *args, **kwargs):
+            timer_inits.append((args, kwargs))
+
+    class UnexpectedThread:
+        def __init__(self, *args, **kwargs):
+            thread_inits.append((args, kwargs))
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "auxiliary": {
+                "background_review": {"idle_delay_seconds": 12.5}
+            }
+        },
+    )
+    monkeypatch.setattr(run_agent_module.threading, "Timer", UnexpectedTimer)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", UnexpectedThread)
+
+    agent = _bare_agent()
+    agent._background_review_closing = True
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    assert timer_inits == []
+    assert thread_inits == []
+
+
+def test_agent_close_interrupts_registered_background_review(monkeypatch):
+    """Close captures the fully registered fork and aborts its in-flight run."""
+    import threading
+
+    run_started = threading.Event()
+    interrupted = threading.Event()
+    closed = threading.Event()
+    worker_threads = []
+    real_thread = threading.Thread
+
+    class RealDaemonThread:
+        def __init__(self, *, target, daemon=None, name=None):
+            self.thread = real_thread(target=target, daemon=daemon, name=name)
+            worker_threads.append(self.thread)
+
+        def start(self):
+            self.thread.start()
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            run_started.set()
+            interrupted.wait(timeout=2)
+
+        def interrupt(self, message=None):
+            assert message == "parent agent closing"
+            interrupted.set()
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            closed.set()
+            interrupted.set()
+
+    monkeypatch.setattr(run_agent_module.threading, "Thread", RealDaemonThread)
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+
+    agent = _bare_agent()
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+        focus=None,
+    )
+    assert run_started.wait(timeout=2)
+    assert len(agent._active_children) == 1
+    assert agent._background_review_agent is agent._active_children[0]
+
+    AIAgent.close(agent)
+    for worker in worker_threads:
+        worker.join(timeout=2)
+
+    assert interrupted.is_set() is True
+    assert closed.is_set() is True
+    assert agent._active_children == []
+    assert agent._background_review_agent is None
+
+
+def test_manual_refine_bypasses_idle_delay(monkeypatch):
+    """An explicit /refine call (even without focus text) starts immediately."""
+    timers = []
+    starts = []
+
+    class UnexpectedTimer:
+        def __init__(self, *_args, **_kwargs):
+            timers.append(self)
+
+    class RecordingThread:
+        def __init__(self, *, target, daemon=None, name=None):
+            self._target = target
+
+        def start(self):
+            starts.append(True)
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "auxiliary": {
+                "background_review": {"idle_delay_seconds": 12.5}
+            }
+        },
+    )
+    monkeypatch.setattr(run_agent_module.threading, "Timer", UnexpectedTimer)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", RecordingThread)
+
+    agent = _bare_agent()
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+        focus=None,
+    )
+
+    assert timers == []
+    assert starts == [True]
+
+
+def test_background_review_idle_delay_defaults_to_zero():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert (
+        DEFAULT_CONFIG["auxiliary"]["background_review"]["idle_delay_seconds"]
+        == 0
+    )
 
 
 

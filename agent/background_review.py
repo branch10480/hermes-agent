@@ -655,6 +655,7 @@ def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
     prompt: str,
+    cancellation_event: Any = None,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
@@ -662,6 +663,12 @@ def _run_review_in_thread(
     review prompt, and surfaces a compact action summary back to the user
     via ``agent._safe_print`` and ``agent.background_review_callback``.
     """
+    # A foreground turn may cancel while the idle Timer hands off to this
+    # worker. Do not even construct the fork when that cancellation already
+    # won; construction itself is intentionally kept API-free.
+    if cancellation_event is not None and cancellation_event.is_set():
+        return
+
     # Local import to avoid a hard circular dep at module load.
     from run_agent import AIAgent
     from tools.terminal_tool import set_approval_callback as _set_approval_callback
@@ -689,16 +696,35 @@ def _run_review_in_thread(
         """Idempotent: clears the review fork from both tracking slots.
         Called from the run_conversation finally and the outer safety-net finally.
         """
-        if agent_ref is None:
-            return
-        if hasattr(agent, "_background_review_agent"):
-            _br_lock = getattr(agent, "_background_review_lock", None)
-            if _br_lock is not None:
-                with _br_lock:
+        _br_lock = getattr(agent, "_background_review_lock", None)
+        if _br_lock is not None:
+            with _br_lock:
+                if (
+                    cancellation_event is not None
+                    and getattr(agent, "_background_review_cancel_event", None)
+                    is cancellation_event
+                ):
+                    agent._background_review_cancel_event = None
+                if agent_ref is not None and hasattr(
+                    agent, "_background_review_agent"
+                ):
                     if agent._background_review_agent is agent_ref:
                         agent._background_review_agent = None
-            elif agent._background_review_agent is agent_ref:
+        else:
+            if (
+                cancellation_event is not None
+                and getattr(agent, "_background_review_cancel_event", None)
+                is cancellation_event
+            ):
+                agent._background_review_cancel_event = None
+            if (
+                agent_ref is not None
+                and hasattr(agent, "_background_review_agent")
+                and agent._background_review_agent is agent_ref
+            ):
                 agent._background_review_agent = None
+        if agent_ref is None:
+            return
         if hasattr(agent, "_active_children"):
             try:
                 _ac_lock = getattr(agent, "_active_children_lock", None)
@@ -915,20 +941,50 @@ def _run_review_in_thread(
             # doubled prompt-token accounting and a Ctrl+C-proof lockup.
             # Best-effort: agents built without agent_init.py (test stubs)
             # degrade to "no cross-cancellation" rather than aborting the review.
-            if hasattr(agent, "_background_review_agent"):
-                _br_lock = getattr(agent, "_background_review_lock", None)
-                if _br_lock is not None:
-                    with _br_lock:
-                        agent._background_review_agent = review_agent
-                else:
-                    agent._background_review_agent = review_agent
-            if hasattr(agent, "_active_children"):
-                _ac_lock = getattr(agent, "_active_children_lock", None)
-                if _ac_lock is not None:
-                    with _ac_lock:
+            cancelled_before_registration = False
+
+            def _register_under_parent_lifecycle() -> None:
+                """Register both cancellation surfaces as one lifecycle step."""
+                nonlocal cancelled_before_registration
+                if (
+                    getattr(agent, "_background_review_closing", False)
+                    or (
+                        cancellation_event is not None
+                        and cancellation_event.is_set()
+                    )
+                ):
+                    cancelled_before_registration = True
+                    return
+                # Lock order is always background-review -> active-children,
+                # matching AIAgent.close(). This removes the old pointer/list
+                # gap where eviction could miss a just-starting review.
+                if hasattr(agent, "_active_children"):
+                    _ac_lock = getattr(agent, "_active_children_lock", None)
+                    if _ac_lock is not None:
+                        with _ac_lock:
+                            agent._active_children.append(review_agent)
+                    else:
                         agent._active_children.append(review_agent)
-                else:
-                    agent._active_children.append(review_agent)
+                if hasattr(agent, "_background_review_agent"):
+                    agent._background_review_agent = review_agent
+                if (
+                    cancellation_event is not None
+                    and getattr(
+                        agent, "_background_review_cancel_event", None
+                    )
+                    is cancellation_event
+                ):
+                    agent._background_review_cancel_event = None
+
+            _br_lock = getattr(agent, "_background_review_lock", None)
+            if _br_lock is not None:
+                with _br_lock:
+                    _register_under_parent_lifecycle()
+            else:
+                _register_under_parent_lifecycle()
+
+            if cancelled_before_registration:
+                return
 
             from model_tools import get_tool_definitions
             from hermes_cli.plugins import (
@@ -1096,6 +1152,7 @@ def spawn_background_review_thread(
     review_memory: bool = False,
     review_skills: bool = False,
     focus: Optional[str] = None,
+    cancellation_event: Any = None,
 ):
     """Build the review thread target and prompt for a background review.
 
@@ -1129,7 +1186,12 @@ def spawn_background_review_thread(
         )
 
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        _run_review_in_thread(
+            agent,
+            messages_snapshot,
+            prompt,
+            cancellation_event=cancellation_event,
+        )
 
     return _target, prompt
 
