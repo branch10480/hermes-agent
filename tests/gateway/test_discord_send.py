@@ -48,6 +48,38 @@ from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 
 @pytest.mark.asyncio
+async def test_nonconversational_messages_are_silent_but_final_replies_notify():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(
+        send=AsyncMock(
+            side_effect=[SimpleNamespace(id=1001), SimpleNamespace(id=1002)]
+        )
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    progress = await adapter.send(
+        "555",
+        "Inspecting the repository…",
+        metadata={"non_conversational": True},
+    )
+    final = await adapter.send(
+        "555",
+        "Done.",
+        metadata={"notify": True},
+    )
+
+    assert progress.success is True
+    assert final.success is True
+    progress_kwargs = channel.send.await_args_list[0].kwargs
+    final_kwargs = channel.send.await_args_list[1].kwargs
+    assert progress_kwargs["silent"] is True
+    assert final_kwargs.get("silent", False) is False
+
+
+@pytest.mark.asyncio
 async def test_send_rejects_whitespace_and_records_failed_final_reply(
     caplog, monkeypatch, tmp_path
 ):
@@ -416,5 +448,4 @@ async def test_send_file_attachment_forum_uses_files_kwarg(tmp_path, monkeypatch
     thread_kwargs = forum_channel.create_thread.await_args.kwargs
     assert thread_kwargs.get("file") is None
     assert isinstance(thread_kwargs.get("files"), list) and len(thread_kwargs["files"]) == 1
-
 

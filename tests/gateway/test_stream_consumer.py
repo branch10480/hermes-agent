@@ -829,6 +829,11 @@ class TestInterimCommentaryMessages:
 
         sent_texts = [call[1]["content"] for call in adapter.send.call_args_list]
         assert sent_texts == ["I'll inspect the repository first.", "Done."]
+        commentary_metadata = adapter.send.call_args_list[0].kwargs["metadata"]
+        final_metadata = adapter.send.call_args_list[1].kwargs["metadata"]
+        assert commentary_metadata["non_conversational"] is True
+        assert final_metadata["notify"] is True
+        assert "non_conversational" not in final_metadata
         assert consumer.final_response_sent is True
 
 
@@ -1487,4 +1492,3 @@ class TestFlushPendingSync:
 
         consumer.finish()
         await task
-

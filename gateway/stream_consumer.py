@@ -1835,11 +1835,13 @@ class GatewayStreamConsumer:
         text = self._clean_for_display(text)
         if not text.strip():
             return False
+        metadata = dict(self.metadata or {})
+        metadata["non_conversational"] = True
         try:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=metadata,
             )
             # Note: do NOT set _already_sent = True here.
             # Commentary messages are interim status updates (e.g. "Using browser

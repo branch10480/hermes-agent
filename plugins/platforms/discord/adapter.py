@@ -3083,6 +3083,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 thread_id = metadata["thread_id"]
             nonconversational = _metadata_marks_nonconversational(metadata)
             final_delivery = bool(metadata and metadata.get("notify"))
+            silent_kwargs = {"silent": True} if nonconversational else {}
 
             if thread_id:
                 # Fetch the thread directly — threads are addressed by their own ID.
@@ -3101,7 +3102,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
-                result = await self._send_to_forum(channel, content)
+                result = await self._send_to_forum(
+                    channel,
+                    content,
+                    silent=nonconversational,
+                )
                 await asyncio.to_thread(
                     self._record_discord_response,
                     reply_to=reply_to,
@@ -3128,6 +3133,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     msg = await channel.send(
                         content=chunk,
                         reference=chunk_reference,
+                        **silent_kwargs,
                     )
                 except Exception as e:
                     err_text = str(e)
@@ -3150,6 +3156,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         msg = await channel.send(
                             content=chunk,
                             reference=None,
+                            **silent_kwargs,
                         )
                     else:
                         raise
@@ -3190,7 +3197,13 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return result
 
-    async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
+    async def _send_to_forum(
+        self,
+        forum_channel: Any,
+        content: str,
+        *,
+        silent: bool = False,
+    ) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
 
         Forum channels (type 15) don't support direct messages.  Instead we
@@ -3213,6 +3226,7 @@ class DiscordAdapter(BasePlatformAdapter):
             thread = await forum_channel.create_thread(
                 name=thread_name,
                 content=starter_content,
+                **({"silent": True} if silent else {}),
             )
         except Exception as e:
             logger.error("[%s] Failed to create forum thread in %s: %s", self.name, forum_channel.id, e)
@@ -3229,7 +3243,10 @@ class DiscordAdapter(BasePlatformAdapter):
         warnings: list[str] = []
         for chunk in chunks[1:]:
             try:
-                msg = await thread_channel.send(content=chunk)
+                msg = await thread_channel.send(
+                    content=chunk,
+                    **({"silent": True} if silent else {}),
+                )
                 message_ids.append(str(msg.id))
             except Exception as e:
                 warning = f"Failed to send follow-up chunk to forum thread {thread_id}: {e}"

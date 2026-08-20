@@ -4741,7 +4741,10 @@ class TurnRunner:
                 ctx._status_adapter.send(
                     ctx._status_chat_id,
                     display_text,
-                    metadata=ctx._status_thread_metadata,
+                    metadata=_non_conversational_metadata(
+                        ctx._status_thread_metadata,
+                        platform=ctx.source.platform,
+                    ),
                 ),
                 ctx._loop_for_step,
                 logger=logger,
