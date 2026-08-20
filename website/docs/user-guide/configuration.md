@@ -2282,7 +2282,7 @@ Setting `approvals.mode: off` disables all safety checks for terminal commands. 
 
 ### Denial circuit breaker
 
-`approvals.denial_breaker_threshold` (default `3`) guards against the agent retrying variations of a command the smart-approval reviewer keeps denying — each retry burns another guardian LLM call. After that many consecutive denials in a session, the deny message escalates to a hard-stop instruction telling the agent to stop, report the blocked operation, and ask you to run it manually or `/approve`. Any approval resets the count; set `0` to disable:
+`approvals.denial_breaker_threshold` (default `3`) guards against the agent retrying variations of a command the smart-approval reviewer keeps denying — each retry burns another guardian LLM call. After that many consecutive denials in a session, Hermes records a bounded internal breaker trip and ends the current turn before another model call. The result may include a diagnostic marker for observability, but transformed or arbitrary plugin output cannot trigger the stop. The user receives a concise safety-stop message; the agent must wait for a new user turn. Any approval resets the count; set `0` to disable:
 
 ```yaml
 approvals:

@@ -786,6 +786,10 @@ def init_agent(
     agent._tool_guardrails = ToolCallGuardrailController()
     agent._tool_guardrail_halt_decision: ToolGuardrailDecision | None = None
     agent._tool_error_halt: dict | None = None
+    # Set only when a trusted built-in approval guard trips its consecutive
+    # smart-denial breaker. Consumed by the conversation loop after matching
+    # tool results are persisted; never used to mutate prompt history.
+    agent._approval_breaker_halt: dict | None = None
 
     # Interrupt mechanism for breaking out of tool loops
     agent._interrupt_requested = False

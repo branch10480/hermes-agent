@@ -200,6 +200,17 @@ def reset_current_observability_context(
     _approval_turn_id.reset(turn_token)
 
 
+def get_current_observability_context() -> tuple[str, str]:
+    """Return the active turn and tool-call correlation IDs.
+
+    Nested tool dispatches (notably ``execute_code`` RPC calls) may omit these
+    optional arguments. Callers can use this accessor to preserve the outer
+    tool's approval side-channel identity instead of replacing it with empty
+    IDs.
+    """
+    return _approval_turn_id.get(), _approval_tool_call_id.get()
+
+
 def get_current_session_key(default: str = "default") -> str:
     """Return the active session key, preferring context-local state.
 
@@ -2364,13 +2375,22 @@ def human_wait_seconds(session_key: str | None = None) -> float:
 # ``approvals.denial_breaker_threshold`` consecutive guardian DENY verdicts
 # in one session (default 3; 0 disables), the deny message returned to the
 # model escalates to a hard-stop instruction. Any approval resets the tally.
-# This changes only the TOOL RESULT text — no message-history surgery, no
-# interrupts — so it is prompt-cache-invariant by construction. Inspired by
-# ChatGPT Work's auto-review circuit breaker (3 consecutive denials).
+# The blocked tool result also carries a small diagnostic marker for model and
+# gateway observability. Structural turn control uses a bounded in-process
+# side-channel keyed by session, turn, and outer tool-call ID; transformed or
+# arbitrary plugin/MCP output is never parsed as control data. No
+# message-history surgery, toolset swap, or system-prompt mutation is needed,
+# so prompt caching stays intact. Inspired by ChatGPT Work's auto-review
+# circuit breaker (3 consecutive denials).
+APPROVAL_BREAKER_METADATA_KEY = "approval_breaker"
+_APPROVAL_BREAKER_METADATA_VERSION = 1
+_APPROVAL_BREAKER_METADATA_TYPE = "consecutive_smart_denials"
 _denial_tally: dict[str, int] = {}
 # Plain dict with a small cap so an army of short-lived session keys cannot
 # grow it without bound; oldest (least recently denied) entries are evicted.
 _DENIAL_TALLY_MAX_SESSIONS = 256
+_approval_breaker_trips: dict[tuple[str, str, str], dict] = {}
+_APPROVAL_BREAKER_MAX_TRIPS = 256
 
 
 def _get_denial_breaker_threshold() -> int:
@@ -2405,6 +2425,106 @@ def _reset_denials(session_key: str) -> None:
         _denial_tally.pop(session_key, None)
 
 
+def _approval_breaker_trip_key(
+    session_key: str | None = None,
+    *,
+    turn_id: str | None = None,
+    tool_call_id: str | None = None,
+) -> tuple[str, str, str]:
+    """Build the bounded side-channel key for one outer tool call."""
+    if session_key is None:
+        session_key = get_current_session_key(default="")
+    if turn_id is None:
+        turn_id = _approval_turn_id.get()
+    if tool_call_id is None:
+        tool_call_id = _approval_tool_call_id.get()
+    return (str(session_key or ""), str(turn_id or ""), str(tool_call_id or ""))
+
+
+def _record_approval_breaker_trip(
+    session_key: str,
+    metadata: dict,
+    *,
+    turn_id: str | None = None,
+    tool_call_id: str | None = None,
+) -> None:
+    """Record a breaker trip outside model-visible tool-result data."""
+    key = _approval_breaker_trip_key(
+        session_key, turn_id=turn_id, tool_call_id=tool_call_id
+    )
+    with _lock:
+        _approval_breaker_trips.pop(key, None)
+        _approval_breaker_trips[key] = dict(metadata)
+        while len(_approval_breaker_trips) > _APPROVAL_BREAKER_MAX_TRIPS:
+            _approval_breaker_trips.pop(next(iter(_approval_breaker_trips)))
+
+
+def peek_approval_breaker_trip(
+    session_key: str | None = None,
+    *,
+    turn_id: str | None = None,
+    tool_call_id: str | None = None,
+) -> dict | None:
+    """Read a pending trip without consuming it.
+
+    The execute_code RPC bridge uses this to stop nested dispatches while the
+    outer tool is still running. The conversation executor consumes the trip
+    after the outer result returns.
+    """
+    key = _approval_breaker_trip_key(
+        session_key, turn_id=turn_id, tool_call_id=tool_call_id
+    )
+    with _lock:
+        metadata = _approval_breaker_trips.get(key)
+        return dict(metadata) if metadata is not None else None
+
+
+def consume_approval_breaker_trip(
+    session_key: str | None = None,
+    *,
+    turn_id: str | None = None,
+    tool_call_id: str | None = None,
+) -> dict | None:
+    """Atomically consume a pending trip for one exact outer tool call."""
+    key = _approval_breaker_trip_key(
+        session_key, turn_id=turn_id, tool_call_id=tool_call_id
+    )
+    with _lock:
+        metadata = _approval_breaker_trips.pop(key, None)
+        return dict(metadata) if metadata is not None else None
+
+
+def _denial_breaker_metadata(session_key: str) -> dict | None:
+    """Return structured metadata once the denial breaker trips.
+
+    This is deliberately derived from the in-process tally rather than from
+    any model-facing text. Callers add it to the result returned by the
+    approval guard for observability; structural control is recorded
+    separately by :func:`_record_approval_breaker_trip`.
+    """
+    with _lock:
+        count = _denial_tally.get(session_key, 0)
+    threshold = _get_denial_breaker_threshold()
+    if threshold <= 0 or count < threshold:
+        return None
+    return {
+        "version": _APPROVAL_BREAKER_METADATA_VERSION,
+        "type": _APPROVAL_BREAKER_METADATA_TYPE,
+        "tripped": True,
+        "count": count,
+        "threshold": threshold,
+    }
+
+
+def _attach_denial_breaker_metadata(result: dict, session_key: str) -> dict:
+    """Attach a diagnostic breaker marker to *result* when tripped."""
+    metadata = _denial_breaker_metadata(session_key)
+    if metadata is not None:
+        result[APPROVAL_BREAKER_METADATA_KEY] = metadata
+        _record_approval_breaker_trip(session_key, metadata)
+    return result
+
+
 def _denial_breaker_addendum(session_key: str) -> str:
     """Return the escalated hard-stop text when the breaker has tripped.
 
@@ -2414,11 +2534,11 @@ def _denial_breaker_addendum(session_key: str) -> str:
     disabled), otherwise a leading-space addendum the caller appends
     verbatim to the deny message returned to the model.
     """
-    with _lock:
-        count = _denial_tally.get(session_key, 0)
-    threshold = _get_denial_breaker_threshold()
-    if threshold <= 0 or count < threshold:
+    metadata = _denial_breaker_metadata(session_key)
+    if metadata is None:
         return ""
+    count = metadata["count"]
+    threshold = metadata["threshold"]
     logger.warning(
         "Smart-approval circuit breaker tripped for session %s: "
         "%d consecutive denials (threshold %d)",
@@ -2582,6 +2702,10 @@ def clear_session(session_key: str) -> None:
     with _lock:
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
+        _denial_tally.pop(session_key, None)
+        for key in tuple(_approval_breaker_trips):
+            if key[0] == session_key:
+                _approval_breaker_trips.pop(key, None)
         _pending.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
@@ -3963,13 +4087,13 @@ def check_all_command_guards(command: str, env_type: str,
         elif verdict == "deny" and not (is_cli or is_gateway or is_ask):
             _record_denial(session_key)
             breaker_addendum = _denial_breaker_addendum(session_key)
-            return {
+            return _attach_denial_breaker_metadata({
                 "approved": False,
                 "message": f"BLOCKED by smart approval: {combined_desc_for_llm}. "
                            "The command was assessed as genuinely dangerous. "
                            f"Do NOT retry.{breaker_addendum}",
                 "smart_denied": True,
-            }
+            }, session_key)
         elif verdict == "deny":
             # Guardian DENY that falls through to a one-operation human
             # override still counts toward the consecutive-denial breaker;
@@ -4070,7 +4194,7 @@ def check_all_command_guards(command: str, env_type: str,
                 if outcome == "denied" and deny_reason:
                     reason_addendum = f' Reason given by the user: "{deny_reason}".'
                 breaker_addendum = _denial_breaker_addendum(session_key)
-                return {
+                return _attach_denial_breaker_metadata({
                     "approved": False,
                     "message": (
                         f"BLOCKED: Command {reason}.{reason_addendum} The user "
@@ -4086,7 +4210,7 @@ def check_all_command_guards(command: str, env_type: str,
                     "outcome": outcome,
                     "user_consent": False,
                     "deny_reason": deny_reason,
-                }
+                }, session_key)
 
             # A smart-DENY owner override is always one operation, even if an
             # older client returns "session" or "always". Manual and ESCALATE
@@ -4168,7 +4292,7 @@ def check_all_command_guards(command: str, env_type: str,
 
     if choice == "timeout":
         breaker_addendum = _denial_breaker_addendum(session_key)
-        return {
+        return _attach_denial_breaker_metadata({
             "approved": False,
             "message": (
                 "BLOCKED: Command timed out without user response. The user "
@@ -4183,11 +4307,11 @@ def check_all_command_guards(command: str, env_type: str,
             "description": combined_desc,
             "outcome": "timeout",
             "user_consent": False,
-        }
+        }, session_key)
 
     if choice == "deny":
         breaker_addendum = _denial_breaker_addendum(session_key)
-        return {
+        return _attach_denial_breaker_metadata({
             "approved": False,
             "message": (
                 "BLOCKED: User denied this command. The user has NOT consented "
@@ -4201,7 +4325,7 @@ def check_all_command_guards(command: str, env_type: str,
             "description": combined_desc,
             "outcome": "denied",
             "user_consent": False,
-        }
+        }, session_key)
 
     # Smart-DENY owner overrides are one-operation scoped. Preserve existing
     # persistence for manual mode and smart ESCALATE.
@@ -4327,7 +4451,7 @@ def check_execute_code_guard(code: str, env_type: str,
         if verdict == "deny" and not (is_gateway or is_ask):
             _record_denial(session_key)
             breaker_addendum = _denial_breaker_addendum(session_key)
-            return {
+            return _attach_denial_breaker_metadata({
                 "approved": False,
                 "message": ("BLOCKED by smart approval: execute_code script "
                             "execution was assessed as genuinely dangerous. "
@@ -4337,7 +4461,7 @@ def check_execute_code_guard(code: str, env_type: str,
                 "description": description,
                 "outcome": "denied",
                 "user_consent": False,
-            }
+            }, session_key)
         if verdict == "deny":
             # Guardian DENY that falls through to a one-operation human
             # override still counts toward the consecutive-denial breaker;
@@ -4425,7 +4549,7 @@ def check_execute_code_guard(code: str, env_type: str,
         if resolved and choice == "deny" and deny_reason:
             reason_addendum = f' Reason given by the user: "{deny_reason}".'
         breaker_addendum = _denial_breaker_addendum(session_key)
-        return {
+        return _attach_denial_breaker_metadata({
             "approved": False,
             "message": (
                 f"BLOCKED: execute_code script {reason}.{reason_addendum} The "
@@ -4438,7 +4562,7 @@ def check_execute_code_guard(code: str, env_type: str,
             "outcome": "timeout" if not resolved else "denied",
             "user_consent": False,
             "deny_reason": deny_reason,
-        }
+        }, session_key)
 
     # Never persist a smart-DENY override under the coarse execute_code key;
     # doing so would approve unrelated future scripts. Manual and ESCALATE

@@ -15,9 +15,14 @@ Run with:  python -m pytest tests/test_code_execution.py -v
 import pytest
 # pytestmark removed — tests run fine (61 pass, ~99s)
 
+import base64
 import json
 import os
+from pathlib import Path
+import re
+import shlex
 import socket
+import tempfile
 import time
 
 os.environ["TERMINAL_ENV"] = "local"
@@ -46,6 +51,9 @@ from tools.code_execution_tool import (
     EXECUTE_CODE_SCHEMA,
     _TOOL_DOC_LINES,
     _execute_remote,
+    _attach_approval_breaker_result,
+    _sync_approval_breaker_state,
+    _rpc_poll_loop,
 )
 
 
@@ -248,6 +256,109 @@ print(result.get("output", ""))
         self.assertEqual(result["status"], "success")
         self.assertIn("mock output for: echo hello", result["output"])
         self.assertEqual(result["tool_calls_made"], 1)
+
+    def test_nested_terminal_breaker_stops_local_rpc_dispatch(self):
+        """Three nested denials trip the side-channel before a fourth dispatch."""
+        from tools import approval as approval_module
+
+        session_key = "nested-local-breaker"
+        metadata = {
+            "version": 1,
+            "type": "consecutive_smart_denials",
+            "tripped": True,
+            "count": 3,
+            "threshold": 3,
+        }
+        session_token = approval_module.set_current_session_key(session_key)
+        observability_tokens = approval_module.set_current_observability_context(
+            turn_id="turn-local",
+            tool_call_id="execute-local",
+        )
+        calls = []
+
+        def nested_dispatch(function_name, function_args, task_id=None, **_kwargs):
+            calls.append((function_name, function_args))
+            if len(calls) == 3:
+                approval_module._record_approval_breaker_trip(
+                    session_key, metadata
+                )
+                return json.dumps({"status": "blocked", "error": "denied"})
+            return json.dumps({"output": "allowed", "exit_code": 0})
+
+        code = """
+from hermes_tools import terminal
+for i in range(4):
+    terminal(f"echo nested-{i}")
+print("done")
+"""
+        try:
+            with patch(
+                "model_tools.handle_function_call", side_effect=nested_dispatch
+            ):
+                result = json.loads(
+                    execute_code(
+                        code,
+                        task_id="nested-local-task",
+                        enabled_tools=["terminal"],
+                    )
+                )
+        finally:
+            approval_module.reset_current_observability_context(observability_tokens)
+            approval_module.reset_current_session_key(session_token)
+            approval_module.clear_session(session_key)
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(result["tool_calls_made"], 3)
+        self.assertEqual(result["approval_breaker"], metadata)
+        self.assertIn("done", result["output"])
+
+    def test_breaker_latch_survives_trip_eviction_and_refreshes_outer_key(self):
+        """A latched bridge stays closed and restores its exact outer trip."""
+        from tools import approval as approval_module
+
+        session_key = "latched-breaker"
+        turn_id = "turn-latched"
+        tool_call_id = "execute-latched"
+        metadata = {
+            "version": 1,
+            "type": "consecutive_smart_denials",
+            "tripped": True,
+            "count": 3,
+            "threshold": 3,
+        }
+        session_token = approval_module.set_current_session_key(session_key)
+        observability_tokens = approval_module.set_current_observability_context(
+            turn_id=turn_id,
+            tool_call_id=tool_call_id,
+        )
+        state = {}
+        try:
+            approval_module._record_approval_breaker_trip(session_key, metadata)
+            self.assertEqual(_sync_approval_breaker_state(state), metadata)
+
+            # Simulate bounded side-channel eviction after the bridge observed
+            # the trip.  Dispatch must remain suppressed from the local latch.
+            with approval_module._lock:
+                approval_module._approval_breaker_trips.clear()
+            self.assertEqual(_sync_approval_breaker_state(state), metadata)
+
+            outer_result = {}
+            _attach_approval_breaker_result(outer_result, state)
+            self.assertEqual(outer_result["approval_breaker"], metadata)
+            self.assertEqual(
+                approval_module.consume_approval_breaker_trip(
+                    session_key,
+                    turn_id=turn_id,
+                    tool_call_id=tool_call_id,
+                ),
+                metadata,
+            )
+        finally:
+            approval_module.reset_current_observability_context(
+                observability_tokens
+            )
+            approval_module.reset_current_session_key(session_token)
+            approval_module.clear_session(session_key)
 
 
     def test_concurrent_tool_calls_match_responses(self):
@@ -810,6 +921,135 @@ class TestRpcTokenAuthorization(unittest.TestCase):
         src = generate_hermes_tools_module(["terminal"], transport="uds")
         self.assertIn("HERMES_RPC_TOKEN", src)
         self.assertIn('"token"', src)
+
+
+class TestApprovalBreakerRemoteRpc(unittest.TestCase):
+    def test_nested_terminal_breaker_stops_remote_rpc_dispatch(self):
+        """File RPC acknowledges a fourth request without dispatching it."""
+        from tools import approval as approval_module
+
+        metadata = {
+            "version": 1,
+            "type": "consecutive_smart_denials",
+            "tripped": True,
+            "count": 3,
+            "threshold": 3,
+        }
+        session_key = "nested-remote-breaker"
+        rpc_token = "remote-test-token"
+
+        class FakeEnv:
+            def __init__(self, root):
+                self.root = root
+
+            def execute(self, command, cwd=None, timeout=None):
+                del cwd, timeout
+                if command.startswith("ls -1"):
+                    return {
+                        "output": "\n".join(
+                            str(path)
+                            for path in sorted(self.root.glob("req_*"))
+                            if not path.name.endswith(".tmp")
+                        )
+                    }
+                parts = shlex.split(command)
+                if parts[:1] == ["cat"]:
+                    return {"output": Path(parts[1]).read_text(encoding="utf-8")}
+                if parts[:2] == ["rm", "-f"]:
+                    Path(parts[2]).unlink(missing_ok=True)
+                    return {"output": ""}
+                match = re.match(
+                    r"echo '([^']*)' \| base64 -d > (\S+) && mv (\S+) (\S+)$",
+                    command,
+                )
+                if match:
+                    encoded, tmp_path, source_path, result_path = match.groups()
+                    Path(tmp_path).write_bytes(base64.b64decode(encoded))
+                    Path(source_path).replace(result_path)
+                    return {"output": ""}
+                return {"output": ""}
+
+        with tempfile.TemporaryDirectory(prefix="hermes-remote-rpc-") as temp_dir:
+            root = Path(temp_dir)
+            for seq in range(1, 5):
+                (root / f"req_{seq:06d}").write_text(
+                    json.dumps(
+                        {
+                            "tool": "terminal",
+                            "args": {"command": f"echo nested-{seq}"},
+                            "seq": seq,
+                            "token": rpc_token,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            calls = []
+            counter = [0]
+            log = []
+            state = {}
+            stop_event = threading.Event()
+
+            def nested_dispatch(function_name, function_args, task_id=None, **_kwargs):
+                calls.append((function_name, function_args))
+                if len(calls) == 3:
+                    approval_module._record_approval_breaker_trip(
+                        session_key, metadata
+                    )
+                    return json.dumps({"status": "blocked", "error": "denied"})
+                return json.dumps({"output": "allowed", "exit_code": 0})
+
+            def run_poll_loop():
+                session_token = approval_module.set_current_session_key(session_key)
+                observability_tokens = approval_module.set_current_observability_context(
+                    turn_id="turn-remote", tool_call_id="execute-remote"
+                )
+                try:
+                    _rpc_poll_loop(
+                        FakeEnv(root),
+                        str(root),
+                        "remote-task",
+                        log,
+                        counter,
+                        10,
+                        frozenset({"terminal"}),
+                        stop_event,
+                        rpc_token,
+                        state,
+                    )
+                finally:
+                    approval_module.reset_current_observability_context(
+                        observability_tokens
+                    )
+                    approval_module.reset_current_session_key(session_token)
+
+            try:
+                with patch(
+                    "model_tools.handle_function_call", side_effect=nested_dispatch
+                ):
+                    thread = threading.Thread(target=run_poll_loop, daemon=True)
+                    thread.start()
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        if all(
+                            (root / f"res_{seq:06d}").exists()
+                            for seq in range(1, 5)
+                        ):
+                            break
+                        time.sleep(0.02)
+                    stop_event.set()
+                    thread.join(timeout=5)
+            finally:
+                approval_module.clear_session(session_key)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(counter[0], 3)
+            self.assertEqual(state.get("metadata"), metadata)
+            fourth_response = json.loads(
+                (root / "res_000004").read_text(encoding="utf-8")
+            )
+            self.assertEqual(fourth_response["approval_breaker"], metadata)
 
 
 if __name__ == "__main__":

@@ -1455,9 +1455,18 @@ def handle_function_call(
         _approval_tokens = None
         try:
             from tools.approval import (
+                get_current_observability_context,
                 reset_current_observability_context,
                 set_current_observability_context,
             )
+            # RPC-backed nested tools omit correlation arguments. Preserve
+            # the outer execute_code tool's context so approval side-channel
+            # trips remain keyed to that exact outer call.
+            inherited_turn_id, inherited_tool_call_id = (
+                get_current_observability_context()
+            )
+            turn_id = turn_id or inherited_turn_id
+            tool_call_id = tool_call_id or inherited_tool_call_id
             _approval_tokens = set_current_observability_context(
                 turn_id=turn_id or "",
                 tool_call_id=tool_call_id or "",

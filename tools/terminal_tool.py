@@ -347,6 +347,7 @@ def _reset_cached_sudo_passwords() -> None:
 
 # Dangerous command detection + approval now consolidated in tools/approval.py
 from tools.approval import (
+    APPROVAL_BREAKER_METADATA_KEY as _APPROVAL_BREAKER_METADATA_KEY,
     check_all_command_guards as _check_all_guards_impl,
 )
 
@@ -2945,12 +2946,16 @@ def terminal_tool(
                     f"Command denied: {desc}. "
                     "Use the approval prompt to allow it, or rephrase the command."
                 )
-                return json.dumps({
+                blocked_result = {
                     "output": "",
                     "exit_code": -1,
                     "error": approval.get("message", fallback_msg),
-                    "status": "blocked"
-                }, ensure_ascii=False)
+                    "status": "blocked",
+                }
+                breaker_metadata = approval.get(_APPROVAL_BREAKER_METADATA_KEY)
+                if breaker_metadata is not None:
+                    blocked_result[_APPROVAL_BREAKER_METADATA_KEY] = breaker_metadata
+                return json.dumps(blocked_result, ensure_ascii=False)
             # Track whether approval was explicitly granted by the user
             if approval.get("user_approved"):
                 desc = approval.get("description", "flagged as dangerous")

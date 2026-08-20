@@ -6980,6 +6980,41 @@ def run_conversation(
                                 pass
                     break
 
+                approval_breaker_halt = getattr(
+                    agent, "_approval_breaker_halt", None
+                )
+                if isinstance(approval_breaker_halt, dict):
+                    _turn_exit_reason = "approval_denial_breaker"
+                    final_response = (
+                        "連続して承認が拒否されたため、安全のためこのターンを停止しました。"
+                        "拒否された操作を確認してから続けてください。"
+                    )
+                    # This is an intentional policy stop, not an
+                    # infrastructure/tool failure. Keep the turn successful
+                    # so gateway resume/queue bookkeeping can clear it.
+                    failed = False
+                    agent._approval_breaker_halt = None
+                    count = approval_breaker_halt.get("count")
+                    threshold = approval_breaker_halt.get("threshold")
+                    agent._emit_status(
+                        "⚠️ Approval denial circuit breaker stopped the turn"
+                        + (
+                            f" ({count}/{threshold})"
+                            if isinstance(count, int) and isinstance(threshold, int)
+                            else ""
+                        )
+                    )
+                    messages.append({"role": "assistant", "content": final_response})
+                    if final_response:
+                        agent._safe_print(f"\n{final_response}\n")
+                        if agent.stream_delta_callback:
+                            try:
+                                agent.stream_delta_callback(final_response)
+                                agent.stream_delta_callback(None)
+                            except Exception:
+                                pass
+                    break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"

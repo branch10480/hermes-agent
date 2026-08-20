@@ -13,6 +13,8 @@ public guard entry points.
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from tools import approval as A
@@ -48,7 +50,7 @@ def breaker_session(monkeypatch):
 
     session_key = "breaker-test-session"
     token = A.set_current_session_key(session_key)
-    A._reset_denials(session_key)
+    A.clear_session(session_key)
     with A._lock:
         A._permanent_approved.discard("breaker-test-danger")
         A._permanent_approved.discard("execute_code")
@@ -60,7 +62,7 @@ def breaker_session(monkeypatch):
         yield session_key
     finally:
         A.reset_current_session_key(token)
-        A._reset_denials(session_key)
+        A.clear_session(session_key)
         with A._lock:
             A._gateway_queues.pop(session_key, None)
             A._gateway_notify_cbs.pop(session_key, None)
@@ -105,6 +107,13 @@ def test_breaker_trips_on_third_consecutive_denial(breaker_session):
     assert BREAKER_MARKER in third["message"]
     assert "3 consecutive commands were blocked" in third["message"]
     assert "STOP attempting variations" in third["message"]
+    assert third[A.APPROVAL_BREAKER_METADATA_KEY] == {
+        "version": 1,
+        "type": "consecutive_smart_denials",
+        "tripped": True,
+        "count": 3,
+        "threshold": 3,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -115,11 +124,25 @@ def test_approval_resets_tally(breaker_session, monkeypatch):
     _register_resolver(breaker_session, "deny")
     _denied_terminal("dangerous one")
     _denied_terminal("dangerous two")
+    A._record_approval_breaker_trip(
+        breaker_session,
+        {
+            "version": 1,
+            "type": "consecutive_smart_denials",
+            "tripped": True,
+            "count": 3,
+            "threshold": 3,
+        },
+    )
+    assert A.peek_approval_breaker_trip() is not None
 
     # Guardian approves the next command → tally resets.
     monkeypatch.setattr(A, "_smart_approve", lambda _c, _d: "approve")
     ok = _denied_terminal("benign command")
     assert ok["approved"] is True and ok.get("smart_approved") is True
+    # Approval resets only the future denial tally; a trip already observed
+    # by an active outer call remains pending for its exact executor consume.
+    assert A.peek_approval_breaker_trip() is not None
 
     # Back to denials: the count restarts, so the next deny is #1, not #3.
     monkeypatch.setattr(A, "_smart_approve", lambda _c, _d: "deny")
@@ -132,11 +155,23 @@ def test_human_approval_resets_tally(breaker_session):
     _register_resolver(breaker_session, "deny")
     _denied_terminal("dangerous one")
     _denied_terminal("dangerous two")
+    A._record_approval_breaker_trip(
+        breaker_session,
+        {
+            "version": 1,
+            "type": "consecutive_smart_denials",
+            "tripped": True,
+            "count": 3,
+            "threshold": 3,
+        },
+    )
+    assert A.peek_approval_breaker_trip() is not None
 
     # User overrides the smart DENY (one-operation approval) → tally resets.
     _register_resolver(breaker_session, "once")
     ok = _denied_terminal("dangerous but user says yes")
     assert ok["approved"] is True and ok.get("user_approved") is True
+    assert A.peek_approval_breaker_trip() is not None
 
     _register_resolver(breaker_session, "deny")
     after = _denied_terminal("dangerous again")
@@ -147,6 +182,21 @@ def test_human_approval_resets_tally(breaker_session):
 # ---------------------------------------------------------------------------
 # (c) Threshold 0 disables the breaker
 # ---------------------------------------------------------------------------
+
+def test_threshold_zero_disables_breaker_and_side_channel(breaker_session, monkeypatch):
+    monkeypatch.setattr(A, "_get_denial_breaker_threshold", lambda: 0)
+    _register_resolver(breaker_session, "deny")
+
+    results = [
+        _denied_terminal("threshold disabled one"),
+        _denied_terminal("threshold disabled two"),
+        _denied_terminal("threshold disabled three"),
+    ]
+
+    assert all(result["approved"] is False for result in results)
+    assert all(BREAKER_MARKER not in result["message"] for result in results)
+    assert all(A.APPROVAL_BREAKER_METADATA_KEY not in result for result in results)
+    assert A.peek_approval_breaker_trip() is None
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +238,7 @@ def test_headless_smart_deny_increments_and_trips(monkeypatch):
 
     session_key = "headless-breaker-session"
     token = A.set_current_session_key(session_key)
-    A._reset_denials(session_key)
+    A.clear_session(session_key)
     with A._lock:
         A._permanent_approved.discard("headless-breaker-danger")
         A._session_approved.get(session_key, set()).discard(
@@ -202,7 +252,7 @@ def test_headless_smart_deny_increments_and_trips(monkeypatch):
         assert BREAKER_MARKER in third["message"]
     finally:
         A.reset_current_session_key(token)
-        A._reset_denials(session_key)
+        A.clear_session(session_key)
 
 
 # ---------------------------------------------------------------------------
@@ -228,3 +278,100 @@ def test_tally_evicts_oldest_sessions():
         with A._lock:
             A._denial_tally.clear()
             A._denial_tally.update(saved)
+
+
+def test_clear_session_resets_denial_tally(breaker_session):
+    _register_resolver(breaker_session, "deny")
+    _denied_terminal("dangerous one")
+    _denied_terminal("dangerous two")
+    A._record_approval_breaker_trip(
+        breaker_session,
+        {
+            "version": 1,
+            "type": "consecutive_smart_denials",
+            "tripped": True,
+            "count": 3,
+            "threshold": 3,
+        },
+    )
+    assert A.peek_approval_breaker_trip() is not None
+
+    A.clear_session(breaker_session)
+    assert A.peek_approval_breaker_trip() is None
+
+    _register_resolver(breaker_session, "deny")
+    after = _denied_terminal("dangerous after clear")
+    assert BREAKER_MARKER not in after["message"]
+
+
+def test_pending_trip_is_scoped_to_exact_turn_and_tool_call(breaker_session):
+    """An old turn's refreshed trip cannot stop a later user turn."""
+    metadata = {
+        "version": 1,
+        "type": "consecutive_smart_denials",
+        "tripped": True,
+        "count": 3,
+        "threshold": 3,
+    }
+    A._record_approval_breaker_trip(
+        breaker_session,
+        metadata,
+        turn_id="old-turn",
+        tool_call_id="old-call",
+    )
+
+    assert A.consume_approval_breaker_trip(
+        breaker_session,
+        turn_id="fresh-turn",
+        tool_call_id="fresh-call",
+    ) is None
+    assert A.consume_approval_breaker_trip(
+        breaker_session,
+        turn_id="old-turn",
+        tool_call_id="old-call",
+    ) == metadata
+
+
+def test_approval_reset_race_keeps_pending_trip():
+    """A concurrent approval reset cannot erase an already recorded trip."""
+    session_key = "breaker-reset-race"
+    turn_id = "turn-reset-race"
+    tool_call_id = "execute-reset-race"
+    metadata = {
+        "version": 1,
+        "type": "consecutive_smart_denials",
+        "tripped": True,
+        "count": 3,
+        "threshold": 3,
+    }
+    A.clear_session(session_key)
+    barrier = threading.Barrier(2)
+
+    def record_trip():
+        barrier.wait()
+        A._record_approval_breaker_trip(
+            session_key,
+            metadata,
+            turn_id=turn_id,
+            tool_call_id=tool_call_id,
+        )
+
+    def reset_approval_tally():
+        barrier.wait()
+        A._reset_denials(session_key)
+
+    threads = [
+        threading.Thread(target=record_trip),
+        threading.Thread(target=reset_approval_tally),
+    ]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert all(not thread.is_alive() for thread in threads)
+        assert A.peek_approval_breaker_trip(
+            session_key, turn_id=turn_id, tool_call_id=tool_call_id
+        ) == metadata
+    finally:
+        A.clear_session(session_key)

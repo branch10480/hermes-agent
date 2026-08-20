@@ -650,6 +650,102 @@ def _call(tool_name, args):
 _TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify_on_complete", "watch_patterns"}
 
 
+def _sync_approval_breaker_state(state: dict | None) -> dict | None:
+    """Mirror the approval side-channel into an active execute_code bridge.
+
+    The marker copied into RPC responses is diagnostic only.  Dispatch
+    suppression is based on the in-process side-channel, which cannot be
+    stripped or spoofed by a model-facing result transform.
+    """
+    if state is None:
+        return None
+    try:
+        from tools.approval import (
+            get_current_observability_context,
+            get_current_session_key,
+            peek_approval_breaker_trip,
+        )
+
+        # Bind the exact outer-call identity once.  Nested RPC dispatches can
+        # omit correlation arguments, and the bridge must not follow a later
+        # context change to another call while it is still running.
+        if not state.get("_identity_bound"):
+            turn_id, tool_call_id = get_current_observability_context()
+            session_key = get_current_session_key(default="")
+            state.update(
+                {
+                    "_identity_bound": True,
+                    "session_key": session_key,
+                    "turn_id": turn_id,
+                    "tool_call_id": tool_call_id,
+                }
+            )
+
+        metadata = peek_approval_breaker_trip(
+            state.get("session_key", ""),
+            turn_id=state.get("turn_id", ""),
+            tool_call_id=state.get("tool_call_id", ""),
+        )
+    except Exception:
+        logger.debug("Could not inspect approval-breaker side-channel", exc_info=True)
+        metadata = None
+
+    if metadata is not None:
+        # Once observed, the bridge owns a latched copy.  Side-channel
+        # eviction (or a concurrent ordinary approval reset) must not reopen
+        # dispatch while this execute_code invocation is still running.
+        state["metadata"] = metadata
+        state["_latched"] = True
+    return state.get("metadata") if state.get("_latched") else None
+
+
+def _approval_breaker_skip_result(metadata: dict) -> str:
+    """Return a model-visible diagnostic for a suppressed nested call."""
+    return json.dumps(
+        {
+            "error": (
+                "The approval denial circuit breaker ended execute_code; "
+                "this nested tool call was not started."
+            ),
+            # Observability only; executor control uses the side-channel.
+            "approval_breaker": metadata,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _attach_approval_breaker_result(result: dict, state: dict | None) -> dict:
+    """Refresh the trusted trip, then expose a diagnostic outer marker.
+
+    The marker is model-visible observability only.  Refreshing the exact
+    side-channel key immediately before returning closes the eviction window
+    between the nested dispatch and the outer executor's consume.  Session
+    cleanup may clear the old key; if the bridge is still unwinding, the
+    refresh remains scoped to this exact (session, turn, tool-call) identity.
+    """
+    if state is not None:
+        metadata = _sync_approval_breaker_state(state)
+        if isinstance(metadata, dict) and state.get("_identity_bound"):
+            try:
+                from tools.approval import _record_approval_breaker_trip
+
+                _record_approval_breaker_trip(
+                    state.get("session_key", ""),
+                    metadata,
+                    turn_id=state.get("turn_id", ""),
+                    tool_call_id=state.get("tool_call_id", ""),
+                )
+            except Exception:
+                logger.debug(
+                    "Could not refresh approval-breaker side-channel",
+                    exc_info=True,
+                )
+            # The executor never trusts this field; it consumes the side
+            # channel after execute_code returns.
+            result["approval_breaker"] = dict(metadata)
+    return result
+
+
 def _rpc_server_loop(
     server_sock: socket.socket,
     task_id: str,
@@ -659,6 +755,7 @@ def _rpc_server_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    approval_breaker_state: dict | None = None,
 ):
     """
     Accept one client connection and dispatch tool-call requests until
@@ -736,6 +833,16 @@ def _rpc_server_loop(
                     conn.sendall((resp + "\n").encode())
                     continue
 
+                # Once a nested approval denial trips the breaker, answer
+                # subsequent requests without dispatching another tool.
+                breaker_metadata = _sync_approval_breaker_state(
+                    approval_breaker_state
+                )
+                if breaker_metadata is not None:
+                    resp = _approval_breaker_skip_result(breaker_metadata)
+                    conn.sendall((resp + "\n").encode())
+                    continue
+
                 # Strip forbidden terminal parameters
                 if tool_name == "terminal" and isinstance(tool_args, dict):
                     for param in _TERMINAL_BLOCKED_PARAMS:
@@ -754,6 +861,7 @@ def _rpc_server_loop(
                     result = tool_error(str(exc))
 
                 tool_call_counter[0] += 1
+                _sync_approval_breaker_state(approval_breaker_state)
                 call_duration = time.monotonic() - call_start
 
                 # Log for observability
@@ -929,6 +1037,7 @@ def _rpc_poll_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    approval_breaker_state: dict | None = None,
 ):
     """Poll the remote filesystem for tool call requests and dispatch them.
 
@@ -1012,6 +1121,14 @@ def _rpc_poll_loop(
                         f"Tool call limit reached ({max_tool_calls}). "
                         "No more tool calls allowed in this execution."
                     )
+                elif (
+                    breaker_metadata := _sync_approval_breaker_state(
+                        approval_breaker_state
+                    )
+                ) is not None:
+                    # The nested request is acknowledged, but never reaches
+                    # handle_function_call after the breaker trips.
+                    tool_result = _approval_breaker_skip_result(breaker_metadata)
                 else:
                     # Strip forbidden terminal parameters
                     if tool_name == "terminal" and isinstance(tool_args, dict):
@@ -1030,6 +1147,7 @@ def _rpc_poll_loop(
                         tool_result = tool_error(str(exc))
 
                     tool_call_counter[0] += 1
+                    _sync_approval_breaker_state(approval_breaker_state)
                     call_duration = time.monotonic() - call_start
                     tool_call_log.append({
                         "tool": tool_name,
@@ -1093,6 +1211,7 @@ def _execute_remote(
 
     tool_call_log: list = []
     tool_call_counter = [0]
+    approval_breaker_state: dict = {}
     exec_start = time.monotonic()
     stop_event = threading.Event()
     rpc_thread = None
@@ -1137,7 +1256,7 @@ def _execute_remote(
             args=(
                 env, f"{sandbox_dir}/rpc", effective_task_id,
                 tool_call_log, tool_call_counter, max_tool_calls,
-                sandbox_tools, stop_event, rpc_token,
+                sandbox_tools, stop_event, rpc_token, approval_breaker_state,
             ),
             daemon=True,
         )
@@ -1178,12 +1297,14 @@ def _execute_remote(
             duration, tool_call_counter[0], type(exc).__name__, exc,
             exc_info=True,
         )
-        return json.dumps({
+        result = {
             "status": "error",
             "error": str(exc),
             "tool_calls_made": tool_call_counter[0],
             "duration_seconds": duration,
-        }, ensure_ascii=False)
+        }
+        _attach_approval_breaker_result(result, approval_breaker_state)
+        return json.dumps(result, ensure_ascii=False)
 
     finally:
         # Stop the polling thread
@@ -1224,6 +1345,7 @@ def _execute_remote(
         "duration_seconds": duration,
     }
     result.update(stdout_metadata)
+    _attach_approval_breaker_result(result, approval_breaker_state)
 
     if status == "timeout":
         timeout_msg = f"Script timed out after {timeout}s and was killed."
@@ -1294,18 +1416,25 @@ def execute_code(
     # caller (tool-executor) thread, which holds the session context (#30882).
     # A Docker sandbox with host bind mounts is no longer isolated, so its
     # script does not get the container fast-path.
-    from tools.approval import check_execute_code_guard
+    from tools.approval import (
+        APPROVAL_BREAKER_METADATA_KEY as _APPROVAL_BREAKER_METADATA_KEY,
+        check_execute_code_guard,
+    )
     _guard = check_execute_code_guard(
         code, env_type,
         has_host_access=_docker_has_host_access(_env_config),
     )
     if not _guard.get("approved", False):
-        return json.dumps({
+        blocked_result = {
             "status": "error",
             "error": _guard.get("message") or "execute_code blocked by approval guard.",
             "tool_calls_made": 0,
             "duration_seconds": 0,
-        }, ensure_ascii=False)
+        }
+        breaker_metadata = _guard.get(_APPROVAL_BREAKER_METADATA_KEY)
+        if breaker_metadata is not None:
+            blocked_result[_APPROVAL_BREAKER_METADATA_KEY] = breaker_metadata
+        return json.dumps(blocked_result, ensure_ascii=False)
 
     # Clean interrupt slate for a user-approved script before EITHER dispatch
     # path spawns it: drop a stale bit that landed on this thread during the
@@ -1361,6 +1490,7 @@ def execute_code(
 
     tool_call_log: list = []
     tool_call_counter = [0]  # mutable so the RPC thread can increment
+    approval_breaker_state: dict = {}
     exec_start = time.monotonic()
     server_sock = None
     stop_event = threading.Event()
@@ -1412,7 +1542,8 @@ def execute_code(
             target=propagate_context_to_thread(_rpc_server_loop),
             args=(
                 server_sock, task_id, tool_call_log,
-                tool_call_counter, max_tool_calls, sandbox_tools, stop_event, rpc_token,
+                tool_call_counter, max_tool_calls, sandbox_tools, stop_event,
+                rpc_token, approval_breaker_state,
             ),
             daemon=True,
         )
@@ -1648,6 +1779,7 @@ def execute_code(
             "duration_seconds": duration,
         }
         result.update(stdout_metadata)
+        _attach_approval_breaker_result(result, approval_breaker_state)
 
         if status == "timeout":
             timeout_msg = f"Script timed out after {timeout}s and was killed."
@@ -1691,12 +1823,14 @@ def execute_code(
             exc,
             exc_info=True,
         )
-        return json.dumps({
+        result = {
             "status": "error",
             "error": str(exc),
             "tool_calls_made": tool_call_counter[0],
             "duration_seconds": duration,
-        }, ensure_ascii=False)
+        }
+        _attach_approval_breaker_result(result, approval_breaker_state)
+        return json.dumps(result, ensure_ascii=False)
 
     finally:
         # Cleanup temp dir and socket

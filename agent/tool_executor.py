@@ -131,6 +131,50 @@ def _authorization_gate_lock_timeout() -> float:
 
 
 _MAX_HALT_ON_ERROR_RESPONSE_CHARS = 128 * 1024
+_APPROVAL_BREAKER_TOOL_NAMES = frozenset({"terminal", "execute_code"})
+
+
+def _record_approval_breaker_halt(
+    agent,
+    function_name: str,
+    *,
+    tool_call_id: str = "",
+) -> None:
+    """Consume an in-process breaker trip for this exact built-in call.
+
+    The approval guard records the trip in a bounded side channel keyed by
+    session, turn, and outer tool-call ID. The model-facing result may be
+    transformed by plugins (or contain an arbitrary JSON object), so it is
+    deliberately never parsed as a control signal here.
+    """
+    if function_name not in _APPROVAL_BREAKER_TOOL_NAMES or getattr(
+        agent, "_approval_breaker_halt", None
+    ) is not None:
+        return
+    try:
+        from tools.approval import (
+            consume_approval_breaker_trip,
+            get_current_session_key,
+        )
+
+        metadata = consume_approval_breaker_trip(
+            session_key=get_current_session_key(
+                default=str(getattr(agent, "session_id", "") or "")
+            ),
+            turn_id=str(getattr(agent, "_current_turn_id", "") or ""),
+            tool_call_id=str(tool_call_id or ""),
+        )
+    except Exception:
+        logger.debug("Approval-breaker side-channel consume failed", exc_info=True)
+        return
+    if not isinstance(metadata, dict):
+        return
+
+    agent._approval_breaker_halt = {
+        "tool_name": function_name,
+        "count": metadata.get("count"),
+        "threshold": metadata.get("threshold"),
+    }
 
 
 def _record_halt_on_error_result(
@@ -1494,6 +1538,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 failed=is_error,
                 blocked=blocked,
             )
+            _record_approval_breaker_halt(
+                agent,
+                function_name,
+                tool_call_id=getattr(tc, "id", "") or "",
+            )
             if not blocked:
                 function_result = agent._append_guardrail_observation(
                     function_name,
@@ -1738,13 +1787,14 @@ def _append_halt_skipped_tool_results(
     tool_calls,
     *,
     effective_task_id: str,
+    reason: str = "an earlier halt-on-error tool ended this turn",
+    error_type: str = "halt_on_error",
 ) -> bool:
     """Complete a halted batch without starting any remaining tool call."""
     for tc in tool_calls:
         name = getattr(getattr(tc, "function", None), "name", "") or "tool"
         result = (
-            f"[Tool execution skipped — {name} was not started because an "
-            "earlier halt-on-error tool ended this turn]"
+            f"[Tool execution skipped — {name} was not started because {reason}]"
         )
         messages.append(
             make_tool_result_message(
@@ -1762,7 +1812,7 @@ def _append_halt_skipped_tool_results(
             effective_task_id=effective_task_id,
             tool_call_id=getattr(tc, "id", "") or "",
             status="cancelled",
-            error_type="halt_on_error",
+            error_type=error_type,
             error_message=result,
         )
         if not _flush_session_db_after_tool_progress(
@@ -1792,6 +1842,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 messages,
                 assistant_message.tool_calls[i - 1 :],
                 effective_task_id=effective_task_id,
+            )
+            break
+        if getattr(agent, "_approval_breaker_halt", None) is not None:
+            _append_halt_skipped_tool_results(
+                agent,
+                messages,
+                assistant_message.tool_calls[i - 1 :],
+                effective_task_id=effective_task_id,
+                reason="the approval denial circuit breaker ended this turn",
+                error_type="approval_breaker",
             )
             break
         # SAFETY: check interrupt BEFORE starting each tool.
@@ -2392,6 +2452,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             failed=_is_error_result,
             blocked=_execution_blocked,
         )
+        _record_approval_breaker_halt(
+            agent,
+            function_name,
+            tool_call_id=getattr(tool_call, "id", "") or "",
+        )
         # The agent-runtime tools above (todo, session_search, memory,
         # context-engine, memory-manager, clarify, delegate_task) are
         # dispatched inline — they never reach handle_function_call, so the
@@ -2565,6 +2630,21 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 return
             break
 
+        if (
+            getattr(agent, "_approval_breaker_halt", None) is not None
+            and i < len(assistant_message.tool_calls)
+        ):
+            if not _append_halt_skipped_tool_results(
+                agent,
+                messages,
+                assistant_message.tool_calls[i:],
+                effective_task_id=effective_task_id,
+                reason="the approval denial circuit breaker ended this turn",
+                error_type="approval_breaker",
+            ):
+                return
+            break
+
         if agent._interrupt_requested and i < len(assistant_message.tool_calls):
             remaining = len(assistant_message.tool_calls) - i
             agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {remaining} remaining tool call(s)", force=True)
@@ -2664,6 +2744,22 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             ):
                 return
             break
+        if getattr(agent, "_approval_breaker_halt", None) is not None:
+            remaining_calls = [
+                tc
+                for _remaining_kind, segment_calls in segments[segment_index:]
+                for tc in segment_calls
+            ]
+            if not _append_halt_skipped_tool_results(
+                agent,
+                messages,
+                remaining_calls,
+                effective_task_id=effective_task_id,
+                reason="the approval denial circuit breaker ended this turn",
+                error_type="approval_breaker",
+            ):
+                return
+            break
         segment_message = SimpleNamespace(tool_calls=list(calls))
         if kind == "parallel":
             execute_tool_calls_concurrent(
@@ -2678,6 +2774,25 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
 
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        if getattr(agent, "_approval_breaker_halt", None) is not None:
+            # The current segment has already emitted one result per call.
+            # Drain only later segments; including ``segment_index`` here
+            # would duplicate results for the segment that just tripped.
+            remaining_calls = [
+                tc
+                for _remaining_kind, segment_calls in segments[segment_index + 1 :]
+                for tc in segment_calls
+            ]
+            if remaining_calls and not _append_halt_skipped_tool_results(
+                agent,
+                messages,
+                remaining_calls,
+                effective_task_id=effective_task_id,
+                reason="the approval denial circuit breaker ended this turn",
+                error_type="approval_breaker",
+            ):
+                return
+            break
 
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────
     total_tools = len(assistant_message.tool_calls)
