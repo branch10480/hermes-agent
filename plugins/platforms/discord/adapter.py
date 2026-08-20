@@ -6979,14 +6979,24 @@ class DiscordAdapter(BasePlatformAdapter):
         reason = "Hermes session handoff"
 
         # First try: create a thread directly on the channel.
+        # Force a PUBLIC thread (type 11). discord.py's Channel.create_thread
+        # defaults to ChannelType.private_thread (type 12) when type is None,
+        # and a private thread created without a message has no members other
+        # than the bot — the originating user can neither see the thread nor
+        # its deliveries. A public thread is readable by everyone with access
+        # to the parent channel, so no member bookkeeping is needed.
+        public_thread_type = getattr(getattr(discord, "ChannelType", None), "public_thread", None)
+        create_kwargs = dict(
+            name=thread_name,
+            auto_archive_duration=1440,
+            reason=reason,
+        )
+        if public_thread_type is not None:
+            create_kwargs["type"] = public_thread_type
         try:
             create = getattr(parent, "create_thread", None)
             if create is not None:
-                thread = await create(
-                    name=thread_name,
-                    auto_archive_duration=1440,
-                    reason=reason,
-                )
+                thread = await create(**create_kwargs)
                 return str(thread.id)
         except Exception as direct_error:
             logger.debug(
@@ -6995,6 +7005,8 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
         # Fallback: post a seed message and create the thread from it.
+        # Message.create_thread always creates a PUBLIC thread, so this path
+        # needs no type override.
         try:
             send = getattr(parent, "send", None)
             if send is None:
