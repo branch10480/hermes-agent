@@ -38,6 +38,9 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.final_response_sanitization import (
+    sanitize_deepseek_discord_final_response,
+)
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -216,6 +219,7 @@ _LOCAL_PROCESSING_MODULES = frozenset({
     "agent_runtime_helpers",
     "message_content",
     "message_sanitization",
+    "final_response_sanitization",
     "chat_completion_helpers",  # only local when NOT also an API-call module
 })
 _API_CALL_MODULES = frozenset({
@@ -7631,8 +7635,18 @@ def run_conversation(
                             _frag.pop("_length_continuation_nudge", None)
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
+                final_response = sanitize_deepseek_discord_final_response(
+                    final_response,
+                    model=getattr(agent, "model", "") or "",
+                    platform=getattr(agent, "platform", None),
+                    user_message=user_message,
+                )
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                # Persist and deliver the same sanitized answer.  This is the
+                # final-response chokepoint, before the gateway performs its
+                # platform-specific message splitting.
+                final_msg["content"] = final_response
 
                 # ── Dropped tool-call recovery (copilot/Claude) ────────
                 # Some providers (observed: claude-opus-4.8 / claude-sonnet-4.5
