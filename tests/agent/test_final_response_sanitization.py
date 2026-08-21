@@ -34,6 +34,34 @@ def test_removes_confirmed_english_planning_prefix():
     assert _sanitize(leaked) == JAPANESE_ANSWER
 
 
+def test_removes_denied_tool_narration_before_japanese_answer():
+    leaked = (
+        "The terminal python3 date conversion and execute_code both got denied "
+        "by smart approval. Interesting — these are read-only operations, but "
+        "they were denied. I shouldn't retry them. I already have enough evidence "
+        "from the cron list and output file to answer.\n\n"
+        "Let me write final answer in Japanese, natural phrasing, concise but informative."
+        + JAPANESE_ANSWER
+    )
+
+    assert _sanitize(leaked) == JAPANESE_ANSWER
+
+
+def test_preserves_japanese_first_sentence_when_switch_has_no_newline():
+    answer = (
+        "2時に予定されていたジョブは実際には動いていました。"
+        "見えなかったのは、配信が意図的に抑制されたためです。"
+        "確認した記録では実行結果も正常に保存されていました。"
+    )
+    leaked = (
+        "The terminal command was blocked by smart approval.\n\n"
+        "Let me write final answer in Japanese, natural phrasing, concise but informative."
+        + answer
+    )
+
+    assert _sanitize(leaked) == answer
+
+
 def test_preserves_english_technical_terms_urls_and_code_in_japanese_answer():
     answer = (
         "## 結論\n\nDeepSeek V4 Flash と oMLX の設定は正常です。"
@@ -48,6 +76,15 @@ def test_fails_open_without_explicit_switch_marker():
     ambiguous = "Now I have enough. " + JAPANESE_ANSWER
 
     assert _sanitize(ambiguous) == ambiguous
+
+
+def test_preserves_denied_tool_report_without_japanese_switch_marker():
+    legitimate_report = (
+        "The terminal command was denied by the approval policy.\n\n"
+        + JAPANESE_ANSWER
+    )
+
+    assert _sanitize(legitimate_report) == legitimate_report
 
 
 def test_fails_open_for_non_discord_or_non_deepseek_or_english_request():

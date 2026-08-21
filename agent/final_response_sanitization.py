@@ -21,14 +21,20 @@ _META_PREFIX_RE = re.compile(
     r"now\s+i\s+have\s+enough\b|"
     r"let\s+me\s+(?:compile|compose|craft|prepare|write)\s+(?:the\s+)?answer\b|"
     r"key\s+facts\s*:|"
-    r"since\s+the\s+user\s+is\s+japanese\b"
+    r"since\s+the\s+user\s+is\s+japanese\b|"
+    # DeepSeek sometimes narrates a denied tool call as ordinary content
+    # before deciding to answer from the evidence it already has.  Keep this
+    # signature narrow: a known tool/terminal noun must begin the response and
+    # the same first line must explicitly say the operation was denied/blocked.
+    r"the\s+(?:terminal|execute_code|read_file|web_search|browser\w*|tool)\b"
+    r"[^\n]{0,240}\b(?:got|was|were)\s+(?:denied|blocked)\b"
     r")",
     re.I,
 )
 _JAPANESE_ANSWER_SWITCH_RE = re.compile(
     r"(?im)^\s*(?:let\s+me|i\s+(?:will|should|need\s+to))"
     r"[^\n]{0,220}\b(?:final\s+answer|answer|response)\b"
-    r"[^\n]{0,160}\b(?:in\s+japanese|japanese)\b[^\n]*$"
+    r"[^\n]{0,160}?\b(?:in\s+japanese|japanese)\b"
 )
 
 
@@ -77,7 +83,24 @@ def sanitize_deepseek_discord_final_response(
     switches = list(_JAPANESE_ANSWER_SWITCH_RE.finditer(content))
     if not switches:
         return content
-    candidate = content[switches[-1].end():].lstrip()
+    tail = content[switches[-1].end():]
+    first_japanese = _JAPANESE_RE.search(tail)
+    if first_japanese is None:
+        return content
+
+    # Some local-model responses concatenate the English switch sentence and
+    # the Japanese answer without a newline.  Find the last sentence/newline
+    # boundary before the first Japanese character so Markdown prefixes such
+    # as ``## `` are preserved while the remaining English switch prose is
+    # removed.
+    before_japanese = tail[:first_japanese.start()]
+    boundary = max(
+        before_japanese.rfind("\n"),
+        before_japanese.rfind("."),
+        before_japanese.rfind("!"),
+        before_japanese.rfind("?"),
+    )
+    candidate = tail[boundary + 1:].lstrip()
 
     # A short Japanese phrase after an English quotation can occur naturally;
     # only treat a sizeable completed answer as proof of the leak shape.
