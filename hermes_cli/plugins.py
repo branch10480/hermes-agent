@@ -139,6 +139,10 @@ VALID_HOOKS: Set[str] = {
     # defensive copy of the server-loaded cron record and may attest only an
     # exact tracked job identity; model-authored prompt text is never enough.
     "attest_scheduled_turn",
+    # Synchronous, direct-user-turn attestation for an exact manual cron fire.
+    # The cron tool passes only server-owned turn identity and a defensive job
+    # copy; model-authored arguments cannot manufacture this authority.
+    "attest_manual_scheduled_turn",
     "pre_tool_call",
     "post_tool_call",
     "transform_terminal_output",
@@ -2472,6 +2476,52 @@ def scheduled_turn_authority_attested(
         "schema_version": 1,
         "authority": "scheduled",
         "job_id": job_id,
+    }
+    return any(result == expected for result in results)
+
+
+def manual_scheduled_turn_authority_attested(
+    job: Mapping[str, Any],
+    *,
+    session_id: str,
+    task_id: str,
+    turn_id: str,
+    direct_user_authority_revision: int,
+    direct_user_authority_kind: str,
+    has_extra_prompt: bool,
+) -> bool:
+    """Attest one exact manual cron fire authorized by its direct user turn."""
+
+    if not isinstance(job, Mapping) or has_extra_prompt is not False:
+        return False
+    if direct_user_authority_kind != "direct_user":
+        return False
+    if not all(isinstance(value, str) and value for value in (session_id, task_id, turn_id)):
+        return False
+    if type(direct_user_authority_revision) is not int or direct_user_authority_revision < 0:
+        return False
+    job_id = job.get("id")
+    if not isinstance(job_id, str) or not job_id:
+        return False
+    discover_plugins()
+    results = invoke_hook(
+        "attest_manual_scheduled_turn",
+        job=copy.deepcopy(dict(job)),
+        session_id=session_id,
+        task_id=task_id,
+        turn_id=turn_id,
+        direct_user_authority_revision=direct_user_authority_revision,
+        direct_user_authority_kind=direct_user_authority_kind,
+        has_extra_prompt=has_extra_prompt,
+    )
+    expected = {
+        "schema_version": 1,
+        "authority": "manual_direct_user",
+        "job_id": job_id,
+        "session_id": session_id,
+        "task_id": task_id,
+        "turn_id": turn_id,
+        "revision": direct_user_authority_revision,
     }
     return any(result == expected for result in results)
 

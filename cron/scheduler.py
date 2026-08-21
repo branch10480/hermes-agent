@@ -3174,6 +3174,7 @@ def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
     fire_provenance: str = "untrusted",
+    manual_authority_job_id: str = "",
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -3191,6 +3192,10 @@ def run_job(
     ``extra_prompt``: optional per-run context from ``cronjob(action='run',
     prompt=...)`` (#57331). Appended to the stored prompt for this fire only —
     never persisted to the job definition.
+
+    ``manual_authority_job_id``: server-owned proof that the direct user turn
+    explicitly authorized this exact stored job's manual fire. It is never
+    accepted for extra-prompt runs or a different job identity.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -4102,6 +4107,12 @@ def run_job(
                 job_id,
                 _attestation_exc,
             )
+        if (
+            fire_provenance == "manual"
+            and extra_prompt is None
+            and manual_authority_job_id == job_id
+        ):
+            _scheduled_authority_attested = True
 
         agent = AIAgent(
             model=model,
@@ -4566,6 +4577,7 @@ def run_one_job(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None,
     fire_provenance: str = "untrusted",
+    manual_authority_job_id: str = "",
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -4633,11 +4645,14 @@ def run_one_job(
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         try:
-            success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents,
-                extra_prompt=extra_prompt,
-                fire_provenance=fire_provenance,
-            )
+            run_kwargs = {
+                "defer_agent_teardown": _deferred_agents,
+                "extra_prompt": extra_prompt,
+                "fire_provenance": fire_provenance,
+            }
+            if manual_authority_job_id:
+                run_kwargs["manual_authority_job_id"] = manual_authority_job_id
+            success, output, final_response, error = run_job(job, **run_kwargs)
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
             # it down here so a failed run never leaks its async resources

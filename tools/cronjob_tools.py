@@ -598,7 +598,9 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _execute_job_now(
-    job: Dict[str, Any], extra_prompt: Optional[str] = None
+    job: Dict[str, Any],
+    extra_prompt: Optional[str] = None,
+    manual_authority_job_id: str = "",
 ) -> Dict[str, Any]:
     """Execute a cron job immediately, outside the scheduler tick.
 
@@ -639,11 +641,17 @@ def _execute_job_now(
             pass
         return {"claimed": True, "success": False, "error": str(e)}
 
-    return _run_claimed_job(job, extra_prompt=extra_prompt)
+    return _run_claimed_job(
+        job,
+        extra_prompt=extra_prompt,
+        manual_authority_job_id=manual_authority_job_id,
+    )
 
 
 def _run_claimed_job(
-    job: Dict[str, Any], extra_prompt: Optional[str] = None
+    job: Dict[str, Any],
+    extra_prompt: Optional[str] = None,
+    manual_authority_job_id: str = "",
 ) -> Dict[str, Any]:
     """Fire an already-claimed job through the shared ``run_one_job`` body.
 
@@ -757,11 +765,15 @@ def _run_claimed_job(
 
         try:
             try:
-                processed = run_one_job(
-                    job, adapters=adapters, loop=gateway_loop,
-                    extra_prompt=extra_prompt,
-                    fire_provenance="manual",
-                )
+                run_kwargs = {
+                    "adapters": adapters,
+                    "loop": gateway_loop,
+                    "extra_prompt": extra_prompt,
+                    "fire_provenance": "manual",
+                }
+                if manual_authority_job_id:
+                    run_kwargs["manual_authority_job_id"] = manual_authority_job_id
+                processed = run_one_job(job, **run_kwargs)
             finally:
                 _heartbeat_stop.set()
                 if _heartbeat_thread is not None:
@@ -824,6 +836,7 @@ def _latest_job_output_excerpt(job_id: str, max_chars: int = 2000) -> Optional[s
 def _try_dispatch_background_run(
     job: Dict[str, Any], session_id: Optional[str] = None,
     extra_prompt: Optional[str] = None,
+    manual_authority_job_id: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Claim ``job`` now, then fire it on the async-delegation daemon executor.
 
@@ -956,7 +969,11 @@ def _try_dispatch_background_run(
             "cronjob run: async delegation registry unavailable (%s); "
             "running job '%s' inline.", e, job_name,
         )
-        result = _run_claimed_job(job, extra_prompt=extra_prompt)
+        result = _run_claimed_job(
+            job,
+            extra_prompt=extra_prompt,
+            manual_authority_job_id=manual_authority_job_id,
+        )
         result["dispatched"] = False
         return result
 
@@ -971,7 +988,11 @@ def _try_dispatch_background_run(
     deliver = job.get("deliver", "local")
 
     def _runner() -> Dict[str, Any]:
-        res = _run_claimed_job(job, extra_prompt=extra_prompt)
+        res = _run_claimed_job(
+            job,
+            extra_prompt=extra_prompt,
+            manual_authority_job_id=manual_authority_job_id,
+        )
         duration = round(time.time() - started_at, 2)
         refreshed = get_job(job_id) or {}
         lines = [
@@ -1029,7 +1050,11 @@ def _try_dispatch_background_run(
         "cronjob run: background pool unavailable (%s); running job '%s' inline.",
         dispatch.get("error", "rejected"), job_name,
     )
-    result = _run_claimed_job(job, extra_prompt=extra_prompt)
+    result = _run_claimed_job(
+        job,
+        extra_prompt=extra_prompt,
+        manual_authority_job_id=manual_authority_job_id,
+    )
     result["dispatched"] = False
     return result
 
@@ -1059,9 +1084,11 @@ def cronjob(
     monitor_url: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    direct_user_authority_revision: int = 0,
+    direct_user_authority_kind: str = "untrusted",
 ) -> str:
     """Unified cron job management tool."""
-    del task_id  # unused but kept for handler signature compatibility
 
     try:
         normalized = (action or "").strip().lower()
@@ -1243,6 +1270,29 @@ def cronjob(
                 scan_error = _scan_cron_prompt(extra_prompt)
                 if scan_error:
                     return tool_error(scan_error, success=False)
+            manual_authority_job_id = ""
+            try:
+                from hermes_cli.plugins import (
+                    manual_scheduled_turn_authority_attested,
+                )
+
+                if manual_scheduled_turn_authority_attested(
+                    job,
+                    session_id=str(session_id or ""),
+                    task_id=str(task_id or ""),
+                    turn_id=str(turn_id or ""),
+                    direct_user_authority_revision=direct_user_authority_revision,
+                    direct_user_authority_kind=direct_user_authority_kind,
+                    has_extra_prompt=extra_prompt is not None,
+                ):
+                    manual_authority_job_id = job_id
+            except Exception as exc:
+                logger.warning(
+                    "cronjob run: direct-user authority attestation failed closed "
+                    "for job '%s': %s",
+                    job_id,
+                    exc,
+                )
             # Execute the job immediately rather than only scheduling it for the
             # next scheduler tick — a manual `run` should actually run, even when
             # no gateway/ticker is active (the #41037 case). The claim (taken
@@ -1258,7 +1308,10 @@ def cronjob(
             # incident). Falls back to inline execution when the session
             # runtime can't receive detached completions.
             bg = _try_dispatch_background_run(
-                job, session_id=session_id, extra_prompt=extra_prompt
+                job,
+                session_id=session_id,
+                extra_prompt=extra_prompt,
+                manual_authority_job_id=manual_authority_job_id,
             )
             if bg is not None and bg.get("dispatched"):
                 _notify_provider_jobs_changed_safe()
@@ -1284,7 +1337,11 @@ def cronjob(
             # unsupported here — run synchronously as before.
             exec_result = (
                 bg if bg is not None
-                else _execute_job_now(job, extra_prompt=extra_prompt)
+                else _execute_job_now(
+                    job,
+                    extra_prompt=extra_prompt,
+                    manual_authority_job_id=manual_authority_job_id,
+                )
             )
             # A claimed direct run advances next_run_at and may race the
             # external one-shot for the same occurrence. If Chronos loses that

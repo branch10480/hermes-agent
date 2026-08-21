@@ -1202,6 +1202,10 @@ def build_turn_context(
                 else "unknown"
             ),
             direct_user_authority_revision=0,
+            direct_user_authority_kind=str(
+                getattr(agent, "_direct_user_authority_kind", "untrusted")
+                or "untrusted"
+            ),
             conversation_history=list(messages),
             is_first_turn=(not bool(conversation_history)),
             model=agent.model,

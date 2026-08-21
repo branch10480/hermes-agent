@@ -26,6 +26,40 @@ _JOB = {"id": "job-run-1", "name": "manual run", "prompt": "hi",
 
 
 class TestCronjobRunExecutesImmediately:
+    def test_direct_user_attestation_reaches_exact_manual_job(self):
+        """A verified direct request binds authority to this job and no other."""
+        completed = {"id": "job-run-1", "last_status": "ok", "last_error": None}
+        with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
+             patch(
+                 "hermes_cli.plugins.manual_scheduled_turn_authority_attested",
+                 return_value=True,
+             ) as m_attest, \
+             patch("tools.cronjob_tools._try_dispatch_background_run", return_value=None), \
+             patch(
+                 "tools.cronjob_tools._execute_job_now",
+                 return_value={"claimed": True, "success": True, "error": None},
+             ) as m_execute, \
+             patch("tools.cronjob_tools.get_job", return_value=completed):
+            out = json.loads(
+                cronjob(
+                    action="run",
+                    job_id="job-run-1",
+                    session_id="session-1",
+                    task_id="task-1",
+                    turn_id="turn-1",
+                    direct_user_authority_revision=0,
+                    direct_user_authority_kind="direct_user",
+                )
+            )
+
+        assert out["success"] is True
+        assert m_attest.call_args.kwargs["has_extra_prompt"] is False
+        m_execute.assert_called_once_with(
+            _JOB,
+            extra_prompt=None,
+            manual_authority_job_id="job-run-1",
+        )
+
     def test_run_action_claims_and_fires_via_run_one_job(self):
         """action='run' must claim the job then fire it through run_one_job."""
         ran = {"job": "after-run", "last_status": "ok", "last_error": None}
