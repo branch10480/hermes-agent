@@ -26,6 +26,9 @@ _END_MARKER_RE = re.compile(
     rf"(?m)^[ \t]*{re.escape(FINAL_ANSWER_END)}[ \t]*\r?$"
 )
 _FENCE_RE = re.compile(r"(?m)^[ \t]*(```|~~~)")
+_ASYNC_DELEGATION_COMPLETE_RE = re.compile(
+    r"^\s*\[ASYNC DELEGATION(?: BATCH)? COMPLETE\s+[—-]", re.I
+)
 
 _EXPLICIT_NON_JAPANESE_REQUEST_RE = re.compile(
     r"(?:英語で(?:回答|返答|答え|書い|説明|出力|まとめ)|"
@@ -90,6 +93,35 @@ def _text_from_user_message(user_message: Any) -> str:
             if isinstance(text, str):
                 parts.append(text)
     return "\n".join(parts)
+
+
+def _effective_user_text(
+    user_message: Any,
+    conversation_messages: list[dict[str, Any]] | None,
+) -> str:
+    """Resolve the human request behind an async-completion synthetic turn.
+
+    Async delegation completion is injected as a model-facing user message in
+    English.  Treating that transport envelope as the user's language disables
+    Japanese-only cleanup on the follow-up response.  The protocol header is a
+    stable Hermes-owned boundary, so only that exact synthetic turn may inherit
+    the most recent genuine Japanese user request.
+    """
+
+    current = _text_from_user_message(user_message)
+    if _JAPANESE_RE.search(current) or not _ASYNC_DELEGATION_COMPLETE_RE.match(current):
+        return current
+    for message in reversed(conversation_messages or []):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        candidate = _text_from_user_message(message.get("content"))
+        if not candidate or candidate == current:
+            continue
+        if _ASYNC_DELEGATION_COMPLETE_RE.match(candidate):
+            continue
+        if _JAPANESE_RE.search(candidate):
+            return candidate
+    return current
 
 
 def _inside_fenced_code(content: str, position: int) -> bool:
@@ -172,12 +204,118 @@ def _extract_structural_fallback(content: str) -> str | None:
     return None
 
 
+def _paragraph_spans(content: str) -> list[tuple[int, int, str]]:
+    """Return non-empty blank-line-delimited blocks with source offsets."""
+
+    spans: list[tuple[int, int, str]] = []
+    for match in re.finditer(r"\S(?:.*?\S)?(?=\n[ \t]*\n|\Z)", content, re.S):
+        spans.append((match.start(), match.end(), match.group(0)))
+    return spans
+
+
+def _looks_like_internal_meta_block(text: str) -> bool:
+    stripped = text.lstrip()
+    if not stripped or stripped.startswith(("```", "~~~", ">")):
+        return False
+    latin_count = len(_LATIN_RE.findall(text))
+    japanese_count = len(_JAPANESE_RE.findall(text))
+    if latin_count < 60 or latin_count < 2 * max(1, japanese_count):
+        return False
+    matched = [bool(pattern.search(text)) for pattern in _META_FEATURES]
+    # Require both an explicit planning/decision signal and an independent
+    # operational/evidence signal.  A legitimate sentence such as “The
+    # terminal command was denied” therefore remains visible.
+    return sum(matched) >= 2 and (matched[0] or matched[3]) and (matched[1] or matched[2])
+
+
+def _looks_like_japanese_answer_suffix(text: str) -> bool:
+    japanese_count = len(_JAPANESE_RE.findall(text))
+    latin_count = len(_LATIN_RE.findall(text))
+    return japanese_count >= 80 and japanese_count * 2 >= latin_count
+
+
+def _is_answer_leading_markdown_block(text: str) -> bool:
+    stripped = text.strip()
+    return bool(
+        len(stripped) <= 160
+        and (
+            re.fullmatch(r"#{1,6}[ \t]+\S[^\n]*", stripped)
+            or re.fullmatch(r"\*\*\S[^\n]*\*\*", stripped)
+        )
+    )
+
+
+def _extract_unmarked_paragraph_fallback(content: str) -> str | None:
+    """Extract a Japanese suffix after the last high-confidence meta block.
+
+    DeepSeek sometimes omits both the explicit boundary and the traditional
+    “final answer in Japanese” switch.  It can even draft a Japanese answer,
+    return to English self-evaluation, then write the real Japanese answer.
+    Searching candidate boundaries from the end keeps the final draft while
+    requiring two independent meta classes immediately before it.
+    """
+
+    spans = _paragraph_spans(content)
+    if len(spans) < 2:
+        return None
+    for index in range(len(spans) - 1, 0, -1):
+        candidate_start = index
+        while (
+            candidate_start > 0
+            and _is_answer_leading_markdown_block(spans[candidate_start - 1][2])
+        ):
+            candidate_start -= 1
+        candidate = content[spans[candidate_start][0] :].strip()
+        if not _looks_like_japanese_answer_suffix(candidate):
+            continue
+        # One model thought may be split across adjacent paragraphs (e.g.
+        # evidence assessment followed by an answer plan), so score a bounded
+        # block ending immediately before the candidate.
+        for width in range(1, min(3, candidate_start) + 1):
+            block = "\n\n".join(
+                item[2] for item in spans[candidate_start - width : candidate_start]
+            )
+            if _looks_like_internal_meta_block(block):
+                return candidate
+    return None
+
+
+def should_suppress_deepseek_discord_interim_content(
+    content: str,
+    *,
+    model: str,
+    platform: str | None,
+    user_message: Any,
+    conversation_messages: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Return True only for high-confidence English internal tool narration.
+
+    The caller suppresses UI projection only; the assistant/tool-call row stays
+    in history so provider tool-call pairing and subsequent reasoning remain
+    intact.
+    """
+
+    if not isinstance(content, str) or not content:
+        return False
+    if (platform or "").lower() != "discord":
+        return False
+    if not _DEEPSEEK_V4_FLASH_MODEL_RE.search(model or ""):
+        return False
+    user_text = _effective_user_text(user_message, conversation_messages)
+    if not _JAPANESE_RE.search(user_text):
+        return False
+    if _EXPLICIT_NON_JAPANESE_REQUEST_RE.search(user_text):
+        return False
+    return _looks_like_internal_meta_block(content)
+
+
 def sanitize_deepseek_discord_final_response(
     content: str,
     *,
     model: str,
     platform: str | None,
     user_message: Any,
+    conversation_messages: list[dict[str, Any]] | None = None,
 ) -> str:
     """Return only a confirmed Japanese final answer, otherwise fail open."""
 
@@ -187,7 +325,7 @@ def sanitize_deepseek_discord_final_response(
         return content
     if not _DEEPSEEK_V4_FLASH_MODEL_RE.search(model or ""):
         return content
-    user_text = _text_from_user_message(user_message)
+    user_text = _effective_user_text(user_message, conversation_messages)
     if not _JAPANESE_RE.search(user_text):
         return content
     if _EXPLICIT_NON_JAPANESE_REQUEST_RE.search(user_text):
@@ -197,11 +335,15 @@ def sanitize_deepseek_discord_final_response(
     if explicit is not None:
         return explicit
     structural = _extract_structural_fallback(content)
-    return structural if structural is not None else content
+    if structural is not None:
+        return structural
+    paragraph_fallback = _extract_unmarked_paragraph_fallback(content)
+    return paragraph_fallback if paragraph_fallback is not None else content
 
 
 __all__ = [
     "FINAL_ANSWER_END",
     "FINAL_ANSWER_START",
     "sanitize_deepseek_discord_final_response",
+    "should_suppress_deepseek_discord_interim_content",
 ]

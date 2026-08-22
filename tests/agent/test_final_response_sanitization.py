@@ -6,6 +6,7 @@ from agent.final_response_sanitization import (
     FINAL_ANSWER_END,
     FINAL_ANSWER_START,
     sanitize_deepseek_discord_final_response,
+    should_suppress_deepseek_discord_interim_content,
 )
 
 
@@ -110,6 +111,111 @@ def test_structural_fallback_handles_long_third_person_tool_narration():
     )
 
     assert _sanitize(leaked) == JAPANESE_ANSWER
+
+
+def test_unmarked_fallback_uses_last_meta_block_after_an_earlier_draft():
+    earlier_draft = (
+        "## 下書き\n\n途中まで調べた内容です。この段階ではまだ検証が終わっておらず、"
+        "最終的な結論ではありません。追加の結果を確認してから回答を確定します。"
+    )
+    leaked = (
+        "response\n\n"
+        "I have reviewed the available evidence and need to organize the result. "
+        "The tool output confirms several facts, but this is still working context.\n\n"
+        + earlier_draft
+        + "\n\nActually, I should not use that draft. The evidence from the delegated "
+        "tool confirms a more precise result and I need to replace it.\n\n"
+        "I will now provide the final response based on the verified result and "
+        "tell the user only the completed conclusion.\n\n"
+        + JAPANESE_ANSWER
+    )
+
+    assert _sanitize(leaked) == JAPANESE_ANSWER
+
+
+def test_unmarked_fallback_preserves_markdown_at_selected_boundary():
+    leaked = (
+        "The delegated tool returned enough verified evidence. I should discard "
+        "the earlier outline and prepare the final response for the user.\n\n"
+        + JAPANESE_ANSWER
+    )
+
+    assert _sanitize(leaked) == JAPANESE_ANSWER
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "[ASYNC DELEGATION COMPLETE — task-123]",
+        "[ASYNC DELEGATION BATCH COMPLETE — batch-123]",
+    ],
+)
+def test_async_delegation_completion_inherits_prior_japanese_request(header):
+    synthetic = (
+        f"{header}\n"
+        "A background subagent has finished.\n--- RESULT ---\nCompleted."
+    )
+    leaked = (
+        "I have enough verified evidence from the delegated tool. I should now "
+        "compile the final response and tell the user the completed result.\n\n"
+        + JAPANESE_ANSWER
+    )
+
+    assert _sanitize(
+        leaked,
+        user_message=synthetic,
+        conversation_messages=[
+            {"role": "user", "content": "この内容を日本語で詳しく調査して"},
+            {"role": "assistant", "content": "調査を開始します。"},
+            {"role": "user", "content": synthetic},
+        ],
+    ) == JAPANESE_ANSWER
+
+
+def test_async_delegation_completion_does_not_override_english_request():
+    synthetic = (
+        "[ASYNC DELEGATION COMPLETE — task-123]\n"
+        "A background subagent has finished.\n--- RESULT ---\nCompleted."
+    )
+    leaked = (
+        "I have enough verified evidence from the delegated tool. I should now "
+        "compile the final response and tell the user the completed result.\n\n"
+        + JAPANESE_ANSWER
+    )
+
+    assert _sanitize(
+        leaked,
+        user_message=synthetic,
+        conversation_messages=[
+            {"role": "user", "content": "Please investigate and answer in English"},
+            {"role": "user", "content": synthetic},
+        ],
+    ) == leaked
+
+
+def test_suppresses_internal_tool_narration_from_discord_projection_only():
+    narration = (
+        "The delegated tool returned enough verified evidence. I should not retry "
+        "the denied operation, and I will now inspect the remaining result."
+    )
+
+    assert should_suppress_deepseek_discord_interim_content(
+        narration,
+        model=MODEL,
+        platform="discord",
+        user_message="この内容を日本語で詳しく調査して",
+    )
+
+
+def test_preserves_legitimate_interim_technical_sentence():
+    narration = "The terminal command was denied by the approval policy."
+
+    assert not should_suppress_deepseek_discord_interim_content(
+        narration,
+        model=MODEL,
+        platform="discord",
+        user_message="この内容を日本語で詳しく調査して",
+    )
 
 
 def test_preserves_japanese_markdown_when_switch_has_no_newline():

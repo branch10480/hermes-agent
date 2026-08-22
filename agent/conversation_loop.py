@@ -40,6 +40,7 @@ from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.final_response_sanitization import (
     sanitize_deepseek_discord_final_response,
+    should_suppress_deepseek_discord_interim_content,
 )
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
@@ -6279,7 +6280,21 @@ def run_conversation(
 
             # Notify progress callback of model's thinking (used by subagent
             # delegation to relay the child's reasoning to the parent display).
-            if (assistant_message.content and agent.tool_progress_callback):
+            _suppress_deepseek_interim = (
+                bool(assistant_message.content)
+                and should_suppress_deepseek_discord_interim_content(
+                    assistant_message.content,
+                    model=getattr(agent, "model", "") or "",
+                    platform=getattr(agent, "platform", None),
+                    user_message=user_message,
+                    conversation_messages=messages,
+                )
+            )
+            if (
+                assistant_message.content
+                and agent.tool_progress_callback
+                and not _suppress_deepseek_interim
+            ):
                 _think_text = assistant_message.content.strip()
                 # Strip reasoning XML tags that shouldn't leak to parent display
                 _think_text = re.sub(
@@ -6876,7 +6891,7 @@ def run_conversation(
                 # A UI must never observe an assistant/tool-call row that is
                 # still only an ephemeral in-memory projection. Emit interim
                 # commentary only after the canonical SessionDB append above.
-                if not duplicate_previous_interim:
+                if not duplicate_previous_interim and not _suppress_deepseek_interim:
                     agent._emit_interim_assistant_message(assistant_msg)
 
                 # Close any open streaming display (response box, reasoning
@@ -7640,6 +7655,7 @@ def run_conversation(
                     model=getattr(agent, "model", "") or "",
                     platform=getattr(agent, "platform", None),
                     user_message=user_message,
+                    conversation_messages=messages,
                 )
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)

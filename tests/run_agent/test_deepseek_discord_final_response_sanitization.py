@@ -13,7 +13,12 @@ JAPANESE_ANSWER = (
 )
 
 
-def _run_response(raw_response: str):
+def _run_response(
+    raw_response: str,
+    *,
+    user_message: str = "この件を日本語で詳しく調査して",
+    conversation_history: list[dict] | None = None,
+):
     from run_agent import AIAgent
     from tests.run_agent.test_run_agent import _mock_response
 
@@ -52,7 +57,10 @@ def _run_response(raw_response: str):
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
     ):
-        result = agent.run_conversation("この件を日本語で詳しく調査して")
+        result = agent.run_conversation(
+            user_message,
+            conversation_history=conversation_history,
+        )
     return result, persisted
 
 
@@ -85,3 +93,84 @@ def test_structural_fallback_answer_is_returned_and_persisted():
     result, persisted = _run_response(leaked)
     _assert_sanitized(result, persisted)
     assert all("I have enough" not in rows[-1]["content"] for rows in persisted)
+
+
+def test_async_completion_uses_the_prior_human_request_and_persists_only_final():
+    synthetic = (
+        "[ASYNC DELEGATION BATCH COMPLETE — batch-123]\n"
+        "A background subagent has finished.\n--- RESULT ---\nCompleted."
+    )
+    leaked = (
+        "I have enough verified evidence from the delegated tool. I should now "
+        "compile the final response and tell the user the completed result.\n\n"
+        + JAPANESE_ANSWER
+    )
+
+    result, persisted = _run_response(
+        leaked,
+        user_message=synthetic,
+        conversation_history=[
+            {"role": "user", "content": "この件を日本語で詳しく調査して"},
+            {"role": "assistant", "content": "調査を開始します。"},
+        ],
+    )
+
+    _assert_sanitized(result, persisted)
+    assert "I have enough" not in result["messages"][-1]["content"]
+
+
+def test_internal_tool_narration_is_kept_in_history_but_not_projected():
+    from run_agent import AIAgent
+    from tests.run_agent.test_run_agent import _mock_response, _mock_tool_call
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="http://127.0.0.1:18088/v1",
+            model="deepseek-v4-flash-0731-2-4bit-mixed",
+            platform="discord",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    narration = (
+        "The delegated tool returned enough verified evidence. I should not retry "
+        "the denied operation, and I will now inspect the remaining result."
+    )
+    tool_call = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+    agent.valid_tool_names = {"web_search"}
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content=narration,
+            finish_reason="tool_calls",
+            tool_calls=[tool_call],
+        ),
+        _mock_response(content=JAPANESE_ANSWER, finish_reason="stop"),
+    ]
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    projected = MagicMock()
+    agent.interim_assistant_callback = projected
+
+    with (
+        patch("run_agent.handle_function_call", return_value="verified result"),
+        patch.object(agent, "_flush_messages_to_session_db", return_value=True),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("この件を日本語で詳しく調査して")
+
+    assert any(
+        message.get("role") == "assistant" and message.get("content") == narration
+        for message in result["messages"]
+    )
+    assert all(narration not in str(call.args[0]) for call in projected.call_args_list)
