@@ -38,6 +38,17 @@ def test_extracts_one_explicit_final_answer_pair():
     assert _sanitize(marked) == JAPANESE_ANSWER
 
 
+def test_extracts_last_inline_start_after_marker_mentioned_in_scratch():
+    leaked = (
+        "I will wrap the Japanese response between "
+        f"{FINAL_ANSWER_START} and {FINAL_ANSWER_END}.\n\n"
+        "Let me write the report now."
+        f"{FINAL_ANSWER_START}\n{JAPANESE_ANSWER}\n{FINAL_ANSWER_END}"
+    )
+
+    assert _sanitize(leaked) == JAPANESE_ANSWER
+
+
 @pytest.mark.parametrize(
     "ambiguous",
     [

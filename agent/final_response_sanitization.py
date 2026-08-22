@@ -19,12 +19,6 @@ FINAL_ANSWER_END = "<<<END_HERMES_FINAL_ANSWER_V1>>>"
 _JAPANESE_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
 _DEEPSEEK_V4_FLASH_MODEL_RE = re.compile(r"deepseek[-_/ ]v4[-_/ ]flash", re.I)
-_START_MARKER_RE = re.compile(
-    rf"(?m)^[ \t]*{re.escape(FINAL_ANSWER_START)}[ \t]*\r?$"
-)
-_END_MARKER_RE = re.compile(
-    rf"(?m)^[ \t]*{re.escape(FINAL_ANSWER_END)}[ \t]*\r?$"
-)
 _FENCE_RE = re.compile(r"(?m)^[ \t]*(```|~~~)")
 _ASYNC_DELEGATION_COMPLETE_RE = re.compile(
     r"^\s*\[ASYNC DELEGATION(?: BATCH)? COMPLETE\s+[—-]", re.I
@@ -135,17 +129,44 @@ def _inside_fenced_code(content: str, position: int) -> bool:
     return active is not None
 
 
+def _is_standalone_marker_occurrence(content: str, match: re.Match[str]) -> bool:
+    """Return True when a raw marker occurrence is alone on its line."""
+
+    line_start = content.rfind("\n", 0, match.start()) + 1
+    line_end = content.find("\n", match.end())
+    if line_end < 0:
+        line_end = len(content)
+    return (
+        not content[line_start : match.start()].strip()
+        and not content[match.end() : line_end].strip()
+    )
+
+
 def _extract_explicit_final_answer(content: str) -> str | None:
-    starts = list(_START_MARKER_RE.finditer(content))
-    ends = list(_END_MARKER_RE.finditer(content))
-    if len(starts) != 1 or len(ends) != 1:
+    starts = list(re.finditer(re.escape(FINAL_ANSWER_START), content))
+    ends = list(re.finditer(re.escape(FINAL_ANSWER_END), content))
+    standalone_ends = [
+        item for item in ends if _is_standalone_marker_occurrence(content, item)
+    ]
+    if not starts or len(standalone_ends) != 1:
         return None
-    start, end = starts[0], ends[0]
-    if start.end() > end.start():
+    end = standalone_ends[0]
+    if any(item.start() > end.start() for item in ends):
         return None
-    if _inside_fenced_code(content, start.start()) or _inside_fenced_code(
-        content, end.start()
-    ):
+    if any(start.start() >= end.start() for start in starts):
+        return None
+    if any(_inside_fenced_code(content, start.start()) for start in starts):
+        return None
+    if any(_inside_fenced_code(content, item.start()) for item in ends):
+        return None
+
+    # DeepSeek may mention the control token in English scratch prose and then
+    # concatenate the real opening token to the final planning sentence. Pair
+    # the sole standalone end token with the nearest preceding start token.
+    # Inline mentions of either token in the preceding scratch are ignored.
+    # Multiple standalone starts remain ambiguous and fail open.
+    start = starts[-1]
+    if any(_is_standalone_marker_occurrence(content, item) for item in starts[:-1]):
         return None
     candidate = content[start.end() : end.start()].strip()
     if not candidate or not _JAPANESE_RE.search(candidate):
