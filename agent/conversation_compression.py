@@ -1629,9 +1629,10 @@ def check_compression_model_feasibility(agent: Any) -> None:
             _aux_cfg_provider, _, _, _, _ = _resolve_task_provider_model("compression")
         except Exception:
             _aux_cfg_provider = ""
+        main_runtime = agent._current_main_runtime()
         client, aux_model = get_text_auxiliary_client(
             "compression",
-            main_runtime=agent._current_main_runtime(),
+            main_runtime=main_runtime,
         )
         if client is None or not aux_model:
             fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
@@ -1676,15 +1677,58 @@ def check_compression_model_feasibility(agent: Any) -> None:
         _raw_aux_key = getattr(client, "api_key", "")
         aux_api_key = "" if (callable(_raw_aux_key) and not isinstance(_raw_aux_key, str)) else str(_raw_aux_key or "")
 
+        effective_aux_provider = (
+            _aux_cfg_provider
+            if _aux_cfg_provider and _aux_cfg_provider != "auto"
+            else getattr(agent, "provider", "")
+        )
+        aux_context_override = getattr(
+            agent, "_aux_compression_context_length_config", None
+        )
+
+        # ``auxiliary.compression.provider: auto`` commonly resolves to the
+        # live main route. In that case the main model's explicit context
+        # override is authoritative for the auxiliary feasibility check too.
+        # Without this inheritance a failed /models probe falls through to a
+        # broad catalogue-family guess (for example 1M), even though the live
+        # endpoint is configured for a smaller window. Keep the match strict so
+        # a genuinely separate compression route never inherits main metadata.
+        if aux_context_override is None:
+            main_context_override = getattr(agent, "_config_context_length", None)
+            same_model = str(aux_model).strip() == str(
+                main_runtime.get("model", "")
+            ).strip()
+            same_base_url = aux_base_url.strip().rstrip("/") == str(
+                main_runtime.get("base_url", "")
+            ).strip().rstrip("/")
+            same_provider = str(effective_aux_provider).strip().lower() == str(
+                main_runtime.get("provider", "")
+            ).strip().lower()
+            if (
+                same_model
+                and same_base_url
+                and same_provider
+                and isinstance(main_context_override, int)
+                and not isinstance(main_context_override, bool)
+                and main_context_override > 0
+            ):
+                aux_context_override = main_context_override
+                logger.debug(
+                    "Using main model.context_length=%s for same-route "
+                    "auxiliary compression model %r",
+                    main_context_override,
+                    aux_model,
+                )
+
         aux_context = get_model_context_length(
             aux_model,
             base_url=aux_base_url,
             api_key=aux_api_key,
-            config_context_length=getattr(agent, "_aux_compression_context_length_config", None),
+            config_context_length=aux_context_override,
             # Each model must be resolved with its own provider so that
             # provider-specific paths (e.g. Bedrock static table, OpenRouter API)
             # are invoked for the correct client, not inherited from the main model.
-            provider=(_aux_cfg_provider if _aux_cfg_provider and _aux_cfg_provider != "auto" else getattr(agent, "provider", "")),
+            provider=effective_aux_provider,
             custom_providers=agent._custom_providers,
         )
 

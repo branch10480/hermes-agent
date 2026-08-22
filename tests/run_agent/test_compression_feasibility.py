@@ -50,6 +50,7 @@ def _make_agent(
     agent.status_callback = None
     agent.tool_progress_callback = None
     agent._compression_warning = None
+    agent._config_context_length = None
     agent._aux_compression_context_length_config = None
     agent._custom_providers = []
     agent.tools = []
@@ -166,6 +167,93 @@ def test_feasibility_check_passes_live_main_runtime():
             "auth_mode": "",
         },
     )
+
+
+def test_same_route_compression_inherits_main_context_override():
+    """Auto compression on the live main route reuses model.context_length."""
+    agent = _make_agent(main_context=393_216, threshold_percent=0.375)
+    agent.model = "deepseek-v4-flash-0731-2-4bit-mixed"
+    agent.provider = "custom"
+    agent.base_url = "http://127.0.0.1:18088/v1"
+    agent._config_context_length = 393_216
+
+    mock_client = MagicMock()
+    # OpenAI's URL object normally renders with a trailing slash.
+    mock_client.base_url = "http://127.0.0.1:18088/v1/"
+    mock_client.api_key = "sk-local"
+
+    with (
+        patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(mock_client, agent.model),
+        ),
+        patch(
+            "agent.model_metadata.get_model_context_length",
+            return_value=393_216,
+        ) as mock_ctx_len,
+    ):
+        agent._emit_status = lambda msg: None
+        agent._check_compression_model_feasibility()
+
+    assert mock_ctx_len.call_args.kwargs["config_context_length"] == 393_216
+    assert mock_ctx_len.call_args.kwargs["provider"] == "custom"
+
+
+def test_explicit_aux_context_override_wins_on_same_route():
+    """A compression-specific override remains authoritative."""
+    agent = _make_agent(main_context=393_216, threshold_percent=0.375)
+    agent.model = "same-route-model"
+    agent.provider = "custom"
+    agent.base_url = "http://127.0.0.1:18088/v1"
+    agent._config_context_length = 393_216
+    agent._aux_compression_context_length_config = 262_144
+
+    mock_client = MagicMock()
+    mock_client.base_url = agent.base_url
+    mock_client.api_key = "sk-local"
+
+    with (
+        patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(mock_client, agent.model),
+        ),
+        patch(
+            "agent.model_metadata.get_model_context_length",
+            return_value=262_144,
+        ) as mock_ctx_len,
+    ):
+        agent._emit_status = lambda msg: None
+        agent._check_compression_model_feasibility()
+
+    assert mock_ctx_len.call_args.kwargs["config_context_length"] == 262_144
+
+
+def test_different_compression_route_does_not_inherit_main_context_override():
+    """A separate auxiliary endpoint must resolve its own context metadata."""
+    agent = _make_agent(main_context=393_216, threshold_percent=0.375)
+    agent.model = "main-model"
+    agent.provider = "custom"
+    agent.base_url = "http://127.0.0.1:18088/v1"
+    agent._config_context_length = 393_216
+
+    mock_client = MagicMock()
+    mock_client.base_url = "https://openrouter.ai/api/v1"
+    mock_client.api_key = "sk-aux"
+
+    with (
+        patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(mock_client, "google/gemini-3-flash-preview"),
+        ),
+        patch(
+            "agent.model_metadata.get_model_context_length",
+            return_value=1_000_000,
+        ) as mock_ctx_len,
+    ):
+        agent._emit_status = lambda msg: None
+        agent._check_compression_model_feasibility()
+
+    assert mock_ctx_len.call_args.kwargs["config_context_length"] is None
 
 
 @patch("agent.model_metadata.get_model_context_length", return_value=1_000_000)
@@ -404,7 +492,3 @@ def test_threshold_suggestion_kept_for_large_context_main(mock_get_client, mock_
 
     assert len(messages) == 1
     assert "threshold: 0.30" in messages[0]
-
-
-
-
