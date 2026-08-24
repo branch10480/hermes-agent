@@ -1,10 +1,10 @@
-"""Conservative cleanup for DeepSeek Discord final answers.
+"""Conservative cleanup for model final answers.
 
-DeepSeek V4 Flash can occasionally place English scratch planning in ordinary
-``content`` after a tool trajectory. The preferred contract is an explicit
-pair of final-answer markers. A structural fallback handles unmarked leaks,
-but only when several independent signals agree; ambiguity always preserves
-the original response.
+The explicit final-answer marker contract is model-independent: reserved
+control markers must be removed before persistence or user delivery. DeepSeek
+V4 Flash additionally gets a structural fallback for English scratch planning
+in ordinary ``content`` after a tool trajectory, but only when several
+independent signals agree; ambiguity preserves the response text.
 """
 
 from __future__ import annotations
@@ -174,6 +174,39 @@ def _extract_explicit_final_answer(content: str) -> str | None:
     return candidate
 
 
+def _strip_visible_final_answer_markers(content: str) -> str:
+    """Remove reserved marker tokens outside fenced code without losing text.
+
+    A malformed or partial boundary must fail open for the surrounding answer,
+    not for the private control token itself.  Fenced examples remain literal
+    so documentation and code snippets are not rewritten.
+    """
+
+    matches = sorted(
+        (
+            *re.finditer(re.escape(FINAL_ANSWER_START), content),
+            *re.finditer(re.escape(FINAL_ANSWER_END), content),
+        ),
+        key=lambda item: item.start(),
+    )
+    if not matches:
+        return content
+
+    parts: list[str] = []
+    cursor = 0
+    removed = False
+    for match in matches:
+        if _inside_fenced_code(content, match.start()):
+            continue
+        parts.append(content[cursor : match.start()])
+        cursor = match.end()
+        removed = True
+    if not removed:
+        return content
+    parts.append(content[cursor:])
+    return "".join(parts).strip()
+
+
 def _looks_like_internal_english_prefix(prefix: str) -> bool:
     stripped = prefix.lstrip()
     if not stripped or stripped.startswith(("```", "~~~", ">")):
@@ -330,7 +363,7 @@ def should_suppress_deepseek_discord_interim_content(
     return _looks_like_internal_meta_block(content)
 
 
-def sanitize_deepseek_discord_final_response(
+def sanitize_final_response(
     content: str,
     *,
     model: str,
@@ -338,10 +371,22 @@ def sanitize_deepseek_discord_final_response(
     user_message: Any,
     conversation_messages: list[dict[str, Any]] | None = None,
 ) -> str:
-    """Return only a confirmed Japanese final answer, otherwise fail open."""
+    """Remove explicit control markers, then apply DeepSeek-only fallback."""
 
     if not isinstance(content, str) or not content:
         return content
+
+
+    # The system-prompt contract uses one reserved boundary across parent-model
+    # changes. Extract it before model/platform/language gates so a correct pair
+    # can never be persisted or delivered as visible text merely because the
+    # active model changed. If the pair is malformed, preserve the surrounding
+    # response but still remove non-fenced control tokens.
+    explicit = _extract_explicit_final_answer(content)
+    if explicit is not None:
+        return explicit
+    content = _strip_visible_final_answer_markers(content)
+
     if (platform or "").lower() != "discord":
         return content
     if not _DEEPSEEK_V4_FLASH_MODEL_RE.search(model or ""):
@@ -352,9 +397,6 @@ def sanitize_deepseek_discord_final_response(
     if _EXPLICIT_NON_JAPANESE_REQUEST_RE.search(user_text):
         return content
 
-    explicit = _extract_explicit_final_answer(content)
-    if explicit is not None:
-        return explicit
     structural = _extract_structural_fallback(content)
     if structural is not None:
         return structural
@@ -362,9 +404,15 @@ def sanitize_deepseek_discord_final_response(
     return paragraph_fallback if paragraph_fallback is not None else content
 
 
+# Compatibility name for downstream imports from the original DeepSeek-only
+# implementation. New call sites should use the model-independent name above.
+sanitize_deepseek_discord_final_response = sanitize_final_response
+
+
 __all__ = [
     "FINAL_ANSWER_END",
     "FINAL_ANSWER_START",
     "sanitize_deepseek_discord_final_response",
+    "sanitize_final_response",
     "should_suppress_deepseek_discord_interim_content",
 ]

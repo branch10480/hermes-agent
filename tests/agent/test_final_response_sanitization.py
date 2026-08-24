@@ -5,7 +5,7 @@ import pytest
 from agent.final_response_sanitization import (
     FINAL_ANSWER_END,
     FINAL_ANSWER_START,
-    sanitize_deepseek_discord_final_response,
+    sanitize_final_response,
     should_suppress_deepseek_discord_interim_content,
 )
 
@@ -25,7 +25,7 @@ def _sanitize(content: str, **overrides):
         "user_message": "この内容を日本語で詳しく調査して",
     }
     kwargs.update(overrides)
-    return sanitize_deepseek_discord_final_response(content, **kwargs)
+    return sanitize_final_response(content, **kwargs)
 
 
 def test_extracts_one_explicit_final_answer_pair():
@@ -50,29 +50,52 @@ def test_extracts_last_inline_start_after_marker_mentioned_in_scratch():
 
 
 @pytest.mark.parametrize(
-    "ambiguous",
+    ("ambiguous", "expected"),
     [
-        f"{FINAL_ANSWER_START}\n{JAPANESE_ANSWER}",
-        f"{JAPANESE_ANSWER}\n{FINAL_ANSWER_END}",
+        (f"{FINAL_ANSWER_START}\n{JAPANESE_ANSWER}", JAPANESE_ANSWER),
+        (f"{JAPANESE_ANSWER}\n{FINAL_ANSWER_END}", JAPANESE_ANSWER),
         (
             f"{FINAL_ANSWER_START}\n{FINAL_ANSWER_START}\n"
-            f"{JAPANESE_ANSWER}\n{FINAL_ANSWER_END}"
+            f"{JAPANESE_ANSWER}\n{FINAL_ANSWER_END}",
+            JAPANESE_ANSWER,
         ),
         (
             f"{FINAL_ANSWER_START}\n{JAPANESE_ANSWER}\n"
-            f"{FINAL_ANSWER_END}\n{FINAL_ANSWER_END}"
+            f"{FINAL_ANSWER_END}\n{FINAL_ANSWER_END}",
+            JAPANESE_ANSWER,
         ),
-        f"{FINAL_ANSWER_END}\n{JAPANESE_ANSWER}\n{FINAL_ANSWER_START}",
-        f"{FINAL_ANSWER_START}\n\n{FINAL_ANSWER_END}",
         (
-            "```text\n"
-            f"{FINAL_ANSWER_START}\n{JAPANESE_ANSWER}\n{FINAL_ANSWER_END}\n"
-            "```"
+            f"{FINAL_ANSWER_END}\n{JAPANESE_ANSWER}\n{FINAL_ANSWER_START}",
+            JAPANESE_ANSWER,
         ),
+        (f"{FINAL_ANSWER_START}\n\n{FINAL_ANSWER_END}", ""),
     ],
 )
-def test_invalid_or_ambiguous_marker_pairs_fail_open(ambiguous):
-    assert _sanitize(ambiguous) == ambiguous
+def test_invalid_or_ambiguous_marker_pairs_preserve_text_without_control_tokens(
+    ambiguous,
+    expected,
+):
+    assert _sanitize(ambiguous) == expected
+
+
+def test_marker_examples_inside_fenced_code_are_preserved():
+    example = (
+        "```text\n"
+        f"{FINAL_ANSWER_START}\n{JAPANESE_ANSWER}\n{FINAL_ANSWER_END}\n"
+        "```"
+    )
+
+    assert _sanitize(example) == example
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["qwen38-mtplx-optimized-speed", "future-local-parent-v9"],
+)
+def test_explicit_boundary_is_removed_for_current_and_future_parent_models(model):
+    marked = f"{FINAL_ANSWER_START}\n{JAPANESE_ANSWER}\n{FINAL_ANSWER_END}"
+
+    assert _sanitize(marked, model=model) == JAPANESE_ANSWER
 
 
 def test_structural_fallback_removes_planning_without_exact_opening_phrase():
@@ -270,19 +293,19 @@ def test_structural_fallback_preserves_legitimate_content(legitimate):
     assert _sanitize(legitimate) == legitimate
 
 
-def test_fails_open_for_non_discord_non_deepseek_or_english_request():
+def test_explicit_marker_cleanup_precedes_model_platform_and_language_gates():
     marked = f"{FINAL_ANSWER_START}\n{JAPANESE_ANSWER}\n{FINAL_ANSWER_END}"
 
-    assert _sanitize(marked, platform="cli") == marked
-    assert _sanitize(marked, model="gpt-5.6") == marked
-    assert _sanitize(marked, user_message="Please answer in English") == marked
-    assert _sanitize(marked, user_message="英語で回答して") == marked
+    assert _sanitize(marked, platform="cli") == JAPANESE_ANSWER
+    assert _sanitize(marked, model="gpt-5.6") == JAPANESE_ANSWER
+    assert _sanitize(marked, user_message="Please answer in English") == JAPANESE_ANSWER
+    assert _sanitize(marked, user_message="英語で回答して") == JAPANESE_ANSWER
 
 
 def test_preserves_explicit_bilingual_request():
     marked = f"{FINAL_ANSWER_START}\n{JAPANESE_ANSWER}\n{FINAL_ANSWER_END}"
 
-    assert _sanitize(marked, user_message="日本語と英語を両方併記して") == marked
+    assert _sanitize(marked, user_message="日本語と英語を両方併記して") == JAPANESE_ANSWER
 
 
 def test_does_not_add_an_apology_after_cleanup():

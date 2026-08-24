@@ -18,6 +18,7 @@ def _run_response(
     *,
     user_message: str = "この件を日本語で詳しく調査して",
     conversation_history: list[dict] | None = None,
+    model: str = "deepseek-v4-flash-0731-2-4bit-mixed",
 ):
     from run_agent import AIAgent
     from tests.run_agent.test_run_agent import _mock_response
@@ -30,7 +31,7 @@ def _run_response(
         agent = AIAgent(
             api_key="test-key-1234567890",
             base_url="http://127.0.0.1:18088/v1",
-            model="deepseek-v4-flash-0731-2-4bit-mixed",
+            model=model,
             platform="discord",
             quiet_mode=True,
             skip_context_files=True,
@@ -80,6 +81,13 @@ def test_explicit_boundary_answer_is_returned_and_persisted_without_markers():
     )
 
     _assert_sanitized(*_run_response(raw))
+
+
+def test_explicit_boundary_is_model_independent_before_persistence():
+    raw = f"{FINAL_ANSWER_START}\n{JAPANESE_ANSWER}\n{FINAL_ANSWER_END}"
+
+    for model in ("qwen38-mtplx-optimized-speed", "future-local-parent-v9"):
+        _assert_sanitized(*_run_response(raw, model=model))
 
 
 def test_structural_fallback_answer_is_returned_and_persisted():

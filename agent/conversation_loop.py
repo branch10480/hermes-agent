@@ -39,7 +39,7 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.final_response_sanitization import (
-    sanitize_deepseek_discord_final_response,
+    sanitize_final_response,
     should_suppress_deepseek_discord_interim_content,
 )
 from agent.turn_context import (
@@ -7703,7 +7703,7 @@ def run_conversation(
                             _frag.pop("_length_continuation_nudge", None)
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
-                final_response = sanitize_deepseek_discord_final_response(
+                final_response = sanitize_final_response(
                     final_response,
                     model=getattr(agent, "model", "") or "",
                     platform=getattr(agent, "platform", None),
