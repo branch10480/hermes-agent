@@ -371,9 +371,100 @@ def test_default_run_conversation_warns_without_guardrail_halt():
     assert any("repeated_exact_failure_warning" in content for content in tool_contents)
 
 
+def test_loop_cap_recovers_with_one_tool_free_final_answer_call():
+    agent = _make_agent(
+        "web_search",
+        max_iterations=10,
+        config={
+            "tool_loop_guardrails": {
+                "loop_caps": {"max_web_searches": 2, "max_subagents": 50}
+            }
+        },
+    )
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call("web_search", json.dumps({"query": f"q{i}"}), f"c{i}")
+            ],
+        )
+        for i in range(1, 4)
+    ]
+    responses.append(
+        _mock_response(
+            content="Here is the completed digest from the sources already collected.",
+            finish_reason="stop",
+            tool_calls=None,
+        )
+    )
+    agent.client.chat.completions.create.side_effect = responses
+    agent._disable_streaming = True
+
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"results": ["source"]})) as mock_hfc,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("research and answer")
+
+    assert mock_hfc.call_count == 2
+    assert result["turn_exit_reason"].startswith("text_response")
+    assert result["final_response"].startswith("Here is the completed digest")
+    assert result["guardrail"]["code"] == "loop_web_search_cap"
+    final_kwargs = agent.client.chat.completions.create.call_args_list[-1].kwargs
+    assert not final_kwargs.get("tools")
+    final_messages = final_kwargs["messages"]
+    assert any(
+        "A tool-loop guardrail stopped further tool use" in str(message.get("content"))
+        for message in final_messages
+        if message.get("role") == "user"
+    )
 
 
-def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
+def test_generic_hard_stop_recovers_with_one_tool_free_final_answer_call():
+    agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config())
+    same_args = {"query": "same"}
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call("web_search", json.dumps(same_args), f"c{i}")
+            ],
+        )
+        for i in range(1, 4)
+    ]
+    responses.append(
+        _mock_response(
+            content="Completed from the evidence collected before the hard stop.",
+            finish_reason="stop",
+            tool_calls=None,
+        )
+    )
+    agent.client.chat.completions.create.side_effect = responses
+    agent._disable_streaming = True
+
+    with (
+        patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps({"error": "boom"}),
+        ) as mock_hfc,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("search repeatedly, then answer")
+
+    assert mock_hfc.call_count == 2
+    assert result["turn_exit_reason"].startswith("text_response")
+    assert result["final_response"].startswith("Completed from the evidence")
+    assert result["guardrail"]["code"] == "repeated_exact_failure_block"
+    assert not agent.client.chat.completions.create.call_args_list[-1].kwargs.get("tools")
+
+
+def test_guardrail_halt_after_failed_recovery_emits_stream_delta():
     """Regression for #30770: when the guardrail halts the loop, the
     synthesized halt message must be pushed through ``stream_delta_callback``
     so SSE/TUI clients see why the agent stopped instead of a silent stream
@@ -389,7 +480,7 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
             finish_reason="tool_calls",
             tool_calls=[_mock_tool_call("web_search", json.dumps(same_args), f"c{i}")],
         )
-        for i in range(1, 10)
+        for i in range(1, 5)
     ]
     agent.client.chat.completions.create.side_effect = responses
 

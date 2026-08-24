@@ -1640,11 +1640,11 @@ tool_loop_guardrails:
     max_subagents: 50          # max subagents spawned per turn (0 = unlimited)
 ```
 
-`hard_stop_enabled` defaults to `false` because interactive sessions have a human in the loop. In unattended deployments (gateway, cron, kanban workers) set it to `true` so repeated failures are blocked rather than only warned. See also [Docker / unattended deployments](docker.md).
+`hard_stop_enabled` defaults to `false` because interactive sessions have a human in the loop. In unattended deployments (gateway, cron, kanban workers) set it to `true` so repeated failures are blocked rather than only warned. After any hard stop or always-on loop cap blocks a tool call, Hermes makes one tool-free recovery call so the model can answer the original request from evidence already collected. If that recovery still attempts a tool call, Hermes falls back to the controlled guardrail-halt response. See also [Docker / unattended deployments](docker.md).
 
 ### Per-turn runaway-loop caps
 
-Separate from the failure-based thresholds above, `loop_caps` sets hard ceilings on how many `web_search` calls and subagent spawns a single agent loop (turn) may make. The counters reset at the start of every turn, so a legitimate multi-turn session is never starved — but a single turn that spirals into an unbounded search or delegation loop is stopped. These are always on and fire regardless of `hard_stop_enabled`. A single turn issuing dozens of web searches or spawning dozens of subagents is already pathological, so the defaults are low. When a cap is reached, the offending tool call is blocked with an explanatory message and the turn stops cleanly instead of burning the rest of the budget. Set either value to `0` to disable that cap entirely.
+Separate from the failure-based thresholds above, `loop_caps` sets hard ceilings on how many `web_search` calls and subagent spawns a single agent loop (turn) may make. The counters reset at the start of every turn, so a legitimate multi-turn session is never starved — but a single turn that spirals into an unbounded search or delegation loop is stopped. These are always on and fire regardless of `hard_stop_enabled`. A single turn issuing dozens of web searches or spawning dozens of subagents is already pathological, so the defaults are low. When a cap is reached, the offending tool call is blocked and Hermes makes one tool-free recovery call to answer from evidence already collected instead of burning the rest of the budget. Set either value to `0` to disable that cap entirely.
 
 A single `delegate_task` batch counts each task toward `max_subagents` (a batch of 3 spends 3), so the cap tracks real subagents spawned rather than `delegate_task` invocations.
 

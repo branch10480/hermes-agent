@@ -177,12 +177,43 @@ _THINKING_BUDGET_RECOVERY_PROMPT = (
 )
 _THINKING_BUDGET_RECOVERY_MAX_TOKENS = 4096
 
+_TOOL_GUARDRAIL_RECOVERY_PROMPT = (
+    "[System recovery: A tool-loop guardrail stopped further tool use. Stop "
+    "investigating and return the best final answer now using only the evidence "
+    "already present in this conversation. Do not call tools or continue planning. "
+    "Answer the user's actual request; if some details remain unverified, state "
+    "those limits briefly instead of replacing the answer with a blocker report.]"
+)
 
-def _apply_thinking_budget_recovery_overrides(api_kwargs: dict[str, Any]) -> None:
-    """Constrain the one-shot reasoning-exhaustion recovery request in place."""
+
+def _append_answer_only_recovery_prompt(
+    api_messages: list[dict[str, Any]], prompt: str
+) -> None:
+    """Append an API-only recovery instruction to the active user turn."""
+    for recovery_msg in reversed(api_messages):
+        if recovery_msg.get("role") != "user":
+            continue
+        recovery_content = recovery_msg.get("content")
+        if isinstance(recovery_content, str):
+            recovery_msg["content"] = recovery_content.rstrip() + "\n\n" + prompt
+        elif isinstance(recovery_content, list):
+            recovery_msg["content"] = [
+                *recovery_content,
+                {"type": "text", "text": "\n\n" + prompt},
+            ]
+        break
+
+
+def _apply_answer_only_recovery_overrides(api_kwargs: dict[str, Any]) -> None:
+    """Make a recovery request physically incapable of another tool call."""
     api_kwargs.pop("tools", None)
     api_kwargs.pop("tool_choice", None)
     api_kwargs.pop("parallel_tool_calls", None)
+
+
+def _apply_thinking_budget_recovery_overrides(api_kwargs: dict[str, Any]) -> None:
+    """Constrain the one-shot reasoning-exhaustion recovery request in place."""
+    _apply_answer_only_recovery_overrides(api_kwargs)
 
     for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
         value = api_kwargs.get(key)
@@ -1632,6 +1663,8 @@ def run_conversation(
     truncated_response_parts: List[str] = []
     thinking_budget_recovery_attempted = False
     thinking_budget_recovery_active = False
+    tool_guardrail_recovery_attempted = False
+    tool_guardrail_recovery_active = False
     compression_attempts = 0
     # One resolved per-turn compression attempt cap, shared by every site that
     # consumes ``compression_attempts``: the pre-API pressure gate, the
@@ -2113,25 +2146,13 @@ def run_conversation(
         # transcript, so the original user turn and prompt-cache history stay
         # clean. The request is also tool-free and low-reasoning below.
         if thinking_budget_recovery_active:
-            for _recovery_msg in reversed(api_messages):
-                if _recovery_msg.get("role") != "user":
-                    continue
-                _recovery_content = _recovery_msg.get("content")
-                if isinstance(_recovery_content, str):
-                    _recovery_msg["content"] = (
-                        _recovery_content.rstrip()
-                        + "\n\n"
-                        + _THINKING_BUDGET_RECOVERY_PROMPT
-                    )
-                elif isinstance(_recovery_content, list):
-                    _recovery_msg["content"] = [
-                        *_recovery_content,
-                        {
-                            "type": "text",
-                            "text": "\n\n" + _THINKING_BUDGET_RECOVERY_PROMPT,
-                        },
-                    ]
-                break
+            _append_answer_only_recovery_prompt(
+                api_messages, _THINKING_BUDGET_RECOVERY_PROMPT
+            )
+        elif tool_guardrail_recovery_active:
+            _append_answer_only_recovery_prompt(
+                api_messages, _TOOL_GUARDRAIL_RECOVERY_PROMPT
+            )
 
         # Drop thinking-only assistant turns (reasoning but no visible
         # output and no tool_calls) and merge any adjacent user messages
@@ -2188,7 +2209,11 @@ def run_conversation(
         # exactly the point the breakpoints were meant to protect. Marking
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
-        tools_for_api = [] if thinking_budget_recovery_active else agent.tools
+        tools_for_api = (
+            []
+            if thinking_budget_recovery_active or tool_guardrail_recovery_active
+            else agent.tools
+        )
         if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
             _initial_cache_plan = build_prompt_cache_plan(
@@ -2589,6 +2614,8 @@ def run_conversation(
                     )
                 if thinking_budget_recovery_active:
                     _apply_thinking_budget_recovery_overrides(api_kwargs)
+                elif tool_guardrail_recovery_active:
+                    _apply_answer_only_recovery_overrides(api_kwargs)
                 # Outbound-request surrogate chokepoint (#50959): the messages
                 # were scrubbed above, but the rest of the request body —
                 # tool/function descriptions (session_search's ±-heavy text is
@@ -2641,10 +2668,13 @@ def run_conversation(
 
                 # Middleware is extensible and may restore request fields.
                 # Reassert the answer-only boundary immediately before hooks
-                # and provider execution so recovery can never call a tool or
-                # silently return to the original reasoning effort.
+                # and provider execution. Thinking-budget recovery also keeps
+                # its reduced reasoning override; guardrail recovery preserves
+                # the normal requested effort while removing every tool field.
                 if thinking_budget_recovery_active:
                     _apply_thinking_budget_recovery_overrides(api_kwargs)
+                elif tool_guardrail_recovery_active:
+                    _apply_answer_only_recovery_overrides(api_kwargs)
 
                 try:
                     from hermes_cli.lifecycle import (
@@ -7059,6 +7089,29 @@ def run_conversation(
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
+                    if not tool_guardrail_recovery_attempted:
+                        tool_guardrail_recovery_attempted = True
+                        tool_guardrail_recovery_active = True
+                        # This is a dedicated final-answer allowance. It must
+                        # remain available even when the blocked call consumed
+                        # the turn's final normal iteration.
+                        agent._budget_grace_call = True
+                        agent._stream_needs_break = True
+                        agent._touch_activity(
+                            f"tool guardrail recovery for {decision.code}"
+                        )
+                        agent._emit_status(
+                            "Tool loop stopped; composing a final answer from "
+                            "the evidence already collected..."
+                        )
+                        logger.info(
+                            "Tool guardrail entering answer-only recovery: "
+                            "tool=%s code=%s count=%s",
+                            decision.tool_name,
+                            decision.code,
+                            decision.count,
+                        )
+                        continue
                     _turn_exit_reason = "guardrail_halt"
                     final_response = agent._toolguard_controlled_halt_response(decision)
                     agent._emit_status(

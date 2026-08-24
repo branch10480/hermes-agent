@@ -409,9 +409,10 @@ browser:
 # Tool Loop Guardrails
 # =============================================================================
 # Soft warnings are enabled by default. They append guidance to repeated failed
-# or non-progressing tool results but still let the tool execute. Hard stops are
-# opt-in circuit breakers for autonomous/cron sessions where stopping a loop is
-# preferable to spending the full iteration budget.
+# or non-progressing tool results but still let the tool execute. When a hard
+# stop or always-on loop cap fires, Hermes blocks the tool and gives the model
+# one tool-free recovery call to answer from evidence already collected. Only
+# a failed recovery falls back to a controlled guardrail halt.
 tool_loop_guardrails:
   warnings_enabled: true
   hard_stop_enabled: false

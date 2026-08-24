@@ -580,7 +580,8 @@ DEFAULT_CONFIG = {
 
     # Tool loop guardrails nudge models when they repeat failed or
     # non-progressing tool calls. Soft warnings are always-on by default;
-    # hard stops are opt-in so interactive CLI/TUI sessions keep flowing.
+    # blocked loops receive one tool-free final-answer recovery call before
+    # Hermes falls back to a controlled halt.
     "tool_loop_guardrails": {
         "warnings_enabled": True,
         "hard_stop_enabled": False,
