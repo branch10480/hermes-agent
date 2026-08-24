@@ -28017,7 +28017,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
     cron_stop = threading.Event()
     cron_provider = resolve_cron_scheduler()
-    cron_start_kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
+    gateway_loop = asyncio.get_running_loop()
+    cron_start_kwargs: Dict[str, Any] = {
+        "adapters": runner.adapters,
+        "loop": gateway_loop,
+    }
 
     # Multiplex profiles: tell the built-in ticker which profile homes to
     # tick so secondary-profile cron jobs actually fire (#69377).
@@ -28050,6 +28054,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if isinstance(cron_provider, InProcessCronScheduler):
         cron_start_kwargs["can_dispatch"] = lambda: not (
             runner._draining or runner._external_drain_active
+        )
+        # Cron agents live on scheduler worker threads, outside the messaging
+        # session map. Persist the aggregate count at their exact start/end
+        # boundaries on the gateway loop; otherwise the last mid-run snapshot
+        # can leave active_agents=1 forever after a completed cron turn.
+        cron_start_kwargs["on_active_work_changed"] = lambda: (
+            gateway_loop.call_soon_threadsafe(runner._persist_active_agents)
         )
     cron_thread = threading.Thread(
         target=cron_provider.start,

@@ -4893,6 +4893,7 @@ def tick(
     sync: bool = True,
     *,
     can_dispatch=None,
+    on_active_work_changed=None,
 ):
     """
     Check and run all due jobs.
@@ -4906,6 +4907,9 @@ def tick(
         loop: Optional asyncio event loop (from gateway) for live adapter sends
         can_dispatch: Optional synchronous gate; false leaves due jobs untouched
             for the next allowed tick
+        on_active_work_changed: Best-effort callback invoked after the cron
+            in-flight set changes. The gateway uses this to persist its
+            aggregate ``active_agents`` count at the exact job boundaries.
 
     Returns:
         Number of jobs executed (0 if another tick is already running)
@@ -5021,6 +5025,18 @@ def tick(
         _results: list = []
         _all_futures: list = []
 
+        def _notify_active_work_changed(boundary: str) -> None:
+            if on_active_work_changed is None:
+                return
+            try:
+                on_active_work_changed()
+            except Exception:
+                logger.debug(
+                    "Cron active-work %s notification failed",
+                    boundary,
+                    exc_info=True,
+                )
+
         def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor):
             """Submit a job fire-and-forget with the in-flight dedup guard.
 
@@ -5043,9 +5059,15 @@ def tick(
             if not try_register_running_job(job_id):
                 logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                 return None
+            _notify_active_work_changed("start")
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
-            execution = create_execution(job_id, source="builtin")
+            try:
+                execution = create_execution(job_id, source="builtin")
+            except Exception:
+                release_running_job(job_id)
+                _notify_active_work_changed("rollback")
+                raise
             dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
 
@@ -5054,11 +5076,13 @@ def tick(
                     return ctx.run(_process_job, j)
                 finally:
                     release_running_job(j["id"])
+                    _notify_active_work_changed("completion")
 
             try:
                 return pool.submit(_run_and_release)
             except Exception as submit_err:
                 release_running_job(job_id)
+                _notify_active_work_changed("rollback")
                 finish_execution(
                     execution["id"],
                     success=False,

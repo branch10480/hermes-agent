@@ -139,10 +139,17 @@ def test_inprocess_provider_ticks_and_stops():
     stop = threading.Event()
     prov = InProcessCronScheduler()
     assert prov.name == "builtin"
+    on_active_work_changed = lambda: None
 
     with patch("cron.scheduler.tick", side_effect=lambda *a, **k: calls.append(k) or 0):
         t = threading.Thread(
-            target=prov.start, args=(stop,), kwargs={"interval": 0}, daemon=True
+            target=prov.start,
+            args=(stop,),
+            kwargs={
+                "interval": 0,
+                "on_active_work_changed": on_active_work_changed,
+            },
+            daemon=True,
         )
         t.start()
         # Wait for the loop to actually call tick() at least once rather than
@@ -155,6 +162,7 @@ def test_inprocess_provider_ticks_and_stops():
     assert not t.is_alive(), "provider did not exit after stop_event was set"
     assert len(calls) >= 1, "provider never called tick()"
     assert calls[0].get("sync") is False
+    assert calls[0].get("on_active_work_changed") is on_active_work_changed
 
 
 # ── Phase 2: config key, discovery, resolver ─────────────────────────────────
@@ -415,4 +423,3 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
     # With 2 profiles and multiple iterations, we should have seen at least 2 calls.
     assert len(tick_count) >= len(profile_homes), \
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
-

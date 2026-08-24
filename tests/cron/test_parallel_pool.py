@@ -182,6 +182,68 @@ class TestSequentialPool:
         assert sched._sequential_pool is None
 
 
+class TestActiveWorkNotifications:
+    def test_async_tick_notifies_active_work_start_and_completion(
+        self, monkeypatch
+    ):
+        """A completed async cron run must publish the drop back to zero.
+
+        Gateway runtime status previously observed the start but received no
+        completion boundary, leaving persisted ``active_agents=1`` after a
+        guardrail-halted cron turn had already finished.
+        """
+        import cron.scheduler as sched
+
+        sched._parallel_pool = None
+        sched._parallel_pool_max_workers = None
+        sched._running_job_ids.clear()
+        job = {
+            "id": "guardrail-finished",
+            "name": "guardrail-finished",
+            "prompt": "test",
+            "schedule": "every 5m",
+            "enabled": True,
+            "next_run_at": "2020-01-01T00:00:00",
+            "deliver": "local",
+        }
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
+        monkeypatch.setattr(sched, "advance_next_runs", lambda *_a, **_kw: 1)
+        monkeypatch.setattr(
+            sched,
+            "run_job",
+            lambda *_a, **_kw: (
+                True,
+                "out",
+                "Stopped after the tool-call guardrail.",
+                None,
+            ),
+        )
+        monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
+        monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
+
+        counts = []
+        completed = threading.Event()
+
+        def on_active_work_changed():
+            count = len(sched.get_running_job_ids())
+            counts.append(count)
+            if count == 0:
+                completed.set()
+
+        try:
+            assert sched.tick(
+                verbose=False,
+                sync=False,
+                on_active_work_changed=on_active_work_changed,
+            ) == 1
+            assert completed.wait(5), "cron completion notification never arrived"
+            assert counts == [1, 0]
+        finally:
+            sched._shutdown_parallel_pool()
+            sched._running_job_ids.clear()
+
+
 class TestTickBatchAdvance:
     """The tick's pre-dispatch advance must go through advance_next_runs
     exactly once with the whole due set — a revert to the per-job loop

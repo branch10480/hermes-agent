@@ -195,6 +195,7 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        on_active_work_changed=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -222,6 +223,7 @@ class InProcessCronScheduler(CronScheduler):
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
+                on_active_work_changed=on_active_work_changed,
             )
             return
 
@@ -247,6 +249,7 @@ class InProcessCronScheduler(CronScheduler):
                         loop=loop,
                         sync=False,
                         can_dispatch=can_dispatch,
+                        on_active_work_changed=on_active_work_changed,
                     )
                 ok = True
             except BaseException as e:
@@ -282,6 +285,7 @@ class InProcessCronScheduler(CronScheduler):
         loop=None,
         interval=60,
         can_dispatch=None,
+        on_active_work_changed=None,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -342,6 +346,7 @@ class InProcessCronScheduler(CronScheduler):
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,
+                                    on_active_work_changed=on_active_work_changed,
                                 )
                         finally:
                             reset_hermes_home_override(home_token)

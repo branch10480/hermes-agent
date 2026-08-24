@@ -185,7 +185,14 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
     monkeypatch.setattr(scheduler, "advance_next_runs", lambda _ids: 0)
     monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: BrokenPool())
 
-    assert scheduler.tick(verbose=False, sync=False) == 0
+    active_counts = []
+    assert scheduler.tick(
+        verbose=False,
+        sync=False,
+        on_active_work_changed=lambda: active_counts.append(
+            len(scheduler.get_running_job_ids())
+        ),
+    ) == 0
     assert finished == [
         ("exec-submit-fail", {
             "success": False,
@@ -193,6 +200,7 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         })
     ]
     assert "submit-fail" not in scheduler.get_running_job_ids()
+    assert active_counts == [1, 0]
 
 
 def test_run_one_job_records_running_then_terminal(monkeypatch):
