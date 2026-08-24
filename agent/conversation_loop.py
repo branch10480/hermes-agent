@@ -181,9 +181,13 @@ _TOOL_GUARDRAIL_RECOVERY_PROMPT = (
     "[System recovery: A tool-loop guardrail stopped further tool use. Stop "
     "investigating and return the best final answer now using only the evidence "
     "already present in this conversation. Do not call tools or continue planning. "
+    "Treat the remaining reasoning and output budgets as ceilings, not targets; "
+    "begin the user-visible answer as soon as the collected evidence is organized. "
+    "A detailed final answer is allowed. "
     "Answer the user's actual request; if some details remain unverified, state "
     "those limits briefly instead of replacing the answer with a blocker report.]"
 )
+_TOOL_GUARDRAIL_RECOVERY_MAX_TOKENS = 16_384
 
 
 def _append_answer_only_recovery_prompt(
@@ -209,6 +213,53 @@ def _apply_answer_only_recovery_overrides(api_kwargs: dict[str, Any]) -> None:
     api_kwargs.pop("tools", None)
     api_kwargs.pop("tool_choice", None)
     api_kwargs.pop("parallel_tool_calls", None)
+
+
+def _tool_guardrail_recovery_settings(agent: Any) -> tuple[int, bool]:
+    """Resolve the configured answer-only policy with safe legacy fallbacks."""
+    controller = getattr(agent, "_tool_guardrails", None)
+    guardrail_config = getattr(controller, "config", None)
+    recovery = getattr(guardrail_config, "answer_only_recovery", None)
+    raw_max_tokens = getattr(
+        recovery, "max_tokens", _TOOL_GUARDRAIL_RECOVERY_MAX_TOKENS
+    )
+    if (
+        not isinstance(raw_max_tokens, int)
+        or isinstance(raw_max_tokens, bool)
+        or raw_max_tokens <= 0
+    ):
+        raw_max_tokens = _TOOL_GUARDRAIL_RECOVERY_MAX_TOKENS
+    deduplicate = getattr(recovery, "deduplicate_tool_results", True)
+    return raw_max_tokens, bool(deduplicate)
+
+
+def _apply_tool_guardrail_recovery_overrides(
+    agent: Any, api_kwargs: dict[str, Any]
+) -> None:
+    """Keep normal reasoning, but bound and de-tool a guardrail recovery."""
+    _apply_answer_only_recovery_overrides(api_kwargs)
+    max_tokens, _ = _tool_guardrail_recovery_settings(agent)
+
+    output_key_found = False
+    for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+        if key not in api_kwargs:
+            continue
+        output_key_found = True
+        value = api_kwargs.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            api_kwargs[key] = min(value, max_tokens)
+        else:
+            api_kwargs[key] = max_tokens
+
+    if output_key_found:
+        return
+    token_param = getattr(agent, "_max_tokens_param", None)
+    if callable(token_param):
+        resolved = token_param(max_tokens)
+        if isinstance(resolved, dict):
+            api_kwargs.update(resolved)
+            return
+    api_kwargs["max_tokens"] = max_tokens
 
 
 def _apply_thinking_budget_recovery_overrides(api_kwargs: dict[str, Any]) -> None:
@@ -1665,6 +1716,8 @@ def run_conversation(
     thinking_budget_recovery_active = False
     tool_guardrail_recovery_attempted = False
     tool_guardrail_recovery_active = False
+    tool_guardrail_recovery_request_stats: Optional[tuple[int, int, int]] = None
+    tool_guardrail_recovery_request_logged = False
     compression_attempts = 0
     # One resolved per-turn compression attempt cap, shared by every site that
     # consumes ``compression_attempts``: the pre-API pressure gate, the
@@ -2141,6 +2194,41 @@ def run_conversation(
         # manual message manipulation are always caught.
         api_messages = agent._sanitize_api_messages(api_messages)
 
+        # A guardrail recovery is an API-only view of the durable transcript.
+        # Losslessly collapse byte-identical tool results before adding the
+        # recovery instruction: the newest full copy remains available, while
+        # repeated errors/search payloads no longer inflate the final-answer
+        # request. Unique evidence and persisted history stay untouched.
+        if tool_guardrail_recovery_active:
+            _recovery_before = estimate_messages_tokens_rough(api_messages)
+            _recovery_deduped = 0
+            _, _recovery_should_deduplicate = _tool_guardrail_recovery_settings(agent)
+            if _recovery_should_deduplicate:
+                _recovery_dedupe = getattr(
+                    getattr(agent, "context_compressor", None),
+                    "deduplicate_tool_results_for_recovery",
+                    None,
+                )
+                if callable(_recovery_dedupe):
+                    try:
+                        _deduped_messages, _recovery_deduped = _recovery_dedupe(
+                            api_messages
+                        )
+                    except Exception:
+                        logger.debug(
+                            "answer-only recovery tool-result dedupe failed; skipping",
+                            exc_info=True,
+                        )
+                    else:
+                        if _recovery_deduped and _deduped_messages is not api_messages:
+                            api_messages = _deduped_messages
+            _recovery_after = estimate_messages_tokens_rough(api_messages)
+            tool_guardrail_recovery_request_stats = (
+                _recovery_before,
+                _recovery_after,
+                _recovery_deduped,
+            )
+
         # A reasoning-only length stop gets exactly one answer-only recovery
         # call. Inject the instruction into the request copy, never the durable
         # transcript, so the original user turn and prompt-cache history stay
@@ -2615,7 +2703,7 @@ def run_conversation(
                 if thinking_budget_recovery_active:
                     _apply_thinking_budget_recovery_overrides(api_kwargs)
                 elif tool_guardrail_recovery_active:
-                    _apply_answer_only_recovery_overrides(api_kwargs)
+                    _apply_tool_guardrail_recovery_overrides(agent, api_kwargs)
                 # Outbound-request surrogate chokepoint (#50959): the messages
                 # were scrubbed above, but the rest of the request body —
                 # tool/function descriptions (session_search's ±-heavy text is
@@ -2674,7 +2762,33 @@ def run_conversation(
                 if thinking_budget_recovery_active:
                     _apply_thinking_budget_recovery_overrides(api_kwargs)
                 elif tool_guardrail_recovery_active:
-                    _apply_answer_only_recovery_overrides(api_kwargs)
+                    _apply_tool_guardrail_recovery_overrides(agent, api_kwargs)
+
+                if (
+                    tool_guardrail_recovery_active
+                    and not tool_guardrail_recovery_request_logged
+                ):
+                    _before, _after, _deduped = (
+                        tool_guardrail_recovery_request_stats or (approx_tokens, approx_tokens, 0)
+                    )
+                    _recovery_effort = api_kwargs.get("reasoning_effort")
+                    if not _recovery_effort:
+                        _extra_body = api_kwargs.get("extra_body")
+                        if isinstance(_extra_body, dict):
+                            _reasoning = _extra_body.get("reasoning")
+                            if isinstance(_reasoning, dict):
+                                _recovery_effort = _reasoning.get("effort")
+                    logger.info(
+                        "Tool guardrail answer-only request prepared: "
+                        "approx_input_tokens=%s->%s deduplicated_tool_results=%s "
+                        "max_output_tokens=%s reasoning_effort=%s",
+                        f"{_before:,}",
+                        f"{_after:,}",
+                        _deduped,
+                        agent._requested_output_cap_from_api_kwargs(api_kwargs),
+                        _recovery_effort or "unchanged/unspecified",
+                    )
+                    tool_guardrail_recovery_request_logged = True
 
                 try:
                     from hermes_cli.lifecycle import (

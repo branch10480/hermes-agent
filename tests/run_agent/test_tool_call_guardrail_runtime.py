@@ -5,6 +5,8 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.conversation_loop import _apply_tool_guardrail_recovery_overrides
+from agent.tool_guardrails import AnswerOnlyRecoveryConfig, ToolCallGuardrailConfig
 from run_agent import AIAgent
 
 
@@ -84,6 +86,33 @@ def _hard_stop_config(**overrides) -> dict:
     }
     cfg["tool_loop_guardrails"].update(overrides)
     return cfg
+
+
+def test_answer_only_recovery_caps_every_output_key_without_lowering_effort():
+    agent = SimpleNamespace(
+        _tool_guardrails=SimpleNamespace(
+            config=ToolCallGuardrailConfig(
+                answer_only_recovery=AnswerOnlyRecoveryConfig(max_tokens=16_384)
+            )
+        ),
+        _max_tokens_param=lambda value: {"max_tokens": value},
+    )
+
+    for output_key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+        kwargs = {
+            output_key: 65_536,
+            "tools": [{"type": "function"}],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "extra_body": {"reasoning": {"effort": "xhigh"}},
+        }
+        _apply_tool_guardrail_recovery_overrides(agent, kwargs)
+
+        assert kwargs[output_key] == 16_384
+        assert "tools" not in kwargs
+        assert "tool_choice" not in kwargs
+        assert "parallel_tool_calls" not in kwargs
+        assert kwargs["extra_body"]["reasoning"]["effort"] == "xhigh"
 
 
 def test_default_sequential_path_warns_repeated_exact_failure_without_blocking_execution():
@@ -377,10 +406,15 @@ def test_loop_cap_recovers_with_one_tool_free_final_answer_call():
         max_iterations=10,
         config={
             "tool_loop_guardrails": {
-                "loop_caps": {"max_web_searches": 2, "max_subagents": 50}
+                "loop_caps": {"max_web_searches": 2, "max_subagents": 50},
+                "answer_only_recovery": {
+                    "max_tokens": 16_384,
+                    "deduplicate_tool_results": True,
+                },
             }
         },
     )
+    agent.max_tokens = 65_536
     responses = [
         _mock_response(
             content="",
@@ -400,9 +434,38 @@ def test_loop_cap_recovers_with_one_tool_free_final_answer_call():
     )
     agent.client.chat.completions.create.side_effect = responses
     agent._disable_streaming = True
+    repeated_evidence = json.dumps(
+        {
+            "results": [
+                {
+                    "title": "Primary source",
+                    "url": "https://example.test/source",
+                    "snippet": "verified evidence " * 30,
+                }
+            ]
+        }
+    )
+
+    def middleware_that_restores_normal_fields(payload, **kwargs):
+        mutated = dict(payload)
+        if kwargs["api_call_count"] == 4:
+            mutated["tools"] = agent.tools
+            mutated["max_tokens"] = 65_536
+            mutated["extra_body"] = {
+                "reasoning": {"enabled": True, "effort": "xhigh"},
+            }
+        return SimpleNamespace(
+            payload=mutated,
+            original_payload=dict(payload),
+            trace=[],
+        )
 
     with (
-        patch("run_agent.handle_function_call", return_value=json.dumps({"results": ["source"]})) as mock_hfc,
+        patch("run_agent.handle_function_call", return_value=repeated_evidence) as mock_hfc,
+        patch(
+            "hermes_cli.middleware.apply_llm_request_middleware",
+            side_effect=middleware_that_restores_normal_fields,
+        ),
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
@@ -415,12 +478,36 @@ def test_loop_cap_recovers_with_one_tool_free_final_answer_call():
     assert result["guardrail"]["code"] == "loop_web_search_cap"
     final_kwargs = agent.client.chat.completions.create.call_args_list[-1].kwargs
     assert not final_kwargs.get("tools")
+    assert final_kwargs["max_tokens"] == 16_384
+    assert final_kwargs["extra_body"]["reasoning"]["effort"] == "xhigh"
     final_messages = final_kwargs["messages"]
     assert any(
         "A tool-loop guardrail stopped further tool use" in str(message.get("content"))
         for message in final_messages
         if message.get("role") == "user"
     )
+    final_tool_contents = [
+        message.get("content")
+        for message in final_messages
+        if message.get("role") == "tool"
+    ]
+    assert sum(
+        isinstance(content, str) and repeated_evidence in content
+        for content in final_tool_contents
+    ) == 1
+    assert sum(
+        isinstance(content, str) and content.startswith("[Duplicate tool output")
+        for content in final_tool_contents
+    ) == 1
+    durable_tool_contents = [
+        message.get("content")
+        for message in result["messages"]
+        if message.get("role") == "tool"
+    ]
+    assert sum(
+        isinstance(content, str) and repeated_evidence in content
+        for content in durable_tool_contents
+    ) == 2
 
 
 def test_generic_hard_stop_recovers_with_one_tool_free_final_answer_call():

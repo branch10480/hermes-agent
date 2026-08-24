@@ -607,6 +607,15 @@ DEFAULT_CONFIG = {
             "max_web_searches": 50,   # max web_search calls per turn (0 = unlimited)
             "max_subagents": 50,      # max subagents spawned per turn (0 = unlimited)
         },
+        # The one final-answer call after a hard stop keeps the turn's normal
+        # reasoning effort, but must not reserve the full normal output budget
+        # or replay redundant tool payloads. Deduplication is request-local and
+        # lossless: the newest full copy remains, unique evidence is untouched,
+        # and the durable transcript is never rewritten.
+        "answer_only_recovery": {
+            "max_tokens": 16_384,
+            "deduplicate_tool_results": True,
+        },
     },
 
     "compression": {

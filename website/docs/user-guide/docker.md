@@ -79,9 +79,12 @@ tool_loop_guardrails:
   hard_stop_after:
     exact_failure: 5
     idempotent_no_progress: 5
+  answer_only_recovery:
+    max_tokens: 16384
+    deduplicate_tool_results: true
 ```
 
-When a hard stop fires, Hermes blocks the repeated tool call and gives the model one tool-free recovery call to answer from evidence already collected. A controlled guardrail-halt response is used only if that recovery still attempts a tool call.
+When a hard stop fires, Hermes blocks the repeated tool call and gives the model one tool-free recovery call to answer from evidence already collected. The recovery keeps the active profile's reasoning effort, uses a bounded output budget, and removes only byte-identical tool results from its request copy. Unique evidence and durable history remain unchanged. A controlled guardrail-halt response is used only if that recovery still attempts a tool call.
 :::
 
 Note: the API server is gated on `API_SERVER_ENABLED=true`. To expose it beyond `127.0.0.1` inside the container, also set `API_SERVER_HOST=0.0.0.0` and an `API_SERVER_KEY` (minimum 8 characters — generate one with `openssl rand -hex 32`). Example:

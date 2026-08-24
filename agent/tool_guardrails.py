@@ -61,6 +61,32 @@ MUTATING_TOOL_NAMES = frozenset(
 
 
 @dataclass(frozen=True)
+class AnswerOnlyRecoveryConfig:
+    """One-shot final-answer policy after a tool-loop guardrail fires.
+
+    The recovery keeps the turn's requested reasoning effort, but bounds the
+    output reservation and may deduplicate byte-identical tool results in the
+    request copy.  Unique evidence is never summarized by this policy.
+    """
+
+    max_tokens: int = 16_384
+    deduplicate_tool_results: bool = True
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "AnswerOnlyRecoveryConfig":
+        if not isinstance(data, Mapping):
+            return cls()
+        defaults = cls()
+        return cls(
+            max_tokens=_positive_int(data.get("max_tokens"), defaults.max_tokens),
+            deduplicate_tool_results=_as_bool(
+                data.get("deduplicate_tool_results"),
+                defaults.deduplicate_tool_results,
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class ToolCallGuardrailConfig:
     """Thresholds for per-turn tool-call loop detection.
 
@@ -80,6 +106,9 @@ class ToolCallGuardrailConfig:
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
     loop_caps: "LoopCapConfig" = field(default_factory=lambda: LoopCapConfig())
+    answer_only_recovery: AnswerOnlyRecoveryConfig = field(
+        default_factory=AnswerOnlyRecoveryConfig
+    )
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "ToolCallGuardrailConfig":
@@ -123,6 +152,9 @@ class ToolCallGuardrailConfig:
                 defaults.no_progress_block_after,
             ),
             loop_caps=LoopCapConfig.from_mapping(data.get("loop_caps")),
+            answer_only_recovery=AnswerOnlyRecoveryConfig.from_mapping(
+                data.get("answer_only_recovery")
+            ),
         )
 
 

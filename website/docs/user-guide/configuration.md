@@ -1638,9 +1638,12 @@ tool_loop_guardrails:
   loop_caps:
     max_web_searches: 50       # max web_search calls per turn (0 = unlimited)
     max_subagents: 50          # max subagents spawned per turn (0 = unlimited)
+  answer_only_recovery:
+    max_tokens: 16384          # output cap for the single tool-free recovery call
+    deduplicate_tool_results: true  # collapse byte-identical tool results in the request copy
 ```
 
-`hard_stop_enabled` defaults to `false` because interactive sessions have a human in the loop. In unattended deployments (gateway, cron, kanban workers) set it to `true` so repeated failures are blocked rather than only warned. After any hard stop or always-on loop cap blocks a tool call, Hermes makes one tool-free recovery call so the model can answer the original request from evidence already collected. If that recovery still attempts a tool call, Hermes falls back to the controlled guardrail-halt response. See also [Docker / unattended deployments](docker.md).
+`hard_stop_enabled` defaults to `false` because interactive sessions have a human in the loop. In unattended deployments (gateway, cron, kanban workers) set it to `true` so repeated failures are blocked rather than only warned. After any hard stop or always-on loop cap blocks a tool call, Hermes makes one tool-free recovery call so the model can answer the original request from evidence already collected. The recovery keeps the active profile's reasoning effort, caps output with `answer_only_recovery.max_tokens`, and can remove byte-identical tool results from the request copy. Deduplication keeps the newest full copy, preserves unique evidence, and never rewrites durable conversation history. If that recovery still attempts a tool call, Hermes falls back to the controlled guardrail-halt response. See also [Docker / unattended deployments](docker.md).
 
 ### Per-turn runaway-loop caps
 

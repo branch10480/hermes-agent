@@ -3,6 +3,7 @@
 import json
 
 from agent.tool_guardrails import (
+    AnswerOnlyRecoveryConfig,
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
     ToolCallSignature,
@@ -61,6 +62,35 @@ def test_config_parses_nested_warn_and_hard_stop_thresholds():
     assert cfg.exact_failure_block_after == 6
     assert cfg.same_tool_failure_halt_after == 7
     assert cfg.no_progress_block_after == 8
+
+
+def test_config_parses_bounded_answer_only_recovery():
+    cfg = ToolCallGuardrailConfig.from_mapping(
+        {
+            "answer_only_recovery": {
+                "max_tokens": 12_345,
+                "deduplicate_tool_results": False,
+            }
+        }
+    )
+
+    assert cfg.answer_only_recovery == AnswerOnlyRecoveryConfig(
+        max_tokens=12_345,
+        deduplicate_tool_results=False,
+    )
+
+
+def test_invalid_answer_only_recovery_values_fall_back_safely():
+    cfg = ToolCallGuardrailConfig.from_mapping(
+        {
+            "answer_only_recovery": {
+                "max_tokens": 0,
+                "deduplicate_tool_results": "not-a-bool",
+            }
+        }
+    )
+
+    assert cfg.answer_only_recovery == AnswerOnlyRecoveryConfig()
 
 
 def test_default_repeated_identical_failed_call_warns_without_blocking():
@@ -167,7 +197,6 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
-
 
 
 

@@ -3388,6 +3388,34 @@ class ContextCompressor(ContextEngine):
 
         return result, pruned
 
+    def deduplicate_tool_results_for_recovery(
+        self, messages: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Losslessly compact an answer-only recovery request.
+
+        This is deliberately narrower than :meth:`prune_tool_results_only`:
+        it replaces only byte-identical historical tool outputs with a pointer
+        to the newest full copy.  Unique search results, extracted pages, file
+        contents, URLs, and the recent tail remain verbatim so final-answer
+        quality does not depend on a lossy summary.  The input list and its
+        message dictionaries are never mutated, and no SessionDB state or
+        proactive-prune rearm threshold is touched.
+
+        ``protect_tail_count=len(messages)`` leaves the ordinary summarization
+        and tool-argument truncation passes with an empty range while the
+        tail-agnostic exact-dedup pass still runs.
+        """
+        if not messages:
+            return messages, 0
+        deduplicated, count = self._prune_old_tool_results(
+            messages,
+            protect_tail_count=len(messages),
+            protect_tail_tokens=None,
+        )
+        if not count:
+            return messages, 0
+        return deduplicated, count
+
     def prune_tool_results_only(
         self, messages: List[Dict[str, Any]], current_tokens: int | None = None,
     ) -> tuple[List[Dict[str, Any]], int]:
