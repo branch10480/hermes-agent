@@ -785,7 +785,8 @@ can:
 
 - Register Python-callback lifecycle hooks:
   `pre_tool_call`, `post_tool_call`, `pre_llm_call`, `post_llm_call`,
-  `on_session_start`, `on_session_end`
+  `on_context_pressure`, `pre_context_compression`,
+  `post_context_compression`, `on_session_start`, `on_session_end`
 - Register new tools via `ctx.register_tool(...)`
 - Register CLI subcommands via `ctx.register_cli_command(...)` — the
   plugin's argparse tree is wired into `hermes` at startup so
