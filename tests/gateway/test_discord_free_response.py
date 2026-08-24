@@ -81,18 +81,41 @@ class FakeForumChannel:
 
 
 class FakeThread:
-    def __init__(self, channel_id: int = 1, name: str = "thread", parent=None, guild_name: str = "Hermes Server"):
+    def __init__(
+        self,
+        channel_id: int = 1,
+        name: str = "thread",
+        parent=None,
+        guild_name: str = "Hermes Server",
+        owner_id=None,
+        history_messages=None,
+    ):
         self.id = channel_id
         self.name = name
         self.parent = parent
         self.parent_id = getattr(parent, "id", None)
         self.guild = getattr(parent, "guild", None) or SimpleNamespace(name=guild_name)
         self.topic = None
+        self.owner_id = owner_id
+        self._history_messages = list(history_messages or [])
 
     def history(self, *, limit, before, after=None, oldest_first=None):
+        before_id = int(getattr(before, "id", before))
+        after_id = int(getattr(after, "id", after)) if after is not None else None
+        if oldest_first is None:
+            oldest_first = after is not None
+
+        messages = [
+            message for message in self._history_messages
+            if int(message.id) < before_id
+            and (after_id is None or int(message.id) > after_id)
+        ]
+        messages.sort(key=lambda message: int(message.id), reverse=not oldest_first)
+
         async def _iter():
-            return
-            yield
+            for message in messages[:limit]:
+                yield message
+
         return _iter()
 
 
@@ -305,6 +328,122 @@ async def test_discord_free_response_channel_skips_auto_thread(adapter, monkeypa
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "casual chat in free-response channel"
     assert event.source.chat_type == "group"
+
+
+@pytest.mark.asyncio
+async def test_handoff_thread_accepts_first_plain_reply_without_mention(adapter, monkeypatch):
+    """Out-of-band handoff/cron threads must join the participation tracker."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "false")
+
+    parent = FakeTextChannel(channel_id=123)
+    thread = FakeThread(channel_id=9001, name="Morning Brief", parent=parent)
+    parent.create_thread = AsyncMock(return_value=thread)
+    adapter._client.get_channel = MagicMock(return_value=parent)
+    adapter._client.fetch_channel = AsyncMock()
+
+    thread_id = await adapter.create_handoff_thread("123", "Morning Brief")
+
+    assert thread_id == "9001"
+    assert thread_id in adapter._threads
+
+    await adapter._handle_message(
+        make_message(channel=thread, content="2番目の項目を詳しく教えて")
+    )
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "2番目の項目を詳しく教えて"
+    assert event.source.thread_id == "9001"
+
+
+@pytest.mark.asyncio
+async def test_handoff_thread_fallback_also_marks_participation(adapter):
+    """The seed-message fallback must preserve the same reply contract."""
+    parent = FakeTextChannel(channel_id=123)
+    parent.create_thread = AsyncMock(side_effect=RuntimeError("direct unavailable"))
+    fallback_thread = FakeThread(channel_id=9002, parent=parent)
+    seed_message = SimpleNamespace(
+        create_thread=AsyncMock(return_value=fallback_thread)
+    )
+    parent.send = AsyncMock(return_value=seed_message)
+    adapter._client.get_channel = MagicMock(return_value=parent)
+    adapter._client.fetch_channel = AsyncMock()
+
+    thread_id = await adapter.create_handoff_thread("123", "Fallback Brief")
+
+    assert thread_id == "9002"
+    assert thread_id in adapter._threads
+
+
+@pytest.mark.asyncio
+async def test_legacy_bot_owned_cron_thread_self_repairs_with_delivery_context(
+    adapter,
+    monkeypatch,
+):
+    """Old cron threads accept plain replies and recover their delivery text."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "false")
+    adapter.config.extra["history_backfill"] = True
+
+    bot_user = adapter._client.user
+    bot_user.bot = True
+    bot_user.display_name = "Hermes"
+    bot_user.name = "Hermes"
+    parent = FakeTextChannel(channel_id=123)
+    thread = FakeThread(
+        channel_id=8999,
+        name="Old Morning Brief",
+        parent=parent,
+        owner_id=bot_user.id,
+        history_messages=[
+            make_history_message(
+                author=bot_user,
+                content="[Cron 配信: morning-digest]\n今日の重要項目は3件です。",
+                msg_id=122,
+            ),
+        ],
+    )
+    assert "8999" not in adapter._threads
+
+    await adapter._handle_message(
+        make_message(channel=thread, content="2番目を詳しく教えて")
+    )
+
+    assert "8999" in adapter._threads
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "2番目を詳しく教えて"
+    assert event.source.thread_id == "8999"
+    assert event.channel_context == (
+        "[Recent channel messages]\n"
+        "[Hermes [bot]] [Cron 配信: morning-digest]\n"
+        "今日の重要項目は3件です。"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovery_gate_admits_legacy_bot_owned_thread_without_consuming_adoption(
+    adapter,
+    monkeypatch,
+):
+    """Backfill admission defers persistence so live handling can seed context."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "false")
+    thread = FakeThread(channel_id=8998, owner_id=adapter._client.user.id)
+    message = make_message(channel=thread, content="続きは？")
+    adapter._discord_message_admission = MagicMock(return_value=(True, True))
+    adapter._handle_message = AsyncMock(return_value=True)
+
+    handled = await adapter._dispatch_recovered_message(message)
+
+    assert handled is True
+    assert "8998" not in adapter._threads
+    adapter._handle_message.assert_awaited_once_with(
+        message,
+        role_authorized=True,
+        recovered=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -826,4 +965,3 @@ async def test_discord_reply_in_free_channel_triggers_backfill(adapter, monkeypa
     assert event.channel_context == (
         "[Context around the replied-to message]\n[Hermes [bot]] earlier answer"
     )
-

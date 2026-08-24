@@ -2312,9 +2312,13 @@ class DiscordAdapter(BasePlatformAdapter):
             parent_id = self._get_parent_channel_id(message.channel)
             channel_keys = self._discord_channel_keys(message, parent_id)
             free_channels = self._discord_free_response_channels()
+            participates, _ = self._discord_thread_participation(
+                message.channel,
+                persist_owned=False,
+            )
             in_bot_thread = (
                 isinstance(message.channel, discord.Thread)
-                and str(message.channel.id) in self._threads
+                and participates
                 and not self._discord_thread_require_mention()
             )
             if (
@@ -6463,6 +6467,49 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
 
+    def _discord_thread_participation(
+        self,
+        channel: Any,
+        *,
+        persist_owned: bool = True,
+    ) -> Tuple[bool, bool]:
+        """Return whether a thread belongs to this bot's conversation.
+
+        The persistent tracker is the normal source of truth. Older
+        handoff/cron threads created before out-of-band thread creation was
+        wired into that tracker can repair themselves from Discord's
+        ``owner_id``: only a thread owned by this bot is adopted. The second
+        return value reports that this call performed the legacy adoption so
+        the first reply can also backfill the bot's delivery boundary.
+
+        ``persist_owned=False`` is used by missed-message admission. It lets
+        the recovered message pass the same gate without consuming the
+        one-time adoption signal before ``_handle_message()`` builds context.
+        """
+        if not isinstance(channel, discord.Thread):
+            return False, False
+
+        thread_id = str(getattr(channel, "id", ""))
+        if not thread_id:
+            return False, False
+        if thread_id in self._threads:
+            return True, False
+
+        bot_user = getattr(getattr(self, "_client", None), "user", None)
+        bot_id = getattr(bot_user, "id", None)
+        owner_id = getattr(channel, "owner_id", None)
+        if bot_id is None or owner_id is None or str(owner_id) != str(bot_id):
+            return False, False
+
+        if persist_owned:
+            self._threads.mark(thread_id)
+            logger.info(
+                "[%s] Adopted legacy bot-owned Discord thread %s into participation tracking",
+                self.name,
+                thread_id,
+            )
+        return True, persist_owned
+
     def _discord_history_backfill(self) -> bool:
         """Return whether history backfill is enabled for shared sessions."""
         configured = self.config.extra.get("history_backfill")
@@ -6497,12 +6544,17 @@ class DiscordAdapter(BasePlatformAdapter):
         channel: Any,
         before: "DiscordMessage",
         reply_target: Optional[Any] = None,
+        *,
+        include_self_boundary: bool = False,
     ) -> str:
         """Fetch recent channel messages for conversational context.
 
         Scans backwards from *before* and collects messages until it hits
         a message sent by this bot (the natural partition point between
-        bot turns) or reaches ``history_backfill_limit``.
+        bot turns) or reaches ``history_backfill_limit``. When
+        ``include_self_boundary`` is true, that boundary message is included;
+        this repairs the first reply in a legacy bot-owned cron thread whose
+        original delivery was not seeded into the replying user's session.
 
         When ``reply_target`` is provided (the user replied to a specific
         message), a second backward scan is run ending at that target so the
@@ -6535,7 +6587,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # trigger — Discord snowflake IDs are monotonically increasing, so
         # a simple int comparison suffices.
         channel_id = str(getattr(channel, "id", ""))
-        _cached_id = self._last_self_message_id.get(channel_id)
+        _cached_id = (
+            None
+            if include_self_boundary
+            else self._last_self_message_id.get(channel_id)
+        )
         _after_obj = None
         try:
             if _cached_id and int(_cached_id) < int(before.id):
@@ -6635,6 +6691,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 # session transcript.  (Redundant when _after_obj is set, but
                 # needed for cold start.)
                 if msg.author == self._client.user:
+                    if include_self_boundary:
+                        line = _keep(msg)
+                        if line is not None:
+                            mid = str(getattr(msg, "id", ""))
+                            collected.append((mid, line))
+                            if mid:
+                                seen_ids.add(mid)
                     break
                 line = _keep(msg)
                 if line is None:
@@ -7014,7 +7077,14 @@ class DiscordAdapter(BasePlatformAdapter):
             create = getattr(parent, "create_thread", None)
             if create is not None:
                 thread = await create(**create_kwargs)
-                return str(thread.id)
+                thread_id = str(thread.id)
+                # Handoff/cron threads are created out-of-band instead of by
+                # _handle_message(), so they never reach the normal
+                # participation marker there. Persist the new thread here so
+                # the user's first plain reply is admitted without requiring
+                # an @mention, exactly like an auto-created Discord thread.
+                self._threads.mark(thread_id)
+                return thread_id
         except Exception as direct_error:
             logger.debug(
                 "[%s] Handoff thread: direct create failed (%s); trying seed-message fallback",
@@ -7034,7 +7104,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 auto_archive_duration=1440,
                 reason=reason,
             )
-            return str(thread.id)
+            thread_id = str(thread.id)
+            self._threads.mark(thread_id)
+            return thread_id
         except Exception as fallback_error:
             logger.warning(
                 "[%s] Handoff thread: both create paths failed for parent %s: %s",
@@ -7708,10 +7780,16 @@ class DiscordAdapter(BasePlatformAdapter):
 
         thread_id = None
         parent_channel_id = None
+        adopted_legacy_owned_thread = False
+        participates_in_thread = False
         is_thread = isinstance(message.channel, discord.Thread)
         if is_thread:
             thread_id = str(message.channel.id)
             parent_channel_id = self._get_parent_channel_id(message.channel)
+            (
+                participates_in_thread,
+                adopted_legacy_owned_thread,
+            ) = self._discord_thread_participation(message.channel)
 
         is_voice_linked_channel = False
 
@@ -7777,7 +7855,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # a thread.
             in_bot_thread = (
                 is_thread
-                and thread_id in self._threads
+                and participates_in_thread
                 and not self._discord_thread_require_mention()
             )
 
@@ -8102,7 +8180,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
             if (_has_mention_gap or is_thread or _is_reply) and auto_threaded_channel is None:
                 _backfill_text = await self._fetch_channel_context(
-                    message.channel, before=message, reply_target=_reply_target,
+                    message.channel,
+                    before=message,
+                    reply_target=_reply_target,
+                    include_self_boundary=adopted_legacy_owned_thread,
                 )
                 if _backfill_text:
                     _channel_context = _backfill_text

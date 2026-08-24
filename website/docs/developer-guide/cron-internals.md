@@ -262,14 +262,14 @@ For **Telegram topics**, use `telegram:<chat_id>:<thread_id>` (e.g., `telegram:-
 ### Response Wrapping
 
 By default (`cron.wrap_response: true`), cron deliveries are wrapped with:
-- A header identifying the cron job name and task
-- A footer noting the agent cannot see the delivered message in conversation
+- A localized header identifying the cron job name and job ID
+- A footer explaining how to follow up in the delivery thread and stop the job
 
 The `[SILENT]` prefix in a cron response suppresses delivery entirely — useful for jobs that only need to write to files or perform side effects.
 
 ### Session Isolation
 
-Cron deliveries are NOT mirrored into gateway session conversation history. They exist only in the cron job's own session. This prevents message alternation violations in the target chat's conversation.
+Cron deliveries are not mirrored into an existing gateway conversation by default. They exist only in the cron job's own session, which prevents message alternation violations in the target chat. A continuable origin delivery (`attach_to_session` or `cron.mirror_delivery`) is the explicit exception: the scheduler creates a dedicated continuation surface where possible and seeds the labelled brief into that surface's session. Discord keys this seed with the thread's own chat ID and the origin user's ID so per-user thread sessions join the same transcript when the user replies.
 
 ## Recursion Guard
 

@@ -356,12 +356,14 @@ This applies only to cron deliveries. `TELEGRAM_HOME_CHANNEL_THREAD_ID` (used el
 By default, delivered cron output is wrapped with a header and footer so the recipient knows it came from a scheduled task:
 
 ```
-Cronjob Response: Morning feeds
+[Cron 配信: Morning feeds]
+(job_id: abc123)
 -------------
 
 <agent output here>
 
-Note: The agent cannot see this message, and therefore cannot respond to it.
+このスレッドに返信でフォローアップできます。ジョブを止める場合は、
+親チャンネルで「Morning feeds stop」を私に送ってください。
 ```
 
 To deliver the raw agent output without the wrapper, set `cron.wrap_response` to `false`:
@@ -395,7 +397,11 @@ Behaviour is **thread-preferred**, scoped to the job's origin chat:
   delivery opens its own dedicated thread and the brief is seeded into that
   thread's session, so a reply in-thread continues with full context. A
   recurring job (e.g. a daily brief) opens a fresh thread per run, keeping each
-  delivery's follow-up discussion isolated.
+  delivery's follow-up discussion isolated. Discord records Hermes-created
+  delivery threads as participated, so a plain reply is accepted when
+  `discord.thread_require_mention` is `false` (the default). Bot-owned threads
+  created by older versions repair that participation marker on their first
+  reply and include the preceding delivery as context.
 - **DM-only platforms** (WhatsApp, Signal, SMS): no threads exist, so the brief
   is mirrored into the origin DM session instead — the DM itself is the
   continuation surface.

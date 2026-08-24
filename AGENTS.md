@@ -1118,9 +1118,13 @@ Hardening invariants:
 - Cron sessions pass `skip_memory=True` by default; memory providers
   intentionally do not run during cron.
 
-Cron deliveries are **not** mirrored into the target gateway session —
-they land in their own cron session with a header/footer frame so the
-main conversation's message-role alternation stays intact.
+Cron deliveries are **not** mirrored into an existing target conversation by
+default — they land in their own cron session with a header/footer frame so
+the main conversation's message-role alternation stays intact. A continuable
+origin delivery (`attach_to_session` or `cron.mirror_delivery`) instead opens
+or reuses a continuation surface and seeds the labelled brief there. Discord
+thread seeds use the origin user's ID and the thread's own chat ID so per-user
+thread sessions resolve to the same transcript as the first human reply.
 
 ---
 
