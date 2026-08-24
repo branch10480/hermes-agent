@@ -2866,6 +2866,23 @@ def compress_context(
                         # re-appending the concurrent rows and the live tail.
                         agent._persist_user_message_idx = len(messages)
 
+        # Generic plugin checkpoint boundary. This fires after any durable
+        # parent adoption, so consumers see the exact transcript the host is
+        # about to compact. Observer failures are fail-open.
+        from agent.context_checkpoint_hooks import notify_pre_context_compression
+
+        notify_pre_context_compression(
+            session_id=agent.session_id or "",
+            task_id=task_id,
+            approx_tokens=int(approx_tokens or 0),
+            threshold_tokens=int(
+                getattr(agent.context_compressor, "threshold_tokens", 0) or 0
+            ),
+            conversation_history=list(messages),
+            model=agent.model,
+            platform=getattr(agent, "platform", None) or "",
+        )
+
         # Notify external memory provider before compression discards context.
         # The provider's on_pre_compress() may return a string of insights it
         # wants surfaced inside the compression summary; capture and forward it
@@ -3709,6 +3726,23 @@ def compress_context(
             f"{_compressed_est:,}",
         )
         _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
+        if _commit_status == "committed":
+            from agent.context_checkpoint_hooks import (
+                notify_post_context_compression,
+            )
+
+            notify_post_context_compression(
+                session_id=agent.session_id or "",
+                old_session_id=_old_sid or _boundary_parent,
+                task_id=task_id,
+                in_place=bool(in_place),
+                compression_count=int(
+                    getattr(agent.context_compressor, "compression_count", 0)
+                    or 0
+                ),
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
         _emit_compression_attempt_telemetry(
             agent,
             started_at=_attempt_started_at,

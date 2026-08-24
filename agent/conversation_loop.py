@@ -2352,6 +2352,38 @@ def run_conversation(
             _estimate_tools_tokens_rough(tools_for_api) if tools_for_api else 0
         )
         total_chars = approx_tokens * 4
+        # Give plugins one request-only chance to checkpoint important working
+        # state before the host compressor becomes the sole continuity path.
+        # The hook also carries one-shot recovery context after a successful
+        # boundary.  Never append a synthetic message: amend the API copy of
+        # the active user turn so strict role alternation and SessionDB stay
+        # untouched.
+        from agent.context_checkpoint_hooks import context_pressure_context
+
+        _pressure_context = context_pressure_context(
+            session_id=agent.session_id or "",
+            task_id=effective_task_id,
+            turn_id=turn_id,
+            approx_tokens=request_pressure_tokens,
+            threshold_tokens=int(
+                getattr(agent.context_compressor, "threshold_tokens", 0) or 0
+            ),
+            context_length=int(
+                getattr(agent.context_compressor, "context_length", 0) or 0
+            ),
+            conversation_history=list(messages),
+            model=agent.model,
+            platform=getattr(agent, "platform", None) or "",
+        )
+        if _pressure_context:
+            _append_answer_only_recovery_prompt(api_messages, _pressure_context)
+            approx_tokens = estimate_messages_tokens_rough(api_messages)
+            request_pressure_tokens = approx_tokens + (
+                _estimate_tools_tokens_rough(tools_for_api)
+                if tools_for_api
+                else 0
+            )
+            total_chars = approx_tokens * 4
         # Stash this request's rough estimate so update_from_response() can
         # pair it with the provider's real prompt count — the (rough, real)
         # anchor behind should_defer_preflight_to_real_usage()'s projection.

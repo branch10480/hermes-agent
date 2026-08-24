@@ -138,6 +138,45 @@ class TestCompressionBoundaryHook:
 
             assert events == ["persist", "compression"]
 
+    def test_plugin_checkpoint_hooks_wrap_a_committed_rotation(self):
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            compressor = MagicMock()
+            compressor.compress.return_value = [
+                {"role": "user", "content": "summary"}
+            ]
+            compressor.compression_count = 1
+            compressor.last_prompt_tokens = 0
+            compressor.last_completion_tokens = 0
+            compressor._last_summary_error = None
+            compressor._last_compress_aborted = False
+            agent.context_compressor = compressor
+            original_sid = agent.session_id
+            messages = [{"role": "user", "content": "request"}]
+
+            with (
+                patch(
+                    "agent.context_checkpoint_hooks.notify_pre_context_compression"
+                ) as pre_hook,
+                patch(
+                    "agent.context_checkpoint_hooks.notify_post_context_compression"
+                ) as post_hook,
+            ):
+                agent._compress_context(messages, "sys", approx_tokens=100)
+
+            pre_hook.assert_called_once()
+            assert pre_hook.call_args.kwargs["session_id"] == original_sid
+            [pre_message] = pre_hook.call_args.kwargs["conversation_history"]
+            assert pre_message["role"] == "user"
+            assert pre_message["content"] == "request"
+            post_hook.assert_called_once()
+            assert post_hook.call_args.kwargs["old_session_id"] == original_sid
+            assert post_hook.call_args.kwargs["session_id"] == agent.session_id
+            assert post_hook.call_args.kwargs["in_place"] is False
+
     def test_failure_before_persistence_does_not_notify(self):
         from hermes_state import SessionDB
 
@@ -322,4 +361,3 @@ class TestSessionCompressEvent:
                 [{"role": "user", "content": "m"}], "sys", approx_tokens=100
             )
             assert compressed
-

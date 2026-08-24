@@ -167,6 +167,11 @@ VALID_HOOKS: Set[str] = {
     "pre_api_request",
     "post_api_request",
     "api_request_error",
+    # Context-pressure/checkpoint lifecycle. The core supplies generic timing
+    # and API-only injection; plugins own checkpoint policy and persistence.
+    "on_context_pressure",
+    "pre_context_compression",
+    "post_context_compression",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",
@@ -2129,8 +2134,8 @@ class PluginManager:
 
         Returns a list of non-``None`` return values from callbacks.
 
-        For ``pre_llm_call``, callbacks may return a dict describing
-        context to inject into the current turn's user message::
+        For ``pre_llm_call`` and ``on_context_pressure``, callbacks may return
+        a dict describing context to inject into the current request::
 
             {"context": "recalled text..."}
             "recalled text..."          # plain string, equivalent
