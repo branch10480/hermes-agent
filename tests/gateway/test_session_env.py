@@ -199,6 +199,7 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_PARENT_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
 
     source = SessionSource(
@@ -208,6 +209,7 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
         user_id="123456",
         user_name="alice",
         thread_id=None,
+        parent_chat_id="2144471000",
     )
     context = SessionContext(
         source=source,
@@ -222,6 +224,7 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
             lambda: {
                 "platform": get_session_env("HERMES_SESSION_PLATFORM"),
                 "chat_id": get_session_env("HERMES_SESSION_CHAT_ID"),
+                "parent_chat_id": get_session_env("HERMES_SESSION_PARENT_CHAT_ID"),
                 "user_id": get_session_env("HERMES_SESSION_USER_ID"),
                 "session_key": get_session_env("HERMES_SESSION_KEY"),
             }
@@ -233,6 +236,7 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
     assert result == {
         "platform": "telegram",
         "chat_id": "2144471399",
+        "parent_chat_id": "2144471000",
         "user_id": "123456",
         "session_key": "agent:main:telegram:dm:2144471399",
     }
@@ -272,4 +276,3 @@ def test_cron_session_set_clear_and_reset_tristate(monkeypatch):
 
     reset_session_vars()
     assert get_session_env("HERMES_CRON_SESSION") == "1"
-

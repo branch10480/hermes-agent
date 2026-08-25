@@ -2322,6 +2322,12 @@ DEFAULT_CONFIG = {
         # mid-loop, never mutating the cached system prompt). Only the origin
         # chat is ever touched — fan-out / broadcast targets are never mirrored.
         "mirror_delivery": False,
+        # When a Discord cron job is created from inside a thread, capture the
+        # parent channel as its durable origin instead of the creation thread.
+        # This makes a continuable delivery open a fresh result thread under
+        # that channel on each run. Default False preserves deliver=origin's
+        # historical exact-conversation behavior.
+        "discord_thread_origin_to_parent": False,
         # Maximum number of due jobs to run in parallel per tick.
         # null/0 = unbounded (limited only by thread count).
         # 1 = serial (pre-v0.9 behaviour).

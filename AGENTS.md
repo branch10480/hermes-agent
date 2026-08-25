@@ -1125,7 +1125,10 @@ the main conversation's message-role alternation stays intact. A continuable
 origin delivery (`attach_to_session` or `cron.mirror_delivery`) instead opens
 or reuses a continuation surface and seeds the labelled brief there. Discord
 thread seeds use the origin user's ID and the thread's own chat ID so per-user
-thread sessions resolve to the same transcript as the first human reply.
+thread sessions resolve to the same transcript as the first human reply. The
+opt-in `cron.discord_thread_origin_to_parent` setting captures a Discord
+thread's parent channel for newly created jobs so each run can open a fresh
+result thread; the default exact-conversation origin contract remains intact.
 
 ---
 

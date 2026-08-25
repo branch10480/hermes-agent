@@ -269,7 +269,7 @@ The `[SILENT]` prefix in a cron response suppresses delivery entirely — useful
 
 ### Session Isolation
 
-Cron deliveries are not mirrored into an existing gateway conversation by default. They exist only in the cron job's own session, which prevents message alternation violations in the target chat. A continuable origin delivery (`attach_to_session` or `cron.mirror_delivery`) is the explicit exception: the scheduler creates a dedicated continuation surface where possible and seeds the labelled brief into that surface's session. Discord keys this seed with the thread's own chat ID and the origin user's ID so per-user thread sessions join the same transcript when the user replies.
+Cron deliveries are not mirrored into an existing gateway conversation by default. They exist only in the cron job's own session, which prevents message alternation violations in the target chat. A continuable origin delivery (`attach_to_session` or `cron.mirror_delivery`) is the explicit exception: the scheduler creates a dedicated continuation surface where possible and seeds the labelled brief into that surface's session. Discord keys this seed with the thread's own chat ID and the origin user's ID so per-user thread sessions join the same transcript when the user replies. With `cron.discord_thread_origin_to_parent: true`, a job created inside a Discord thread captures its parent channel as the durable origin, allowing each run to open a fresh result thread instead of reusing the setup thread. The option defaults to false so `deliver=origin` retains its exact-conversation contract.
 
 ## Recursion Guard
 

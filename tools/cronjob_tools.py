@@ -319,6 +319,28 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
     origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
     if origin_platform and origin_chat_id:
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID") or None
+        parent_chat_id = get_session_env("HERMES_SESSION_PARENT_CHAT_ID") or None
+        # Discord represents an organic thread with chat_id == thread_id. If
+        # that live source is persisted verbatim, deliver=origin routes every
+        # future result back into the thread where the job was created. A
+        # continuable Discord cron should instead use its parent channel as the
+        # durable origin; leaving thread_id empty lets cron.scheduler open and
+        # seed a fresh result thread through its existing continuation path.
+        # Other platforms keep their captured topic/thread semantics.
+        if (
+            str(origin_platform).strip().lower() == "discord"
+            and thread_id
+            and parent_chat_id
+            and _discord_thread_origin_to_parent_enabled()
+        ):
+            logger.debug(
+                "Cron Discord thread origin normalized to parent channel %s "
+                "(creation thread=%s)",
+                parent_chat_id,
+                thread_id,
+            )
+            origin_chat_id = parent_chat_id
+            thread_id = None
         if thread_id:
             logger.debug(
                 "Cron origin captured thread_id=%s for %s:%s",
@@ -337,6 +359,24 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
             "user_id": get_session_env("HERMES_SESSION_USER_ID") or None,
         }
     return None
+
+
+def _discord_thread_origin_to_parent_enabled() -> bool:
+    """Whether Discord thread-created cron jobs target their parent channel.
+
+    This is opt-in because the default ``deliver=origin`` contract preserves
+    the exact conversation where a job was created. Operators who want every
+    run to open a fresh continuable thread under the channel can enable the
+    profile-scoped cron setting without changing Telegram/Slack topic routing.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+        cron_config = config.get("cron", {}) or {}
+        return cron_config.get("discord_thread_origin_to_parent") is True
+    except Exception:
+        return False
 
 
 def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> Optional[str]:

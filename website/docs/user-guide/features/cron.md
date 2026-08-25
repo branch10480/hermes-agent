@@ -391,6 +391,19 @@ cron:
   mirror_delivery: false   # set true to make cron deliveries continuable
 ```
 
+`deliver: origin` normally preserves the exact conversation where the job was
+created. For Discord operators who create jobs inside setup threads but want
+each result under the parent channel, enable parent-origin capture as well:
+
+```yaml
+cron:
+  mirror_delivery: true
+  discord_thread_origin_to_parent: true
+```
+
+The parent-origin option is off by default. It affects newly created jobs;
+existing jobs keep their stored origin until recreated or explicitly migrated.
+
 Behaviour is **thread-preferred**, scoped to the job's origin chat:
 
 - **Thread-capable platforms** (Telegram topics, Discord/Slack threads): each

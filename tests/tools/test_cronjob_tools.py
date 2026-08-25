@@ -458,6 +458,7 @@ class TestLocalDeliveryNotice:
             "HERMES_SESSION_PLATFORM",
             "HERMES_SESSION_CHAT_ID",
             "HERMES_SESSION_THREAD_ID",
+            "HERMES_SESSION_PARENT_CHAT_ID",
             "HERMES_SESSION_CHAT_NAME",
         ):
             monkeypatch.delenv(var, raising=False)
@@ -489,6 +490,74 @@ class TestLocalDeliveryNotice:
         )
         assert created["deliver"] == "origin"
         assert "local-only cron job" not in created["message"]
+
+    def test_discord_thread_origin_uses_parent_channel(self, monkeypatch):
+        """Thread-created Discord jobs open future result threads under the
+        parent channel instead of reusing their creation thread."""
+        from cron.jobs import get_job
+        from gateway.session_context import set_session_vars
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"cron": {"discord_thread_origin_to_parent": True}},
+        )
+        set_session_vars(
+            platform="discord",
+            chat_id="thread-456",
+            thread_id="thread-456",
+            parent_chat_id="channel-123",
+            user_id="user-789",
+        )
+        created = json.loads(
+            cronjob(action="create", prompt="x", schedule="every 2m")
+        )
+
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["origin"]["platform"] == "discord"
+        assert stored["origin"]["chat_id"] == "channel-123"
+        assert stored["origin"]["thread_id"] is None
+        assert stored["origin"]["user_id"] == "user-789"
+
+    def test_discord_thread_origin_preserves_exact_thread_by_default(self):
+        """The opt-in must not change deliver=origin's default contract."""
+        from cron.jobs import get_job
+        from gateway.session_context import set_session_vars
+
+        set_session_vars(
+            platform="discord",
+            chat_id="thread-456",
+            thread_id="thread-456",
+            parent_chat_id="channel-123",
+        )
+        created = json.loads(
+            cronjob(action="create", prompt="x", schedule="every 2m")
+        )
+
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["origin"]["chat_id"] == "thread-456"
+        assert stored["origin"]["thread_id"] == "thread-456"
+
+    def test_non_discord_thread_origin_is_preserved(self):
+        """Telegram topics still deliver back to the captured topic."""
+        from cron.jobs import get_job
+        from gateway.session_context import set_session_vars
+
+        set_session_vars(
+            platform="telegram",
+            chat_id="chat-123",
+            thread_id="topic-456",
+            parent_chat_id="chat-123",
+        )
+        created = json.loads(
+            cronjob(action="create", prompt="x", schedule="every 2m")
+        )
+
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["origin"]["chat_id"] == "chat-123"
+        assert stored["origin"]["thread_id"] == "topic-456"
 
 
 class TestValidateCronBaseUrl:
