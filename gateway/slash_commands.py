@@ -3850,7 +3850,15 @@ class GatewaySlashCommandsMixin:
         policy = policy_for_source(self.config, event.source)
         if requested and not policy.is_admin(event.source.user_id):
             return "Only gateway admins can change the persistent approval mode."
-        result = run_approval_mode_command(requested)
+        # approvals.mode is a protected safety setting: the config writers refuse
+        # it on the gateway surface so an agent turn cannot widen its own gate
+        # (H-018). This path is the deliberate exception — the write comes from a
+        # platform slash event issued by an authenticated admin, not from model
+        # output, and the agent has no way to emit one.
+        from tools.safety_config_guard import owner_initiated_safety_config_change
+
+        with owner_initiated_safety_config_change():
+            result = run_approval_mode_command(requested)
         # Approval checks load config dynamically; do not evict the cached agent
         # or alter its system prompt/tool schema (prompt-cache prefix is sacred).
         return result.message
@@ -5332,7 +5340,15 @@ class GatewaySlashCommandsMixin:
                 # Persist the opt-out and run the reload.
                 try:
                     from cli import save_config_value
-                    save_config_value("approvals.mcp_reload_confirm", False)
+                    from tools.safety_config_guard import (
+                        owner_initiated_safety_config_change,
+                    )
+
+                    # approvals.* is refused on the gateway surface (H-018);
+                    # this opt-out is the owner answering their own confirm
+                    # prompt, not something a turn can trigger.
+                    with owner_initiated_safety_config_change():
+                        save_config_value("approvals.mcp_reload_confirm", False)
                     logger.info(
                         "User opted out of /reload-mcp confirmation (session=%s)",
                         session_key,

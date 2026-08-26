@@ -3494,7 +3494,9 @@ _SECURITY_COMMENT = """
 # to false to disable (e.g. when developing the redactor itself).
 # tirith pre-exec scanning is enabled by default when the tirith binary
 # is available. Configure via security.tirith_* keys or env vars
-# (TIRITH_ENABLED, TIRITH_BIN, TIRITH_TIMEOUT, TIRITH_FAIL_OPEN).
+# (TIRITH_ENABLED, TIRITH_BIN, TIRITH_TIMEOUT, TIRITH_FAIL_OPEN,
+# TIRITH_FAIL_OPEN_GATEWAY). Gateway and cron turns fail closed by default
+# and never auto-download tirith — give them a pinned tirith_path.
 #
 # security:
 #   redact_secrets: true
@@ -3502,6 +3504,7 @@ _SECURITY_COMMENT = """
 #   tirith_path: "tirith"
 #   tirith_timeout: 5
 #   tirith_fail_open: true
+#   tirith_fail_open_gateway: false
 """
 
 _FALLBACK_COMMENT = """
@@ -3561,6 +3564,40 @@ _COMMENTED_SECTIONS = """
 """
 
 
+def _assert_safety_config_writable(key: str, action: str) -> None:
+    """Refuse a single-key write to a safety setting from a remote surface.
+
+    Mirrors the terminal-side deny in ``tools/safety_config_guard`` for callers
+    that reach the config API without going through a shell (observation
+    H-018). Imported lazily: ``tools.approval`` imports this module, so a
+    module-level import would be circular.
+    """
+    try:
+        from tools.safety_config_guard import assert_config_key_writable
+    except Exception:
+        return
+    assert_config_key_writable(key, action=action)
+
+
+def _assert_safety_config_save_allowed(config: Dict[str, Any]) -> None:
+    """Refuse a whole-document save that would move a safety setting."""
+    try:
+        from tools.safety_config_guard import (
+            assert_config_save_allowed,
+            current_guarded_surface,
+        )
+    except Exception:
+        return
+    if current_guarded_surface() is None:
+        return
+    # Compare *effective* configs. Most callers pass a merged config while the
+    # file on disk holds only explicit user values, so comparing them raw would
+    # report every defaulted safety key as a change.
+    incoming = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), config or {})
+    on_disk = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), read_raw_config() or {})
+    assert_config_save_allowed(incoming, on_disk)
+
+
 def save_config(
     config: Dict[str, Any],
     *,
@@ -3586,6 +3623,12 @@ def save_config(
         if is_managed():
             managed_error("save configuration")
             return
+        # Safety boundary (H-018): a bulk save reaches approvals.*, security.*,
+        # the toolset surface and the sandbox settings just as directly as
+        # `config set` does. Only an actual *change* is refused, so the many
+        # callers that load the config, edit one unrelated key and write the
+        # whole document back keep working on every surface.
+        _assert_safety_config_save_allowed(config)
         # Managed scope: strip any leaf the managed layer pins, so a bulk write
         # (wizard / programmatic save) never persists a user value that would
         # silently lose to managed on the next load. Single-key `config set`
@@ -4902,6 +4945,12 @@ def set_config_value(key: str, value: str, force: bool = False):
     if is_managed():
         managed_error("set configuration values")
         return
+    # Safety boundary (H-018): approval mode, the denial breaker, the Tirith
+    # switches, the toolset surface and the sandbox/egress settings decide
+    # whether the *next* command is checked at all, so an agent turn on a
+    # messaging or cron surface cannot move them. Raises; every other key is
+    # untouched.
+    _assert_safety_config_writable(key, "change")
     # Managed scope guard (D2): a key pinned by the managed layer cannot be set by
     # the user — the next load would override it anyway. Hard-reject and name the
     # source. Distinct from is_managed() above (the package-manager write-lock).
@@ -5129,6 +5178,9 @@ def unset_config_value(key: str):
     if is_managed():
         managed_error("unset configuration values")
         return
+    # Safety boundary (H-018) — see set_config_value. Removing a key restores
+    # its default, which is just as much a policy change as setting it.
+    _assert_safety_config_writable(key, "remove")
     # Managed scope guard: a key pinned by the managed layer cannot be unset by
     # the user — the next load would reinstate it anyway (mirrors set_config_value).
     from hermes_cli import managed_scope

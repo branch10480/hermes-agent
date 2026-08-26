@@ -108,11 +108,16 @@ def test_breaker_trips_on_third_consecutive_denial(breaker_session):
     assert "3 consecutive commands were blocked" in third["message"]
     assert "STOP attempting variations" in third["message"]
     assert third[A.APPROVAL_BREAKER_METADATA_KEY] == {
-        "version": 1,
+        "version": 2,
         "type": "consecutive_smart_denials",
         "tripped": True,
         "count": 3,
         "threshold": 3,
+        # v2 carries the redacted denial detail across the side channel so the
+        # conversation loop can name the refused class without the command.
+        "reason_code": "breaker_test_danger",
+        "effect_class": "unclassified",
+        "safe_alternative": A._safe_alternative_for("unclassified"),
     }
 
 

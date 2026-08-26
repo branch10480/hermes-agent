@@ -2849,7 +2849,10 @@ PROCESS_SCHEMA = {
         "Actions: 'list' (show all), 'poll' (check status + new output), "
         "'log' (full output with pagination), 'wait' (block until done or timeout), "
         "'kill' (terminate), 'write' (send raw stdin data without newline), "
-        "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF)."
+        "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF). "
+        "'write' and 'submit' are unavailable on messaging and cron surfaces — send the "
+        "next step as its own terminal call there. Every action works only on processes "
+        "started in this session."
     ),
     "parameters": {
         "type": "object",
@@ -2912,6 +2915,136 @@ def _redact_process_result(result: dict) -> dict:
     return result
 
 
+# Actions that push new input into an already-running process. The command a
+# background process was started with went through Tirith, dangerous-command
+# detection and Smart Approval exactly once, at ``terminal`` time; everything
+# typed into its stdin afterwards is unchecked. On a remote surface that is an
+# authorization bypass — a vetted `bash` or `python` started with pty=true
+# becomes an unguarded command channel (observation H-017) — so these two
+# actions are policy-disabled there until each write can carry the same guards.
+# Read and lifecycle actions (list/poll/log/wait/kill/close) stay available.
+_STDIN_ACTIONS = frozenset({"write", "submit"})
+
+_STDIN_DENIED_REASON = "process_stdin_disabled_on_remote_surface"
+
+_ID_ADDRESSED_ACTIONS = frozenset({"poll", "log", "wait", "kill", "write", "submit", "close"})
+
+
+def _stdin_policy_denial(action: str, surface: str) -> Optional[str]:
+    """Return a machine-readable denial for stdin actions on remote surfaces."""
+    from tools.approval import REMOTE_TOOL_SURFACES
+
+    if action not in _STDIN_ACTIONS or surface not in REMOTE_TOOL_SURFACES:
+        return None
+    return tool_error(
+        f"process(action='{action}') is disabled on the {surface} surface: input "
+        "sent to a running process skips the command guards (Tirith, dangerous "
+        "command detection, approval) that its original terminal call passed. "
+        "Run the next step as its own terminal call instead — it gets checked "
+        "and its output comes back the same way.",
+        reason_code=_STDIN_DENIED_REASON,
+        surface=surface,
+        alternative={
+            "tool": "terminal",
+            "note": (
+                "Issue a new terminal call with the command you were about to "
+                "type. For a program that only accepts input interactively, "
+                "drive it non-interactively instead (flags, a config file, or a "
+                "here-doc inside the terminal command)."
+            ),
+        },
+        retryable=False,
+    )
+
+
+def _session_key_fingerprint(session_key: str) -> str:
+    """Opaque, run-local label for a session key, safe to log (H-014).
+
+    Delegates to ``agent.redact.session_key_fingerprint`` so both modules share
+    a single per-process salt: the same session key logs as the same
+    fingerprint whether the line is emitted here or by the redaction layer.
+    Keeping separate salts made one session look like two different sessions
+    across the two logs, defeating correlation. A session key embeds
+    machine-local chat / thread / participant IDs, so the raw value must never
+    reach a log line; the shared salt is regenerated every process start, so the
+    digest correlates lines within one run and is unguessable outside it.
+    """
+    from agent.redact import session_key_fingerprint
+    return session_key_fingerprint(session_key)
+
+
+def _process_not_found(session_id: str) -> str:
+    """The response every unreachable process ID gets.
+
+    Deliberately identical for "no such process" and "that process belongs to
+    another session": a distinguishable ownership error would confirm the ID
+    exists, which is exactly what a caller guessing IDs wants to learn.
+    """
+    return json.dumps(
+        {"status": "not_found", "error": f"No process with ID {session_id}"},
+        ensure_ascii=False,
+    )
+
+
+def _caller_session_key() -> str:
+    """Session key of the caller, or ``""`` when nothing bound one.
+
+    Every surface that runs more than one conversation in a process (the
+    messaging gateway, the TUI, the interactive CLI) binds this before the
+    agent turn starts, and it propagates into tool worker threads. The empty
+    string genuinely means "this run has no session identity", so it must not
+    be papered over with a task id — the one-shot and goal-loop CLI paths mint
+    a fresh task id per turn, and substituting it would make a process
+    unreachable from the very next turn that started it.
+    """
+    from tools.approval import get_current_session_key
+
+    return get_current_session_key(default="")
+
+
+def _process_access_allowed(
+    session: ProcessSession,
+    caller_task_id: Optional[str],
+    caller_session_key: str,
+    surface: str,
+) -> bool:
+    """Whether this caller owns *session*.
+
+    Process IDs are only unguessable, not secret: they travel through tool
+    results, logs and notifications. Without this check any caller that learned
+    an ID could read another session's output, inject stdin, or kill it
+    (observation H-020).
+
+    The gateway session key is the ownership boundary — it already encodes
+    whichever of platform / chat / thread / user the deployment chose to
+    isolate on (``gateway.session.build_session_key``), so comparing user IDs
+    on top of it would override an operator who deliberately shares a thread
+    between participants. When neither side has a session identity (a one-shot
+    CLI run, tests) the sandbox the process was spawned in is all there is to
+    bind to; on a remote surface a half-identified pair is refused instead,
+    since that is where unrelated conversations share a process.
+    """
+    owner_key = (session.session_key or "").strip()
+    caller_key = (caller_session_key or "").strip()
+    if owner_key and caller_key:
+        return owner_key == caller_key
+
+    from tools.approval import REMOTE_TOOL_SURFACES
+
+    if (owner_key or caller_key) and surface in REMOTE_TOOL_SURFACES:
+        return False
+
+    from tools.terminal_tool import _resolve_container_task_id
+
+    # Both sides go through the resolver: it is what turns a raw tool-call
+    # task id into the sandbox the process actually runs in, and it is
+    # idempotent, so a stored (already-collapsed) id compares cleanly against a
+    # caller's raw one.
+    return _resolve_container_task_id(session.task_id) == _resolve_container_task_id(
+        caller_task_id
+    )
+
+
 def _handle_process(args, **kw):
     task_id = kw.get("task_id")
     action = args.get("action", "")
@@ -2923,8 +3056,7 @@ def _handle_process(args, **kw):
         # preview server) in addition to this task's own — they share the
         # gateway session_key and can block session reset (#29177).
         try:
-            from tools.approval import get_current_session_key
-            session_key = get_current_session_key(default="") or ""
+            session_key = _caller_session_key()
         except Exception:
             session_key = ""
         return json.dumps(
@@ -2936,9 +3068,38 @@ def _handle_process(args, **kw):
             },
             ensure_ascii=False,
         )
-    elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
+    elif action in _ID_ADDRESSED_ACTIONS:
         if not session_id:
             return tool_error(f"session_id is required for {action}")
+
+        # Surface policy first: it depends only on where the call came from, so
+        # it can answer without touching the registry and without revealing
+        # whether the ID resolves.
+        from tools.approval import get_current_tool_surface
+
+        caller_key = _caller_session_key()
+        surface = get_current_tool_surface()
+        denial = _stdin_policy_denial(action, surface)
+        if denial is not None:
+            logger.warning(
+                "process(action=%s) denied on %s surface (session %s)",
+                action, surface, _session_key_fingerprint(caller_key),
+            )
+            return denial
+
+        target = process_registry.get(session_id)
+        if target is None or not _process_access_allowed(
+            target, task_id, caller_key, surface
+        ):
+            if target is not None:
+                logger.warning(
+                    "process(action=%s) denied: %s belongs to session %s, caller is %s",
+                    action, session_id,
+                    _session_key_fingerprint(target.session_key),
+                    _session_key_fingerprint(caller_key),
+                )
+            return _process_not_found(session_id)
+
         if action == "poll":
             return json.dumps(_redact_process_result(process_registry.poll(session_id)), ensure_ascii=False)
         elif action == "log":

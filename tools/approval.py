@@ -30,6 +30,23 @@ from utils import env_var_enabled, is_truthy_value
 
 logger = logging.getLogger(__name__)
 
+
+def _log_session_key(session_key) -> str:
+    """Fingerprint a session key for logging.
+
+    Gateway session keys embed Discord/Slack channel, thread, and participant
+    IDs. Logs are persisted to disk, so raw keys must never appear in them;
+    every log line here that needs to tell sessions apart uses the run-local
+    fingerprint instead.
+    """
+    try:
+        from agent.redact import session_key_fingerprint
+
+        return session_key_fingerprint(session_key)
+    except Exception:  # pragma: no cover -- redaction must never break logging
+        return "redacted"
+
+
 # Freeze YOLO mode at module import time. Reading os.environ on every call
 # would allow any skill running inside the process to set this variable and
 # instantly bypass all approval checks — a prompt-injection escalation path.
@@ -271,6 +288,32 @@ def _is_gateway_approval_context() -> bool:
     if env_var_enabled("HERMES_GATEWAY_SESSION"):
         return True
     return bool(_get_session_platform())
+
+
+# Surfaces where nobody is sitting at the terminal the agent is driving: the
+# conversation arrives over a chat platform or a scheduled job, so a tool call
+# cannot be vetoed by a human watching it happen.
+REMOTE_TOOL_SURFACES = frozenset({"gateway", "cron"})
+
+
+def get_current_tool_surface() -> str:
+    """Return the surface driving the current tool call.
+
+    ``"cron"``    — an unattended scheduled job.
+    ``"gateway"`` — a messaging session (Discord/Telegram/Slack/...) or the
+                    API server.
+    ``"local"``   — CLI, TUI, or desktop: a human with their own terminal.
+
+    Tool policies that must bind only the remote surfaces key off this helper
+    instead of re-deriving the env/contextvar rules, so the gateway and cron
+    paths cannot drift apart from the approval decisions made here.
+    """
+    if _is_cron_approval_context():
+        return "cron"
+    if _is_gateway_approval_context():
+        return "gateway"
+    return "local"
+
 
 # Sensitive write targets that should trigger approval even when referenced
 # via shell expansions like $HOME or $HERMES_HOME, or by the resolved absolute
@@ -2368,6 +2411,200 @@ def human_wait_seconds(session_key: str | None = None) -> float:
         return total
 
 # =========================================================================
+# Approval outcomes, reason codes, and effect classes
+# =========================================================================
+# A denial has three genuinely different origins and the model must be able to
+# tell them apart: the guardian/policy denied it with no human involved, the
+# owner explicitly refused, or nobody answered. Attributing a policy deny to
+# the user tells the model something false about the user's stance and steers
+# it toward "ask the human to bypass this" instead of "find a safe route".
+#
+# ``outcome`` keeps its historical coarse values ("denied" / "timeout") for
+# existing consumers; ``approval_outcome`` carries the precise one.
+APPROVAL_OUTCOME_GUARDIAN_DENIED = "guardian_denied"
+APPROVAL_OUTCOME_USER_DENIED = "user_denied"
+APPROVAL_OUTCOME_TIMED_OUT = "timed_out"
+APPROVAL_OUTCOME_NOTIFY_FAILED = "notify_failed"
+APPROVAL_OUTCOME_NO_APPROVER = "no_approver"
+
+_LEGACY_OUTCOME_BY_APPROVAL_OUTCOME = {
+    APPROVAL_OUTCOME_GUARDIAN_DENIED: "denied",
+    APPROVAL_OUTCOME_USER_DENIED: "denied",
+    APPROVAL_OUTCOME_TIMED_OUT: "timeout",
+    APPROVAL_OUTCOME_NOTIFY_FAILED: "notify_failed",
+    APPROVAL_OUTCOME_NO_APPROVER: "blocked",
+}
+
+_REASON_CODE_SAFE_RE = re.compile(r"[^a-z0-9]+")
+_REASON_CODE_MAX_LEN = 48
+_UNCLASSIFIED_EFFECT = "unclassified"
+
+# Effect classes, most specific first. Each entry is (effect class, substrings
+# matched against the normalized reason code). Reason codes are derived from
+# pattern keys, which are static detector labels or tirith rule IDs — never
+# command text — so this table can never leak the blocked command.
+_EFFECT_CLASS_RULES = (
+    ("arbitrary_code_execution", ("execute_code", "fork_bomb", "shell_c",
+                                  "inline_code", "eval", "encoded_command")),
+    ("destructive_data", ("sql_drop", "sql_delete", "truncate", "mkfs",
+                          "format_filesystem", "disk_copy", "block_device")),
+    ("destructive_filesystem", ("delete", "remove_item", "rmdir", "erase",
+                                "overwrite")),
+    ("process_control", ("kill", "service", "systemctl", "shutdown",
+                         "reboot")),
+    ("permission_change", ("chmod", "chown", "permission", "writable",
+                           "sudo", "setuid")),
+    ("credential_exposure", ("credential", "secret", "token", "api_key",
+                             "password", "private_key", "env_file")),
+    ("network_egress", ("curl", "wget", "upload", "publish", "push",
+                        "exfil", "network", "http")),
+)
+
+_SAFE_ALTERNATIVES_BY_EFFECT_CLASS = {
+    "arbitrary_code_execution": (
+        "use the dedicated built-in tools (read_file / write_file / terminal "
+        "with a single explicit command) instead of a script that can spawn "
+        "its own subprocesses"
+    ),
+    "destructive_data": (
+        "read or export the data first (SELECT / dump to a file) and let the "
+        "user run the destructive statement themselves"
+    ),
+    "destructive_filesystem": (
+        "list what would be removed and report the exact paths instead of "
+        "deleting them"
+    ),
+    "process_control": (
+        "inspect process or service state (list / status / logs) and report "
+        "what you found instead of stopping or killing anything"
+    ),
+    "permission_change": (
+        "report the current permissions and the change that would be needed "
+        "instead of applying it"
+    ),
+    "credential_exposure": (
+        "work with the non-secret metadata only (key names, presence checks) "
+        "and never read or move the credential value"
+    ),
+    "network_egress": (
+        "keep the work local and report what would have been sent instead of "
+        "sending it"
+    ),
+    _UNCLASSIFIED_EFFECT: (
+        "narrow the operation to a read-only step, or report what you need "
+        "and let the user decide"
+    ),
+}
+
+
+def _normalize_reason_code(pattern_key) -> str:
+    """Turn a pattern key into a stable, log/model-safe reason code.
+
+    Pattern keys are the static detector descriptions ("recursive delete") or
+    tirith rule IDs ("tirith:some-rule"). Normalizing to a bounded
+    ``[a-z0-9_]`` token means that even if a future detector ever built a key
+    out of command text, no raw command could survive into the reason code.
+    """
+    text = str(pattern_key or "").strip().lower()
+    if not text:
+        return "unspecified"
+    code = _REASON_CODE_SAFE_RE.sub("_", text).strip("_")
+    if not code:
+        return "unspecified"
+    return code[:_REASON_CODE_MAX_LEN].rstrip("_")
+
+
+def _reason_codes_for(pattern_keys) -> list[str]:
+    """Deduplicated reason codes for the keys that triggered a denial."""
+    codes: list[str] = []
+    for key in pattern_keys or ():
+        code = _normalize_reason_code(key)
+        if code not in codes:
+            codes.append(code)
+    return codes or ["unspecified"]
+
+
+def _effect_class_for(reason_codes) -> str:
+    """Classify a denial by the kind of effect it would have had."""
+    for effect_class, needles in _EFFECT_CLASS_RULES:
+        for code in reason_codes or ():
+            if any(needle in code for needle in needles):
+                return effect_class
+    return _UNCLASSIFIED_EFFECT
+
+
+def _safe_alternative_for(effect_class: str) -> str:
+    """A vetted, non-bypassing alternative to suggest for *effect_class*."""
+    return _SAFE_ALTERNATIVES_BY_EFFECT_CLASS.get(
+        effect_class, _SAFE_ALTERNATIVES_BY_EFFECT_CLASS[_UNCLASSIFIED_EFFECT]
+    )
+
+
+def _deny_context(pattern_keys) -> dict:
+    """Redacted {reason codes, effect class, safe alternative} for a denial.
+
+    This is the only denial detail allowed to cross into model-facing text and
+    into the breaker side channel: it is derived from static detector labels,
+    so it carries no command text, no path, and no session identifier.
+    """
+    codes = _reason_codes_for(pattern_keys)
+    effect_class = _effect_class_for(codes)
+    return {
+        "reason_codes": codes,
+        "reason_code": codes[0],
+        "effect_class": effect_class,
+        "safe_alternative": _safe_alternative_for(effect_class),
+    }
+
+
+def _guardian_deny_message(context: dict, *, subject: str,
+                           breaker_addendum: str = "") -> str:
+    """Model-facing text for a denial that no human was asked about.
+
+    Deliberately says nothing about the user's stance, and does not tell the
+    model to abandon the goal — only that this *operation* is refused by
+    policy and that rewording it will be refused identically.
+    """
+    return (
+        f"BLOCKED by security policy: this {subject} was denied by the "
+        f"automated security reviewer (reason code: {context['reason_code']}, "
+        f"effect class: {context['effect_class']}). No approval request was "
+        "sent to anyone and nobody has refused it. Rephrasing the same "
+        "operation, or reaching the same effect through another command, is "
+        "denied the same way. Safe alternative to consider: "
+        f"{context['safe_alternative']}.{breaker_addendum}"
+    )
+
+
+def _classify_gateway_denial(decision: dict, *,
+                             smart_denied_for_owner: bool) -> str:
+    """Say who actually refused a gateway approval that came back negative.
+
+    A missing ``human_responded`` on a resolved decision means the resolution
+    did not come from :func:`_await_gateway_decision` — a policy wrapper
+    answered on its own. Combined with a guardian DENY that is what an
+    automatic denial looks like, and it must not be reported as the user's.
+    """
+    if not decision.get("resolved"):
+        return APPROVAL_OUTCOME_TIMED_OUT
+    if smart_denied_for_owner and not decision.get("human_responded", False):
+        return APPROVAL_OUTCOME_GUARDIAN_DENIED
+    return APPROVAL_OUTCOME_USER_DENIED
+
+
+def _smart_deny_is_final() -> bool:
+    """Whether a guardian DENY ends the decision with no human override.
+
+    ``approvals.smart_deny_final: true`` makes Smart Approval a complete local
+    decision — the deployment surface Hermes runs on (Discord) has no way to
+    turn a guardian DENY into a real approval prompt, so offering an owner
+    override there produces an unanswerable request. Defaults to false, which
+    keeps the historical owner-override behavior.
+    """
+    return is_truthy_value(_get_approval_config().get("smart_deny_final", False))
+
+
+# =========================================================================
 # Consecutive-denial circuit breaker for smart approvals
 # =========================================================================
 # Nothing stops the model from retrying variants of a smart-denied command —
@@ -2383,7 +2620,11 @@ def human_wait_seconds(session_key: str | None = None) -> float:
 # so prompt caching stays intact. Inspired by ChatGPT Work's auto-review
 # circuit breaker (3 consecutive denials).
 APPROVAL_BREAKER_METADATA_KEY = "approval_breaker"
-_APPROVAL_BREAKER_METADATA_VERSION = 1
+# v2 added the redacted denial detail (reason_code / effect_class /
+# safe_alternative) so the conversation loop can explain *what class* of
+# operation was refused and what to do instead, without ever seeing the
+# command. v1 carried only the tool name, count, and threshold.
+_APPROVAL_BREAKER_METADATA_VERSION = 2
 _APPROVAL_BREAKER_METADATA_TYPE = "consecutive_smart_denials"
 _denial_tally: dict[tuple[str, str], int] = {}
 # Plain dict with a small cap so an army of short-lived session/turn keys
@@ -2517,38 +2758,51 @@ def consume_approval_breaker_trip(
         return dict(metadata) if metadata is not None else None
 
 
-def _denial_breaker_metadata(session_key: str) -> dict | None:
+def _denial_breaker_metadata(session_key: str,
+                             context: dict | None = None) -> dict | None:
     """Return structured metadata once the denial breaker trips.
 
     This is deliberately derived from the in-process tally rather than from
     any model-facing text. Callers add it to the result returned by the
     approval guard for observability; structural control is recorded
     separately by :func:`_record_approval_breaker_trip`.
+
+    *context* is the redacted denial detail from :func:`_deny_context`. It
+    rides along so the conversation loop can name the refused effect class and
+    a safe alternative in its final message; it never contains command text,
+    paths, or session identifiers.
     """
     with _lock:
         count = _denial_tally.get(_denial_tally_key(session_key), 0)
     threshold = _get_denial_breaker_threshold()
     if threshold <= 0 or count < threshold:
         return None
-    return {
+    metadata = {
         "version": _APPROVAL_BREAKER_METADATA_VERSION,
         "type": _APPROVAL_BREAKER_METADATA_TYPE,
         "tripped": True,
         "count": count,
         "threshold": threshold,
     }
+    if context:
+        metadata["reason_code"] = context["reason_code"]
+        metadata["effect_class"] = context["effect_class"]
+        metadata["safe_alternative"] = context["safe_alternative"]
+    return metadata
 
 
-def _attach_denial_breaker_metadata(result: dict, session_key: str) -> dict:
+def _attach_denial_breaker_metadata(result: dict, session_key: str,
+                                    context: dict | None = None) -> dict:
     """Attach a diagnostic breaker marker to *result* when tripped."""
-    metadata = _denial_breaker_metadata(session_key)
+    metadata = _denial_breaker_metadata(session_key, context)
     if metadata is not None:
         result[APPROVAL_BREAKER_METADATA_KEY] = metadata
         _record_approval_breaker_trip(session_key, metadata)
     return result
 
 
-def _denial_breaker_addendum(session_key: str) -> str:
+def _denial_breaker_addendum(session_key: str,
+                             context: dict | None = None) -> str:
     """Return the escalated hard-stop text when the breaker has tripped.
 
     Read-only: callers increment via :func:`_record_denial` on the guardian
@@ -2556,22 +2810,36 @@ def _denial_breaker_addendum(session_key: str) -> str:
     configured threshold. Returns '' below the threshold (or when
     disabled), otherwise a leading-space addendum the caller appends
     verbatim to the deny message returned to the model.
+
+    The text never routes the model toward a manual bypass: on the surfaces
+    this breaker fires on, a guardian DENY creates no pending approval, so
+    "use /approve" is an instruction the user cannot act on, and "run it in
+    your own terminal" hands an operation the reviewer just refused — possibly
+    one that originated in injected content — to the human to execute blind.
     """
-    metadata = _denial_breaker_metadata(session_key)
+    metadata = _denial_breaker_metadata(session_key, context)
     if metadata is None:
         return ""
     count = metadata["count"]
     threshold = metadata["threshold"]
     logger.warning(
         "Smart-approval circuit breaker tripped for session %s: "
-        "%d consecutive denials (threshold %d)",
-        session_key, count, threshold,
+        "%d consecutive denials (threshold %d, effect class %s)",
+        _log_session_key(session_key), count, threshold,
+        metadata.get("effect_class", _UNCLASSIFIED_EFFECT),
     )
+    detail = ""
+    if context:
+        detail = (
+            f" Refused effect class: {context['effect_class']} "
+            f"(reason code: {context['reason_code']}). Safe alternative: "
+            f"{context['safe_alternative']}."
+        )
     return (
         f" CIRCUIT BREAKER: {count} consecutive commands were blocked by "
         "the security reviewer. STOP attempting variations of this "
-        "operation. Report the blocked operation to the user and either "
-        "ask them to run it manually or use /approve."
+        f"operation.{detail} Tell the user which class of operation was "
+        "refused and continue with work that does not need it."
     )
 
 # =========================================================================
@@ -2695,7 +2963,7 @@ def _release_permission_mode_dependents(session_key: str) -> None:
     except Exception:
         logger.debug(
             "Failed to release permission-mode dependent resources for %s",
-            session_key,
+            _log_session_key(session_key),
             exc_info=True,
         )
 
@@ -2841,12 +3109,25 @@ def load_permanent_allowlist() -> set:
 
 
 def save_permanent_allowlist(patterns: set):
-    """Save permanently allowed command patterns to config."""
+    """Save permanently allowed command patterns to config.
+
+    ``command_allowlist`` is a protected safety setting: the config writers
+    refuse it on the messaging and cron surfaces so an agent turn cannot
+    permanently widen its own gate (H-018). Every caller here is the
+    ``choice == "always"`` branch of an approval prompt — a human explicitly
+    granting the pattern — plus ``hermes approvals suggest --apply``, which the
+    terminal guard already refuses on those surfaces. So this write is marked
+    owner-initiated; the entries themselves come from ``_permanent_approved``,
+    which only ``approve_permanent()`` (same branches) ever adds to.
+    """
     try:
         from hermes_cli.config import load_config, save_config
+        from tools.safety_config_guard import owner_initiated_safety_config_change
+
         config = load_config()
         config["command_allowlist"] = list(patterns)
-        save_config(config)
+        with owner_initiated_safety_config_change():
+            save_config(config)
     except Exception as e:
         logger.warning("Could not save allowlist: %s", e)
 
@@ -3457,6 +3738,11 @@ def _run_approval_gate(
                     ),
                     "pattern_key": pattern_key,
                     "description": description,
+                    "outcome": "timeout" if not resolved else "denied",
+                    "approval_outcome": (
+                        APPROVAL_OUTCOME_TIMED_OUT if not resolved
+                        else APPROVAL_OUTCOME_USER_DENIED
+                    ),
                     "user_consent": False,
                 }
 
@@ -3521,6 +3807,7 @@ def _run_approval_gate(
             "pattern_key": pattern_key,
             "description": description,
             "outcome": "timeout",
+            "approval_outcome": APPROVAL_OUTCOME_TIMED_OUT,
             "user_consent": False,
         }
 
@@ -3535,6 +3822,7 @@ def _run_approval_gate(
             "pattern_key": pattern_key,
             "description": description,
             "outcome": "denied",
+            "approval_outcome": APPROVAL_OUTCOME_USER_DENIED,
             "user_consent": False,
         }
 
@@ -3760,10 +4048,17 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     the execute_code guard (``check_execute_code_guard``) so the fiddly
     heartbeat-polling wait loop lives in one place.
 
-    Returns ``{"resolved": bool, "choice": str|None}`` on completion, or
-    ``{"resolved": False, "choice": None, "notify_failed": True}`` if the
-    notify callback raised.  Persistence of an approved choice and building
-    the final tool-facing result dict remain the caller's responsibility.
+    Returns ``{"resolved": bool, "choice": str|None, "human_responded": bool}``
+    on completion, or ``{"resolved": False, "choice": None,
+    "notify_failed": True}`` if the notify callback raised.  Persistence of an
+    approved choice and building the final tool-facing result dict remain the
+    caller's responsibility.
+
+    ``human_responded`` says a person actually answered this request. Wrappers
+    that resolve an approval without asking anyone (a policy plugin that turns
+    a guardian DENY into an immediate ``deny``) return a dict without the key,
+    and callers read a missing key as "no human was asked" so they never
+    attribute a policy decision to the user.
     """
     command = approval_data.get("command", "")
     description = approval_data.get("description", "")
@@ -3845,7 +4140,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                 logger.info(
                     "Approval wait interrupted by user signal — "
                     "returning deny for session %s",
-                    session_key,
+                    _log_session_key(session_key),
                 )
                 entry.result = "deny"
                 entry.event.set()
@@ -3877,7 +4172,15 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         surface=surface,
         choice=_outcome,
     )
-    return {"resolved": resolved, "choice": choice, "reason": entry.reason}
+    return {
+        "resolved": resolved,
+        "choice": choice,
+        "reason": entry.reason,
+        # Every resolution reaching this point came from a person: the gateway
+        # /approve or /deny handler, a platform button, or the user's own
+        # interrupt signal. A timeout means nobody answered.
+        "human_responded": resolved,
+    }
 
 
 def check_all_command_guards(command: str, env_type: str,
@@ -3980,18 +4283,25 @@ def check_all_command_guards(command: str, env_type: str,
                             ),
                         }
                 except ImportError:
-                    # Tirith not installed. Honour security.tirith_fail_open:
-                    # the default (True) allows as before, but when an operator
-                    # has explicitly opted into fail-closed the command cannot
-                    # be silently allowed — and a cron session has no user to
-                    # approve it, so fail-closed means block (mirrors the
-                    # fail-closed synthesis in the main flow below; see #20733).
-                    _cron_fail_open = True  # safe default if config is unreadable
+                    # Tirith not installed. Cron is a remote surface, so honour
+                    # the *gateway* fail-open policy, not the global one:
+                    # security.tirith_fail_open_gateway (default false) governs
+                    # remote surfaces and can never be more permissive than the
+                    # global security.tirith_fail_open — this mirrors
+                    # tirith_security._effective_fail_open("cron"). With the
+                    # defaults, a missing scanner on cron fails closed, and a
+                    # cron session has no user to approve, so fail-closed means
+                    # block (see #20733). Reading only the global key here was a
+                    # bypass: it defaults True, so an unavailable scanner
+                    # silently allowed the command on cron.
+                    _cron_fail_open = True  # scanner disabled / config unreadable → allow
                     try:
                         from hermes_cli.config import load_config_readonly as _load_cfg
                         _sec = (_load_cfg() or {}).get("security", {}) or {}
                         if _sec.get("tirith_enabled", True):
-                            _cron_fail_open = _sec.get("tirith_fail_open", True)
+                            _cron_fail_open = bool(
+                                _sec.get("tirith_fail_open_gateway", False)
+                            ) and bool(_sec.get("tirith_fail_open", True))
                     except Exception:
                         pass
                     if not _cron_fail_open:
@@ -4063,6 +4373,46 @@ def check_all_command_guards(command: str, env_type: str,
 
     session_key = get_current_session_key()
 
+    # A *fail-closed* Tirith verdict is categorically different from a normal
+    # block: check_command_security could not scan the command at all on a
+    # remote surface (gateway/cron) where security.tirith_fail_open_gateway is
+    # false — tirith was missing, timed out, or its crash breaker is open. There
+    # is no finding for a human, or the Smart Approval guardian, to inspect and
+    # knowingly approve. "Could not scan" must not be downgraded to an
+    # approvable warning: route it straight to a hard deny so it never reaches
+    # the smart auto-approve path (verdict == "approve") or the gateway/ask
+    # approval prompt below, where an owner or the guardian could wave it
+    # through. (The cron-deny branch above hard-denies on its own path; this
+    # covers the block synthesized for a gateway turn.)
+    if tirith_result.get("action") == "block" and tirith_result.get("fail_closed") is True:
+        _fc_findings = tirith_result.get("findings") or []
+        _fc_rule_id = _fc_findings[0].get("rule_id", "unknown") if _fc_findings else "unknown"
+        _fc_key = f"tirith:{_fc_rule_id}"
+        _fc_desc = _format_tirith_description(tirith_result)
+        _fc_ctx = _deny_context([_fc_key])
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED by security policy: "
+                + _fc_desc
+                + " This command could not be security-scanned and "
+                "security.tirith_fail_open_gateway is false, so it cannot be run "
+                "— or approved — from a chat or scheduled session. No approval "
+                "request was sent to anyone and nobody has refused it."
+            ),
+            "tirith_fail_closed": True,
+            "pattern_key": _fc_key,
+            "description": _fc_desc,
+            "outcome": _LEGACY_OUTCOME_BY_APPROVAL_OUTCOME[
+                APPROVAL_OUTCOME_GUARDIAN_DENIED],
+            "approval_outcome": APPROVAL_OUTCOME_GUARDIAN_DENIED,
+            "user_consent": None,
+            "reason_code": _fc_ctx["reason_code"],
+            "reason_codes": _fc_ctx["reason_codes"],
+            "effect_class": _fc_ctx["effect_class"],
+            "safe_alternative": _fc_ctx["safe_alternative"],
+        }
+
     # Tirith block/warn → approvable warning with rich findings.
     # Previously, tirith "block" was a hard block with no approval prompt.
     # Now both block and warn go through the approval flow so users can
@@ -4109,16 +4459,33 @@ def check_all_command_guards(command: str, env_type: str,
             return {"approved": True, "message": None,
                     "smart_approved": True,
                     "description": combined_desc_for_llm}
-        elif verdict == "deny" and not (is_cli or is_gateway or is_ask):
+        elif verdict == "deny" and (
+            _smart_deny_is_final() or not (is_cli or is_gateway or is_ask)
+        ):
+            # No human is asked on this path — either there is no approval
+            # surface at all, or the deployment made a guardian DENY final.
+            # The message must therefore say "policy refused this", never
+            # "the user refused this".
             _record_denial(session_key)
-            breaker_addendum = _denial_breaker_addendum(session_key)
+            deny_context = _deny_context([key for key, _, _ in warnings])
+            breaker_addendum = _denial_breaker_addendum(session_key, deny_context)
             return _attach_denial_breaker_metadata({
                 "approved": False,
-                "message": f"BLOCKED by smart approval: {combined_desc_for_llm}. "
-                           "The command was assessed as genuinely dangerous. "
-                           f"Do NOT retry.{breaker_addendum}",
+                "message": _guardian_deny_message(
+                    deny_context, subject="command",
+                    breaker_addendum=breaker_addendum,
+                ),
                 "smart_denied": True,
-            }, session_key)
+                "pattern_key": warnings[0][0],
+                "description": combined_desc_for_llm,
+                "outcome": _LEGACY_OUTCOME_BY_APPROVAL_OUTCOME[
+                    APPROVAL_OUTCOME_GUARDIAN_DENIED],
+                "approval_outcome": APPROVAL_OUTCOME_GUARDIAN_DENIED,
+                "reason_code": deny_context["reason_code"],
+                "reason_codes": deny_context["reason_codes"],
+                "effect_class": deny_context["effect_class"],
+                "safe_alternative": deny_context["safe_alternative"],
+            }, session_key, deny_context)
         elif verdict == "deny":
             # Guardian DENY that falls through to a one-operation human
             # override still counts toward the consecutive-denial breaker;
@@ -4204,7 +4571,37 @@ def check_all_command_guards(command: str, env_type: str,
                 # that names the agent's most common evasion paths (retry,
                 # rephrase, achieve the same outcome via a different command).
                 # See issue #24912 for the original incident.
-                if not resolved:
+                #
+                # A guardian DENY that a policy wrapper resolved without ever
+                # asking anyone is a third case: nobody refused, so the user
+                # attribution below would be a lie about the user's stance.
+                deny_context = _deny_context(all_keys)
+                approval_outcome = _classify_gateway_denial(
+                    decision, smart_denied_for_owner=smart_denied_for_owner
+                )
+                if approval_outcome == APPROVAL_OUTCOME_GUARDIAN_DENIED:
+                    breaker_addendum = _denial_breaker_addendum(
+                        session_key, deny_context
+                    )
+                    return _attach_denial_breaker_metadata({
+                        "approved": False,
+                        "message": _guardian_deny_message(
+                            deny_context, subject="command",
+                            breaker_addendum=breaker_addendum,
+                        ),
+                        "pattern_key": primary_key,
+                        "description": combined_desc,
+                        "outcome": _LEGACY_OUTCOME_BY_APPROVAL_OUTCOME[
+                            approval_outcome],
+                        "approval_outcome": approval_outcome,
+                        "smart_denied": True,
+                        "user_consent": None,
+                        "reason_code": deny_context["reason_code"],
+                        "reason_codes": deny_context["reason_codes"],
+                        "effect_class": deny_context["effect_class"],
+                        "safe_alternative": deny_context["safe_alternative"],
+                    }, session_key, deny_context)
+                if approval_outcome == APPROVAL_OUTCOME_TIMED_OUT:
                     reason = "timed out without user response"
                     timeout_addendum = " Silence is not consent."
                     outcome = "timeout"
@@ -4218,7 +4615,9 @@ def check_all_command_guards(command: str, env_type: str,
                 reason_addendum = ""
                 if outcome == "denied" and deny_reason:
                     reason_addendum = f' Reason given by the user: "{deny_reason}".'
-                breaker_addendum = _denial_breaker_addendum(session_key)
+                breaker_addendum = _denial_breaker_addendum(
+                    session_key, deny_context
+                )
                 return _attach_denial_breaker_metadata({
                     "approved": False,
                     "message": (
@@ -4233,9 +4632,14 @@ def check_all_command_guards(command: str, env_type: str,
                     "pattern_key": primary_key,
                     "description": combined_desc,
                     "outcome": outcome,
+                    "approval_outcome": approval_outcome,
                     "user_consent": False,
                     "deny_reason": deny_reason,
-                }, session_key)
+                    "reason_code": deny_context["reason_code"],
+                    "reason_codes": deny_context["reason_codes"],
+                    "effect_class": deny_context["effect_class"],
+                    "safe_alternative": deny_context["safe_alternative"],
+                }, session_key, deny_context)
 
             # A smart-DENY owner override is always one operation, even if an
             # older client returns "session" or "always". Manual and ESCALATE
@@ -4315,8 +4719,10 @@ def check_all_command_guards(command: str, env_type: str,
         choice=choice,
     )
 
+    cli_deny_context = _deny_context(all_keys)
+
     if choice == "timeout":
-        breaker_addendum = _denial_breaker_addendum(session_key)
+        breaker_addendum = _denial_breaker_addendum(session_key, cli_deny_context)
         return _attach_denial_breaker_metadata({
             "approved": False,
             "message": (
@@ -4331,11 +4737,16 @@ def check_all_command_guards(command: str, env_type: str,
             "pattern_key": primary_key,
             "description": combined_desc,
             "outcome": "timeout",
+            "approval_outcome": APPROVAL_OUTCOME_TIMED_OUT,
             "user_consent": False,
-        }, session_key)
+            "reason_code": cli_deny_context["reason_code"],
+            "reason_codes": cli_deny_context["reason_codes"],
+            "effect_class": cli_deny_context["effect_class"],
+            "safe_alternative": cli_deny_context["safe_alternative"],
+        }, session_key, cli_deny_context)
 
     if choice == "deny":
-        breaker_addendum = _denial_breaker_addendum(session_key)
+        breaker_addendum = _denial_breaker_addendum(session_key, cli_deny_context)
         return _attach_denial_breaker_metadata({
             "approved": False,
             "message": (
@@ -4349,8 +4760,13 @@ def check_all_command_guards(command: str, env_type: str,
             "pattern_key": primary_key,
             "description": combined_desc,
             "outcome": "denied",
+            "approval_outcome": APPROVAL_OUTCOME_USER_DENIED,
             "user_consent": False,
-        }, session_key)
+            "reason_code": cli_deny_context["reason_code"],
+            "reason_codes": cli_deny_context["reason_codes"],
+            "effect_class": cli_deny_context["effect_class"],
+            "safe_alternative": cli_deny_context["safe_alternative"],
+        }, session_key, cli_deny_context)
 
     # Smart-DENY owner overrides are one-operation scoped. Preserve existing
     # persistence for manual mode and smart ESCALATE.
@@ -4470,23 +4886,33 @@ def check_execute_code_guard(code: str, env_type: str,
         if verdict == "approve":
             _reset_denials(session_key)
             logger.debug("Smart approval: auto-approved execute_code for session %s",
-                         session_key)
+                         _log_session_key(session_key))
             return {"approved": True, "message": None,
                     "smart_approved": True, "description": description}
-        if verdict == "deny" and not (is_gateway or is_ask):
+        if verdict == "deny" and (
+            _smart_deny_is_final() or not (is_gateway or is_ask)
+        ):
             _record_denial(session_key)
-            breaker_addendum = _denial_breaker_addendum(session_key)
+            deny_context = _deny_context([pattern_key])
+            breaker_addendum = _denial_breaker_addendum(session_key, deny_context)
             return _attach_denial_breaker_metadata({
                 "approved": False,
-                "message": ("BLOCKED by smart approval: execute_code script "
-                            "execution was assessed as genuinely dangerous. "
-                            f"Do NOT retry.{breaker_addendum}"),
+                "message": _guardian_deny_message(
+                    deny_context, subject="execute_code script",
+                    breaker_addendum=breaker_addendum,
+                ),
                 "smart_denied": True,
                 "pattern_key": pattern_key,
                 "description": description,
-                "outcome": "denied",
-                "user_consent": False,
-            }, session_key)
+                "outcome": _LEGACY_OUTCOME_BY_APPROVAL_OUTCOME[
+                    APPROVAL_OUTCOME_GUARDIAN_DENIED],
+                "approval_outcome": APPROVAL_OUTCOME_GUARDIAN_DENIED,
+                "user_consent": None,
+                "reason_code": deny_context["reason_code"],
+                "reason_codes": deny_context["reason_codes"],
+                "effect_class": deny_context["effect_class"],
+                "safe_alternative": deny_context["safe_alternative"],
+            }, session_key, deny_context)
         if verdict == "deny":
             # Guardian DENY that falls through to a one-operation human
             # override still counts toward the consecutive-denial breaker;
@@ -4568,12 +4994,34 @@ def check_execute_code_guard(code: str, env_type: str,
     deny_reason = decision.get("reason")
 
     if not resolved or choice is None or choice == "deny":
+        deny_context = _deny_context([pattern_key])
+        approval_outcome = _classify_gateway_denial(
+            decision, smart_denied_for_owner=smart_denied_for_owner
+        )
+        breaker_addendum = _denial_breaker_addendum(session_key, deny_context)
+        if approval_outcome == APPROVAL_OUTCOME_GUARDIAN_DENIED:
+            return _attach_denial_breaker_metadata({
+                "approved": False,
+                "message": _guardian_deny_message(
+                    deny_context, subject="execute_code script",
+                    breaker_addendum=breaker_addendum,
+                ),
+                "pattern_key": pattern_key,
+                "description": description,
+                "outcome": _LEGACY_OUTCOME_BY_APPROVAL_OUTCOME[approval_outcome],
+                "approval_outcome": approval_outcome,
+                "smart_denied": True,
+                "user_consent": None,
+                "reason_code": deny_context["reason_code"],
+                "reason_codes": deny_context["reason_codes"],
+                "effect_class": deny_context["effect_class"],
+                "safe_alternative": deny_context["safe_alternative"],
+            }, session_key, deny_context)
         reason = "timed out without user response" if not resolved else "denied by user"
         addendum = " Silence is not consent." if not resolved else ""
         reason_addendum = ""
         if resolved and choice == "deny" and deny_reason:
             reason_addendum = f' Reason given by the user: "{deny_reason}".'
-        breaker_addendum = _denial_breaker_addendum(session_key)
         return _attach_denial_breaker_metadata({
             "approved": False,
             "message": (
@@ -4585,9 +5033,14 @@ def check_execute_code_guard(code: str, env_type: str,
             "pattern_key": pattern_key,
             "description": description,
             "outcome": "timeout" if not resolved else "denied",
+            "approval_outcome": approval_outcome,
             "user_consent": False,
             "deny_reason": deny_reason,
-        }, session_key)
+            "reason_code": deny_context["reason_code"],
+            "reason_codes": deny_context["reason_codes"],
+            "effect_class": deny_context["effect_class"],
+            "safe_alternative": deny_context["safe_alternative"],
+        }, session_key, deny_context)
 
     # Never persist a smart-DENY override under the coarse execute_code key;
     # doing so would approve unrelated future scripts. Manual and ESCALATE
@@ -4645,7 +5098,7 @@ def request_elicitation_consent(
             logger.warning(
                 "Elicitation requested in gateway session %s but no "
                 "notify_cb is registered — failing closed",
-                session_key,
+                _log_session_key(session_key),
             )
             return "decline"
 

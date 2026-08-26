@@ -1958,6 +1958,30 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     except ImportError:
         pass
 
+    # Same treatment for a task whose turn is still running. "Inactive" here has
+    # to mean "no work in flight", not "no tool call recently": a turn can sit
+    # inside one model API call for many minutes (local backends prefill a large
+    # context for five to eight), and retiring the environment underneath it
+    # regenerates the sandbox and drops the session cwd and shell state the turn
+    # had built up. Environments only -- a background process whose tracked
+    # wrapper exited early loses its handle regardless of this.
+    #
+    # _last_activity is keyed by the collapsed container id, except where a
+    # per-session surface cached an env under the raw task_id, so protect both
+    # spellings. Resolve before taking _env_lock: the container-alias lookup
+    # takes its own lock and the sweep must not nest the two.
+    try:
+        from tools.env_activity import active_task_ids
+        busy_task_ids = set()
+        for raw_task_id in active_task_ids():
+            busy_task_ids.add(raw_task_id)
+            busy_task_ids.add(_resolve_container_task_id(raw_task_id))
+        for task_id in list(_last_activity.keys()):
+            if task_id in busy_task_ids:
+                _last_activity[task_id] = current_time  # Turn still running
+    except ImportError:
+        pass
+
     # Phase 1: collect stale entries and remove them from tracking dicts while
     # holding the lock.  Do NOT call env.cleanup() inside the lock -- Modal and
     # Docker teardown can block for 10-15s, which would stall every concurrent
@@ -2369,6 +2393,185 @@ def _command_requires_pipe_stdin(command: str) -> bool:
     )
 
 
+# Programs that sit and read commands from their stdin when started without a
+# script to run: a PTY-backed one turns into a general command channel that
+# only the very first `terminal` call was ever checked against.
+_INTERACTIVE_SHELL_PROGRAMS = frozenset({
+    "ash", "bash", "csh", "dash", "fish", "ksh", "sh", "tcsh", "zsh",
+})
+_INTERACTIVE_REPL_PROGRAMS = frozenset({
+    "bpython", "clojure", "deno", "erl", "ghci", "iex", "ipython", "ipython3",
+    "irb", "julia", "lua", "node", "perl", "php", "pry", "python", "python2",
+    "python3", "R", "ruby", "scala", "swift",
+})
+# Flags that hand the program its work upfront, so it never reads commands
+# from stdin. Long forms plus the short letters (`bash -lc`, `python -m`) that
+# arrive bundled into one cluster.
+_WORK_SUPPLYING_LONG_FLAGS = frozenset({
+    "--command", "--eval", "--exec", "--file", "--module", "--run",
+})
+_WORK_SUPPLYING_SHORT_FLAGS = frozenset("cem")
+_ARGV_PASSTHROUGH_WRAPPERS = frozenset({
+    "command", "env", "exec", "nice", "stdbuf", "sudo", "time",
+})
+_STATEMENT_SPLIT_RE = re.compile(r"(?:&&|\|\||[;&\n])")
+
+_INTERACTIVE_SHELL_DENIED_REASON = "interactive_shell_disabled_on_remote_surface"
+
+
+def _segment_starts_interactive_program(segment: str) -> bool:
+    """Whether *segment* starts a shell/REPL that would read commands from stdin."""
+    segment = segment.strip()
+    if not segment or "<" in segment:
+        # A redirect feeds the program a file instead of the terminal.
+        return False
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return False
+    # Skip leading env assignments and the wrappers that pass their argv
+    # straight through, so `env FOO=1 bash` reads as `bash`.
+    while tokens and (
+        _looks_like_env_assignment(tokens[0])
+        or os.path.basename(tokens[0]) in _ARGV_PASSTHROUGH_WRAPPERS
+    ):
+        tokens.pop(0)
+    if not tokens:
+        return False
+
+    program = os.path.basename(tokens[0])
+    if program not in _INTERACTIVE_SHELL_PROGRAMS and program not in _INTERACTIVE_REPL_PROGRAMS:
+        return False
+
+    # Anything that survives the loop was given no work and no script, which
+    # leaves stdin as the only place the program can get its commands. An
+    # explicit `-i`/`-s` never overrides a `-c`: `bash -ic 'cmd'` still runs
+    # that one command and exits.
+    for arg in tokens[1:]:
+        if arg == "-":
+            continue  # reads the program from stdin — still a stdin channel
+        if arg.startswith("--"):
+            if arg in _WORK_SUPPLYING_LONG_FLAGS:
+                return False
+        elif arg.startswith("-") and len(arg) > 1:
+            if set(arg[1:]) & _WORK_SUPPLYING_SHORT_FLAGS:
+                return False
+        else:
+            return False  # a script/file argument — it runs and exits
+    return True
+
+
+def _starts_interactive_shell(command: str) -> bool:
+    """Whether *command* launches an interactive shell or REPL.
+
+    Only the head of each pipeline is considered: anything further down reads
+    the pipe, not the terminal, so it is not a command channel.
+    """
+    if not command:
+        return False
+    for statement in _STATEMENT_SPLIT_RE.split(_strip_quotes(command)):
+        if _segment_starts_interactive_program(statement.split("|")[0]):
+            return True
+    return False
+
+
+def _interactive_shell_denial(command: str, pty: bool) -> Optional[str]:
+    """Refuse a PTY shell/REPL launch on the messaging and cron surfaces.
+
+    A PTY-backed shell or REPL is a command channel: only its launch line is
+    ever checked, and every later keystroke arrives through
+    ``process(action='write'/'submit')``, which runs no guards at all
+    (observation H-017). Those stdin actions are disabled on the same surfaces
+    (see ``tools/process_registry.py``); refusing the launch keeps the agent
+    from parking a process it can never talk to, and closes the half of the
+    bypass that a future stdin relaxation must not silently reopen.
+
+    Returns ``None`` when the launch is allowed.
+    """
+    if not pty or not _starts_interactive_shell(command):
+        return None
+
+    from tools.approval import REMOTE_TOOL_SURFACES, get_current_tool_surface
+
+    surface = get_current_tool_surface()
+    if surface not in REMOTE_TOOL_SURFACES:
+        return None
+
+    # Redact before previewing: the launch line can carry inline secrets
+    # (``env OPENAI_API_KEY=sk-... bash``) and this warning lands in the
+    # persisted gateway log. force=True keeps the safety boundary redacting even
+    # if the operator disabled global log redaction; code_file=True skips the
+    # ENV-assignment/JSON false positives while still masking prefixed keys,
+    # auth headers, JWTs and URL credentials. Redaction runs first so a secret
+    # straddling the 200-char preview cut cannot leak its tail (H-014).
+    from agent.redact import redact_sensitive_text
+    logger.warning(
+        "Blocked interactive shell/REPL launch on %s surface (command: %s)",
+        surface,
+        _safe_command_preview(redact_sensitive_text(command, force=True, code_file=True)),
+    )
+    return json.dumps({
+        "output": "",
+        "exit_code": -1,
+        "error": (
+            f"Blocked: interactive shells and REPLs cannot be started on the "
+            f"{surface} surface. Their launch command is the only thing that gets "
+            "checked; everything typed in afterwards would skip the guards. Run "
+            "each step as its own terminal call instead."
+        ),
+        "status": "blocked",
+        "reason_code": _INTERACTIVE_SHELL_DENIED_REASON,
+        "surface": surface,
+        "alternative": {
+            "tool": "terminal",
+            "note": (
+                "Send the work as a complete command (pty=false), e.g. "
+                "python -c '<code>' or bash -lc '<script>'. For a multi-step "
+                "session, issue one terminal call per step."
+            ),
+        },
+    }, ensure_ascii=False)
+
+
+def _safety_config_change_denial(command: str) -> Optional[str]:
+    """Refuse a command that would rewrite the harness's own safety settings.
+
+    The approval mode, denial breaker, Tirith switches and toolset surface are
+    what decide whether the *next* command gets checked at all, so a turn on the
+    messaging or cron surface is not allowed to move them (observation H-018).
+    Config-file write guards alone miss this: ``hermes config set`` reaches the
+    same values through the CLI. Ordinary ``hermes config set`` calls on other
+    keys are untouched and still take the normal approval path.
+
+    Returns ``None`` when the command is allowed.
+    """
+    from tools.safety_config_guard import (
+        find_safety_config_change_in_command,
+        safety_config_denial_payload,
+    )
+
+    matched = find_safety_config_change_in_command(command)
+    if matched is None:
+        return None
+
+    from tools.approval import REMOTE_TOOL_SURFACES, get_current_tool_surface
+
+    surface = get_current_tool_surface()
+    if surface not in REMOTE_TOOL_SURFACES:
+        return None
+
+    # ``matched`` comes from the static protected table, never from the
+    # command text, so this line cannot be used to write attacker-chosen
+    # content into the log.
+    logger.warning(
+        "Blocked safety-configuration change on %s surface (setting: %s)",
+        surface, matched,
+    )
+    return json.dumps(
+        safety_config_denial_payload(matched, surface), ensure_ascii=False
+    )
+
+
 _SHELL_LEVEL_BACKGROUND_RE = re.compile(
     r"(?:^|[;&|]\s*|&&\s*|\|\|\s*|\$\(\s*)(?:nohup|disown|setsid)\b", re.IGNORECASE | re.MULTILINE
 )
@@ -2667,6 +2870,14 @@ def terminal_tool(
                     "error": guidance,
                     "status": "error",
                 }, ensure_ascii=False)
+
+        interactive_denial = _interactive_shell_denial(command, pty)
+        if interactive_denial is not None:
+            return interactive_denial
+
+        safety_config_denial = _safety_config_change_denial(command)
+        if safety_config_denial is not None:
+            return safety_config_denial
 
         # Start cleanup thread
         _start_cleanup_thread()

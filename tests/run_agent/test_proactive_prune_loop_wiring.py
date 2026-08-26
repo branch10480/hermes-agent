@@ -1,14 +1,20 @@
-"""Behavioral tests for the post-tool proactive tool-result prune wiring.
+"""Behavioral tests for the proactive tool-result prune wiring.
 
-The conversation loop's post-tool gate now has a prune arm inside the
+The conversation loop's post-tool gate has a prune arm inside the
 ``elif agent.compression_enabled`` branch: when full compression does NOT
 fire (the usual case on a large-window model), the deterministic no-LLM
-prune gets one shot per tool iteration, committing only when the engine
-returns a NEW list object with a non-zero prune count.
+prune becomes eligible.
+
+The arm only RECORDS that eligibility. The rewrite itself is deferred to the
+turn boundary, after the turn's last API call, because a commit invalidates
+the provider's cached prefix from the earliest rewritten message forward —
+between two calls of a live turn that is a cold re-prefill the user waits
+through. The commit still honours the same contract: it replaces ``messages``
+only when the engine returns a NEW list object with a non-zero prune count.
 
 These tests drive ``run_conversation()`` through real tool iterations and pin:
-- the prune is consulted when compression stands down;
-- a committed prune replaces ``messages`` for subsequent iterations;
+- the prune is consulted once, at the boundary, when compression stands down;
+- a committed prune reaches the finished transcript;
 - a no-op (input object returned) commits nothing;
 - a compressor WITHOUT the method (plugin engine predating the hook /
   SimpleNamespace test double) does not raise — getattr-guarded;
@@ -155,7 +161,9 @@ class TestProactivePruneLoopWiring:
         compress.assert_called_once()
         agent.context_compressor.prune_tool_results_only.assert_not_called()
 
-    def test_prune_consulted_when_compression_stands_down(self, agent):
+    def test_prune_consulted_once_at_the_turn_boundary(self, agent):
+        """Three eligible tool iterations collapse into a single boundary
+        consultation, so the turn pays at most one cache break."""
         calls = []
 
         def _prune(messages, current_tokens=None):
@@ -165,8 +173,8 @@ class TestProactivePruneLoopWiring:
         agent.context_compressor.prune_tool_results_only = _prune
         result = _run_tool_loop(agent, n_tool_iterations=3)
         assert result["completed"] is True
-        assert len(calls) == 3  # one shot per tool iteration
-        assert all(t == 120_000 for t in calls)  # fed the real usage reading
+        assert len(calls) == 1
+        assert calls == [120_000]  # fed the real usage reading
 
     def test_committed_prune_replaces_messages(self, agent):
         marker = "[old tool output pruned]"

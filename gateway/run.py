@@ -6254,12 +6254,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
-        # Ensure tirith security scanner is available (downloads if needed)
+        # Resolve the tirith security scanner from the local install only.
+        # A gateway serves nothing but remote surfaces, and those fail closed
+        # when the scanner is missing rather than run against a binary this
+        # process pulled from releases/latest at startup — pinning the build
+        # is the owner's job, not an unattended download's.
         try:
             from tools.tirith_security import ensure_installed
-            ensure_installed(log_failures=False)
+            ensure_installed(log_failures=False, allow_download=False)
         except Exception:
-            pass  # Non-fatal — fail-open at scan time if unavailable
+            pass  # Non-fatal — the per-command fail policy decides from here
 
         # Startup heads-up (#30882): a gateway in manual approval mode with no
         # automated risk assessor (tirith disabled AND no auxiliary.approval
@@ -21367,12 +21371,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if choice == "always":
                 try:
                     from cli import save_config_value
+                    from tools.safety_config_guard import (
+                        owner_initiated_safety_config_change,
+                    )
                     # save_config_value swallows its own errors and reports the
                     # outcome in the return value, so the try block alone says
                     # nothing about whether the write landed.
-                    persisted = bool(
-                        save_config_value("approvals.destructive_slash_confirm", False)
-                    )
+                    #
+                    # approvals.* is refused on the gateway surface (H-018);
+                    # this opt-out is the owner answering their own confirm
+                    # prompt, not something an agent turn can trigger.
+                    with owner_initiated_safety_config_change():
+                        persisted = bool(
+                            save_config_value("approvals.destructive_slash_confirm", False)
+                        )
                     if persisted:
                         logger.info(
                             "User opted out of destructive slash confirm (session=%s)",

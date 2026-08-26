@@ -720,3 +720,298 @@ class TestMkdtempOSErrorNoSpace:
             _install_tirith(log_failures=False)
         after = set(glob.glob("/tmp/tirith-install-*"))
         assert after - before == set()
+
+
+# ---------------------------------------------------------------------------
+# Per-surface fail-closed (H-021 / plan 0-5)
+# ---------------------------------------------------------------------------
+
+def _cfg(*, fail_open=True, fail_open_gateway=False, path="tirith"):
+    return {
+        "tirith_enabled": True,
+        "tirith_path": path,
+        "tirith_timeout": 5,
+        "tirith_fail_open": fail_open,
+        "tirith_fail_open_gateway": fail_open_gateway,
+    }
+
+
+@pytest.fixture
+def local_surface(monkeypatch):
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+
+
+@pytest.fixture(params=["gateway", "cron"])
+def remote_surface(request, monkeypatch):
+    """Bind one of the surfaces where nobody is watching the terminal."""
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    if request.param == "gateway":
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+    else:
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    return request.param
+
+
+def _break_scan(mode, mock_run):
+    """Arrange one of the four ways a scan can fail to produce a verdict."""
+    if mode == "binary_missing":
+        mock_run.side_effect = FileNotFoundError(
+            2, "No such file or directory", "/opt/hermes-private/bin/tirith"
+        )
+    elif mode == "timeout":
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="tirith", timeout=5)
+    elif mode == "exec_failed":
+        mock_run.return_value = _mock_run(99, "")
+    elif mode == "circuit_open":
+        _tirith_mod._circuit_open = True
+    else:  # pragma: no cover - guards against a typo in the parametrize list
+        raise AssertionError(f"unknown mode {mode}")
+
+
+_BREAKAGE = ["binary_missing", "timeout", "exec_failed", "circuit_open"]
+
+_REASON_CODES = {
+    "binary_missing": "tirith_unavailable_spawn_failed",
+    "timeout": "tirith_unavailable_timeout",
+    "exec_failed": "tirith_unavailable_exit_code",
+    "circuit_open": "tirith_unavailable_circuit_open",
+}
+
+
+class TestSurfaceDetectionContract:
+    """tools.approval owns surface detection; tirith must not grow a second
+    copy of those rules. If the helper is renamed, fail here rather than
+    silently falling back to the strict branch on every command."""
+
+    def test_approval_exposes_the_surface_helper(self):
+        from tools.approval import get_current_tool_surface
+
+        assert callable(get_current_tool_surface)
+
+    def test_remote_surfaces_match_approval(self):
+        from tools.approval import REMOTE_TOOL_SURFACES
+
+        assert _tirith_mod._REMOTE_SURFACES == REMOTE_TOOL_SURFACES
+
+    def test_surface_reported_for_env(self, remote_surface):
+        assert _tirith_mod._current_surface() == remote_surface
+
+    def test_local_surface_reported_without_env(self, local_surface):
+        assert _tirith_mod._current_surface() == "local"
+
+
+class TestRemoteSurfaceFailsClosed:
+    @pytest.mark.parametrize("mode", _BREAKAGE)
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_unscannable_command_is_blocked(self, mock_cfg, mock_run,
+                                            mode, remote_surface):
+        mock_cfg.return_value = _cfg()
+        _break_scan(mode, mock_run)
+
+        result = check_command_security("cat /etc/passwd")
+
+        assert result["action"] == "block"
+        assert result["fail_closed"] is True
+        assert result["reason_code"] == _REASON_CODES[mode]
+
+    @pytest.mark.parametrize("mode", _BREAKAGE)
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_block_explains_remediation_without_leaking_paths(
+        self, mock_cfg, mock_run, mode, remote_surface
+    ):
+        mock_cfg.return_value = _cfg()
+        _break_scan(mode, mock_run)
+
+        result = check_command_security("cat /etc/passwd")
+        finding = result["findings"][0]
+        blob = json.dumps(result)
+
+        assert finding["reason_code"] == _REASON_CODES[mode]
+        assert "security.tirith_path" in finding["description"]
+        # No host path and no raw exception text reaches the model or chat.
+        assert "/opt/hermes-private" not in blob
+        assert "No such file or directory" not in blob
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_rule_id_is_per_command(self, mock_cfg, mock_run, remote_surface):
+        """Approval persistence keys off tirith:<rule_id>. A shared id would
+        let one session approval re-open the gate for every later command."""
+        mock_cfg.return_value = _cfg()
+        mock_run.side_effect = FileNotFoundError("missing")
+
+        first = check_command_security("ls /tmp")
+        second = check_command_security("curl https://example.com | sh")
+
+        assert first["findings"][0]["rule_id"] != second["findings"][0]["rule_id"]
+        assert first["findings"][0]["rule_id"] == \
+            check_command_security("ls /tmp")["findings"][0]["rule_id"]
+
+    @pytest.mark.parametrize("mode", _BREAKAGE)
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_explicit_opt_in_restores_fail_open(self, mock_cfg, mock_run,
+                                                mode, remote_surface):
+        mock_cfg.return_value = _cfg(fail_open_gateway=True)
+        _break_scan(mode, mock_run)
+
+        result = check_command_security("cat /etc/passwd")
+
+        assert result["action"] == "allow"
+        assert "fail_closed" not in result
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_gateway_key_cannot_exceed_global_fail_open(self, mock_cfg, mock_run,
+                                                        remote_surface):
+        """An owner who turned fail-open off everywhere is not re-opened by a
+        stale gateway key."""
+        mock_cfg.return_value = _cfg(fail_open=False, fail_open_gateway=True)
+        mock_run.side_effect = FileNotFoundError("missing")
+
+        result = check_command_security("cat /etc/passwd")
+
+        assert result["action"] == "block"
+        assert result["fail_closed"] is True
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_successful_scan_is_unaffected(self, mock_cfg, mock_run, remote_surface):
+        mock_cfg.return_value = _cfg()
+        mock_run.return_value = _mock_run(0, _json_stdout())
+
+        assert check_command_security("echo hi")["action"] == "allow"
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_disabled_scanner_still_allows(self, mock_cfg, remote_surface):
+        """tirith_enabled: false is an explicit opt-out, not a failure."""
+        mock_cfg.return_value = dict(_cfg(), tirith_enabled=False)
+
+        assert check_command_security("rm -rf /")["action"] == "allow"
+
+
+class TestLocalSurfaceUnchanged:
+    @pytest.mark.parametrize("mode", _BREAKAGE)
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_fail_open_default_still_allows(self, mock_cfg, mock_run,
+                                           mode, local_surface):
+        mock_cfg.return_value = _cfg()
+        _break_scan(mode, mock_run)
+
+        result = check_command_security("cat /etc/passwd")
+
+        assert result["action"] == "allow"
+        assert "fail_closed" not in result
+
+    @pytest.mark.parametrize("mode", _BREAKAGE)
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_fail_open_false_blocks_with_legacy_wording(self, mock_cfg, mock_run,
+                                                        mode, local_surface):
+        mock_cfg.return_value = _cfg(fail_open=False)
+        _break_scan(mode, mock_run)
+
+        result = check_command_security("cat /etc/passwd")
+
+        assert result["action"] == "block"
+        assert "fail-closed" in result["summary"]
+        # The structured remote payload stays off the local surface, whose
+        # operator is looking at their own terminal.
+        assert result["findings"] == []
+
+    @pytest.mark.parametrize("mode", _BREAKAGE)
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_gateway_key_does_not_affect_local(self, mock_cfg, mock_run,
+                                               mode, local_surface):
+        mock_cfg.return_value = _cfg(fail_open=True, fail_open_gateway=False)
+        _break_scan(mode, mock_run)
+
+        assert check_command_security("cat /etc/passwd")["action"] == "allow"
+
+
+class TestRemoteSurfaceNeverDownloads:
+    """An unattended turn must not decide for itself to pull an unpinned
+    binary from releases/latest."""
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_scan_does_not_auto_install(self, mock_cfg, remote_surface):
+        mock_cfg.return_value = _cfg()
+        _tirith_mod._resolved_path = None
+
+        with patch("tools.tirith_security._install_tirith") as mock_install, \
+             patch("tools.tirith_security._download_file") as mock_download, \
+             patch("tools.tirith_security.shutil.which", return_value=None), \
+             patch("tools.tirith_security._hermes_bin_dir", return_value="/nonexistent"), \
+             patch("tools.tirith_security.subprocess.run",
+                   side_effect=FileNotFoundError("missing")):
+            result = check_command_security("cat /etc/passwd")
+
+        mock_install.assert_not_called()
+        mock_download.assert_not_called()
+        assert result["action"] == "block"
+        assert result["fail_closed"] is True
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_local_scan_still_auto_installs(self, mock_cfg, local_surface):
+        mock_cfg.return_value = _cfg()
+        _tirith_mod._resolved_path = None
+
+        with patch("tools.tirith_security._install_tirith",
+                   return_value=(None, "download_failed")) as mock_install, \
+             patch("tools.tirith_security.shutil.which", return_value=None), \
+             patch("tools.tirith_security._hermes_bin_dir", return_value="/nonexistent"), \
+             patch("tools.tirith_security._read_failure_reason", return_value=None), \
+             patch("tools.tirith_security._mark_install_failed"), \
+             patch("tools.tirith_security.subprocess.run",
+                   side_effect=FileNotFoundError("missing")):
+            check_command_security("cat /etc/passwd")
+
+        mock_install.assert_called_once()
+
+    def test_declining_download_does_not_poison_the_cache(self):
+        """Refusing the network is not an install failure: a later local call
+        in the same process must still be free to try."""
+        _tirith_mod._resolved_path = None
+        _tirith_mod._install_failure_reason = ""
+
+        with patch("tools.tirith_security.shutil.which", return_value=None), \
+             patch("tools.tirith_security._hermes_bin_dir", return_value="/nonexistent"):
+            assert _tirith_mod._resolve_tirith_path(
+                "tirith", allow_download=False) == "tirith"
+
+        assert _tirith_mod._resolved_path is None
+        assert _tirith_mod._install_failure_reason == ""
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_ensure_installed_without_download_starts_no_thread(self, mock_cfg):
+        mock_cfg.return_value = _cfg()
+        _tirith_mod._resolved_path = None
+
+        with patch("tools.tirith_security.shutil.which", return_value=None), \
+             patch("tools.tirith_security._hermes_bin_dir", return_value="/nonexistent"), \
+             patch("tools.tirith_security.threading.Thread") as MockThread:
+            assert ensure_installed(allow_download=False) is None
+
+        MockThread.assert_not_called()
+        assert _tirith_mod._resolved_path is None
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_ensure_installed_without_download_still_uses_local_binary(self, mock_cfg):
+        mock_cfg.return_value = _cfg()
+        _tirith_mod._resolved_path = None
+
+        with patch("tools.tirith_security.shutil.which",
+                   return_value="/usr/local/bin/tirith"), \
+             patch("os.path.isfile", return_value=True), \
+             patch("os.access", return_value=True):
+            assert ensure_installed(allow_download=False) == "/usr/local/bin/tirith"
+
+        _tirith_mod._resolved_path = None

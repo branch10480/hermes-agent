@@ -337,9 +337,13 @@ class TestCronDenyModeAllGuards:
             assert not result["approved"]
             assert "tirith_fail_open" in result["message"]
 
-    def test_tirith_import_error_fail_open_allows_in_cron_deny(self, monkeypatch):
-        """When tirith is unavailable and tirith_fail_open is true (default),
-        cron-deny mode allows safe commands — preserving pre-#22070 behavior."""
+    def test_tirith_import_error_global_fail_open_still_blocks_cron(self, monkeypatch):
+        """Cron is a remote surface, so the global tirith_fail_open (default
+        true) alone does NOT open it: the ImportError branch reads
+        tirith_fail_open_gateway (default false), so a missing scanner still
+        fails closed on cron even when the global key is true (F-5). Reading the
+        global key here was a bypass — an unavailable scanner silently allowed
+        the command."""
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
@@ -362,6 +366,39 @@ class TestCronDenyModeAllGuards:
             mock_patch("hermes_cli.config.load_config_readonly",
                        return_value={"security": {"tirith_enabled": True,
                                                    "tirith_fail_open": True}}),
+            mock_patch.object(builtins, "__import__", _blocked_import),
+        ):
+            result = check_all_command_guards("echo hi", "local")
+            assert not result["approved"]
+
+    def test_tirith_import_error_gateway_fail_open_allows_in_cron_deny(self, monkeypatch):
+        """Only the explicit gateway opt-in re-opens cron: with both
+        tirith_fail_open_gateway and the global tirith_fail_open true, a missing
+        scanner fails open on cron (matching tirith_security._effective_fail_open,
+        which ANDs the two keys)."""
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+        from unittest.mock import patch as mock_patch
+        import builtins
+        _real_import = builtins.__import__
+
+        def _blocked_import(name, *a, **k):
+            if name.endswith("tirith_security"):
+                raise ImportError("simulated missing tirith")
+            return _real_import(name, *a, **k)
+
+        with (
+            mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"),
+            mock_patch("tools.approval.detect_dangerous_command",
+                       return_value=(False, None, None)),
+            mock_patch("hermes_cli.config.load_config_readonly",
+                       return_value={"security": {"tirith_enabled": True,
+                                                   "tirith_fail_open": True,
+                                                   "tirith_fail_open_gateway": True}}),
             mock_patch.object(builtins, "__import__", _blocked_import),
         ):
             result = check_all_command_guards("echo hi", "local")

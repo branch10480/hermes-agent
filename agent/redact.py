@@ -7,9 +7,11 @@ Short tokens (< 18 chars) are fully masked. Longer tokens preserve
 the first 6 and last 4 characters for debuggability.
 """
 
+import hashlib
 import logging
 import os
 import re
+import secrets
 import shlex
 from urllib.parse import unquote_plus
 
@@ -21,6 +23,33 @@ from urllib.parse import unquote_plus
 from agent.file_safety import _BLOCKED_PROJECT_ENV_BASENAMES as _ENV_FILE_BASENAMES
 
 logger = logging.getLogger(__name__)
+
+# Salt for session-key fingerprints. Regenerated every process start, so a
+# fingerprint is only correlatable inside one run of one process — an old log
+# file can never be brute-forced back to a channel/thread/participant ID even
+# though the ID space is small enough to enumerate.
+_SESSION_KEY_LOG_SALT = secrets.token_bytes(16)
+
+
+def session_key_fingerprint(session_key) -> str:
+    """Opaque, run-local label for a session key, safe to log.
+
+    Gateway session keys embed platform identifiers (Discord channel, thread,
+    and participant IDs). Logs are persisted, so the raw key must never reach
+    them; every log line that needs to distinguish sessions uses this instead.
+    This is the single source of the fingerprint salt:
+    ``tools.process_registry._session_key_fingerprint`` delegates here so both
+    logs render the same session key as the same fingerprint.
+    """
+    text = "" if session_key is None else str(session_key)
+    if not text:
+        return "none"
+    return hashlib.blake2s(
+        text.encode("utf-8", "surrogateescape"),
+        key=_SESSION_KEY_LOG_SALT,
+        digest_size=6,
+    ).hexdigest()
+
 
 # Sensitive query-string parameter names (case-insensitive exact match).
 # Ported from nearai/ironclaw#2529 — catches tokens whose values don't match

@@ -1117,6 +1117,15 @@ DEFAULT_CONFIG = {
             # Zero preserves the historical immediate post-turn behavior;
             # manual /refine requests are always immediate.
             "idle_delay_seconds": 0,
+            # Global idle gate: an automatic review starts only while no turn
+            # is in flight anywhere in this process — any Discord session, cron
+            # job or maintenance fork — and re-checks every
+            # idle_gate_poll_seconds until idle_gate_max_wait_seconds elapses
+            # (<= 0 waits indefinitely). Without it, housekeeping queues behind
+            # a user who is still waiting on the same single local backend.
+            "idle_gate": True,
+            "idle_gate_poll_seconds": 5,
+            "idle_gate_max_wait_seconds": 300,
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },
@@ -2225,6 +2234,11 @@ DEFAULT_CONFIG = {
         "tirith_path": "tirith",
         "tirith_timeout": 5,
         "tirith_fail_open": True,
+        # Gateway and cron turns have no human watching the terminal, so an
+        # unavailable scanner blocks there instead of falling through to the
+        # local fail-open default. Never resolves more permissive than
+        # tirith_fail_open.
+        "tirith_fail_open_gateway": False,
         "website_blocklist": {
             "enabled": False,
             "domains": [],

@@ -4188,7 +4188,20 @@ def save_config_value(key_path: str, value: any) -> bool:
     # setting silently vanished every restart on any install whose
     # HERMES_HOME/config.yaml didn't exist yet.
     config_path = get_hermes_home() / 'config.yaml'
-    
+
+    # Safety boundary (H-018): this writer bypasses hermes_cli.config entirely
+    # (it round-trips the YAML in place), so it needs the same refusal as
+    # `config set` — approval mode, the denial breaker, the Tirith switches and
+    # the toolset surface cannot be moved from a messaging or cron surface.
+    # Owner-driven opt-outs mark themselves with
+    # owner_initiated_safety_config_change().
+    try:
+        from tools.safety_config_guard import assert_config_key_writable
+    except Exception:
+        pass
+    else:
+        assert_config_key_writable(key_path, action="change")
+
     try:
         # Ensure parent directory exists (for ~/.hermes/config.yaml on first use)
         config_path.parent.mkdir(parents=True, exist_ok=True)

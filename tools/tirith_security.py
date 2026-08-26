@@ -10,6 +10,15 @@ JSON stdout enriches findings/summary but never overrides the verdict.
 Operational failures (spawn error, timeout, unknown exit code) respect
 the fail_open config setting. Programming errors propagate.
 
+Fail-open is per surface. A local CLI/TUI turn happens in front of the
+person who typed it, so an unavailable scanner degrades to the historical
+allow (``security.tirith_fail_open``, default true). A gateway or cron turn
+has no such witness — the conversation arrives over chat or a timer — so an
+unavailable scanner blocks instead (``security.tirith_fail_open_gateway``,
+default false). Those surfaces also never reach for the network: an
+unpinned auto-download is a supply-chain decision no unattended turn should
+be making for itself.
+
 Auto-install: if tirith is not found on PATH or at the configured path,
 it is automatically downloaded from GitHub releases to $HERMES_HOME/bin/tirith.
 The download always verifies SHA-256 checksums.  When cosign is available on
@@ -17,7 +26,7 @@ PATH, provenance verification (GitHub Actions workflow signature) is also
 performed.  If cosign is not installed, the download proceeds with SHA-256
 verification only — still secure via HTTPS + checksum, just without supply
 chain provenance proof.  Installation runs in a background thread so startup
-never blocks.
+never blocks.  Gateway and cron turns opt out of it entirely (see above).
 """
 
 import hashlib
@@ -72,6 +81,7 @@ def _load_security_config() -> dict:
         "tirith_path": "tirith",
         "tirith_timeout": 5,
         "tirith_fail_open": True,
+        "tirith_fail_open_gateway": False,
     }
     try:
         from hermes_cli.config import load_config_readonly
@@ -84,6 +94,109 @@ def _load_security_config() -> dict:
         "tirith_path": os.getenv("TIRITH_BIN", cfg.get("tirith_path", defaults["tirith_path"])),
         "tirith_timeout": _env_int("TIRITH_TIMEOUT", cfg.get("tirith_timeout", defaults["tirith_timeout"])),
         "tirith_fail_open": _env_bool("TIRITH_FAIL_OPEN", cfg.get("tirith_fail_open", defaults["tirith_fail_open"])),
+        "tirith_fail_open_gateway": _env_bool(
+            "TIRITH_FAIL_OPEN_GATEWAY",
+            cfg.get("tirith_fail_open_gateway", defaults["tirith_fail_open_gateway"]),
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Surface-aware fail policy
+# ---------------------------------------------------------------------------
+
+# Surfaces with nobody watching the terminal the agent is driving. Kept in
+# sync with tools.approval.REMOTE_TOOL_SURFACES via _current_surface().
+_REMOTE_SURFACES = frozenset({"gateway", "cron"})
+
+# What the owner has to do to clear a fail-closed verdict. Deliberately free
+# of any host path: this text reaches the model, and on a gateway it is
+# rendered straight into a chat message.
+_PIN_REMEDIATION = (
+    "The Hermes owner must install the pinned Tirith build on the host and "
+    "point security.tirith_path at it, then restart the gateway."
+)
+
+
+def _current_surface() -> str:
+    """Return the surface driving this scan: 'gateway', 'cron', or 'local'.
+
+    ``tools.approval`` owns surface detection and is the only caller of
+    ``check_command_security``, so the import below is a warm module lookup
+    rather than a real import. If it ever fails, the security layer itself is
+    broken — the moment to be strict, not permissive — so we report the
+    stricter remote surface.
+    """
+    try:
+        from tools.approval import get_current_tool_surface
+        return get_current_tool_surface()
+    except Exception:
+        _warn_once(
+            "tirith_surface_unavailable",
+            "tirith could not determine the calling surface; "
+            "treating it as a gateway surface (fail closed)",
+        )
+        return "gateway"
+
+
+def _effective_fail_open(cfg: dict, surface: str) -> bool:
+    """Return the fail-open policy that applies to *surface*.
+
+    Remote surfaces read ``tirith_fail_open_gateway`` (default false) and can
+    never end up more permissive than the global ``tirith_fail_open``, so an
+    owner who turns fail-open off everywhere cannot be re-opened by a stale
+    gateway key.
+    """
+    if surface not in _REMOTE_SURFACES:
+        return bool(cfg.get("tirith_fail_open", True))
+    return bool(cfg.get("tirith_fail_open_gateway", False)) and bool(
+        cfg.get("tirith_fail_open", True)
+    )
+
+
+def _unavailable_verdict(reason_code: str, command: str, *,
+                         fail_open: bool, remote: bool,
+                         summary: str, closed_summary: str | None = None) -> dict:
+    """Build the verdict for a scan that could not produce one.
+
+    *summary* and *closed_summary* are the historical local-surface wordings,
+    kept verbatim so CLI behaviour and its tests are untouched. Remote
+    surfaces get a structured finding instead: a reason code the caller can
+    branch on and remediation text, with no exception strings or host paths
+    that would leak the install layout into a chat transcript.
+    """
+    if fail_open:
+        return {"action": "allow", "findings": [], "summary": summary}
+    if not remote:
+        return {
+            "action": "block",
+            "findings": [],
+            "summary": closed_summary or f"{summary} (fail-closed)",
+        }
+
+    # Digest the command into the rule_id. Approval persistence keys off
+    # ``tirith:<rule_id>``, so a single shared id would let one session
+    # approval re-open the gate for every later command in that session.
+    digest = hashlib.sha256(command.encode("utf-8", "replace")).hexdigest()[:12]
+    return {
+        "action": "block",
+        "fail_closed": True,
+        "reason_code": reason_code,
+        "findings": [
+            {
+                "rule_id": f"{reason_code}:{digest}",
+                "severity": "HIGH",
+                "title": "Tirith security scanner unavailable",
+                "description": (
+                    f"This command could not be security-scanned "
+                    f"(reason_code={reason_code}). Commands from chat and "
+                    f"scheduled sessions are not allowed to run unscanned. "
+                    f"{_PIN_REMEDIATION}"
+                ),
+                "reason_code": reason_code,
+            }
+        ],
+        "summary": f"tirith unavailable ({reason_code}) — fail closed",
     }
 
 
@@ -490,7 +603,7 @@ def _is_explicit_path(configured_path: str) -> bool:
     return configured_path != "tirith"
 
 
-def _resolve_tirith_path(configured_path: str) -> str:
+def _resolve_tirith_path(configured_path: str, *, allow_download: bool = True) -> str:
     """Resolve the tirith binary path, auto-installing if necessary.
 
     If the user explicitly set a path (anything other than the bare "tirith"
@@ -501,6 +614,12 @@ def _resolve_tirith_path(configured_path: str) -> str:
     1. PATH lookup via shutil.which
     2. $HERMES_HOME/bin/tirith (previously auto-installed)
     3. Auto-install from GitHub releases → $HERMES_HOME/bin/tirith
+
+    ``allow_download=False`` stops at step 2. Gateway and cron turns pass it
+    so an unattended session never pulls an unpinned binary off the network
+    mid-command; they fail closed instead. It deliberately leaves the cached
+    sentinels alone, so declining the network here cannot suppress a later
+    local install attempt in the same process.
 
     Failed installs are cached for the process lifetime (and persisted to
     disk for 24h) to avoid repeated network attempts.
@@ -555,6 +674,17 @@ def _resolve_tirith_path(configured_path: str) -> str:
         _install_failure_reason = ""
         _clear_install_failed()
         return hermes_bin
+
+    # Caller declined the network (gateway/cron). Return the configured name
+    # so the spawn fails and the surface's fail policy decides, without
+    # caching a sentinel that would suppress a later local install.
+    if not allow_download:
+        _warn_once(
+            "tirith_download_declined",
+            "tirith is not installed and this surface does not auto-download; "
+            "scans will fail closed until the owner installs a pinned build",
+        )
+        return expanded
 
     # Local checks failed.  If a previous install attempt already failed,
     # skip the network retry — UNLESS the failure was "cosign_missing" and
@@ -630,12 +760,17 @@ def _background_install(*, log_failures: bool = True):
             _mark_install_failed(reason)
 
 
-def ensure_installed(*, log_failures: bool = True):
+def ensure_installed(*, log_failures: bool = True, allow_download: bool = True):
     """Ensure tirith is available, downloading in background if needed.
 
     Quick PATH/local checks are synchronous; network download runs in a
     daemon thread so startup never blocks. Safe to call multiple times.
     Returns the resolved path immediately if available, or None.
+
+    ``allow_download=False`` reduces this to the local checks. The gateway
+    passes it: every turn that process serves is a remote surface, and those
+    fail closed rather than run against a binary fetched from
+    ``releases/latest`` at startup.
     """
     global _resolved_path, _install_thread, _install_failure_reason
 
@@ -690,6 +825,12 @@ def ensure_installed(*, log_failures: bool = True):
         _clear_install_failed()
         return hermes_bin
 
+    # Caller declined the network — local checks are all there is. Leave the
+    # sentinels untouched (see _resolve_tirith_path) so this is a refusal to
+    # download, not a recorded install failure.
+    if not allow_download:
+        return None
+
     # If previously failed in-memory, check if the cause is now resolved
     if _resolved_path is _INSTALL_FAILED:
         if _install_failure_reason == "cosign_missing" and shutil.which("cosign"):
@@ -732,11 +873,16 @@ def check_command_security(command: str) -> dict:
     """Run tirith security scan on a command.
 
     Exit code determines action (0=allow, 1=block, 2=warn). JSON enriches
-    findings/summary. Spawn failures and timeouts respect fail_open config.
-    Programming errors propagate.
+    findings/summary. Spawn failures and timeouts respect the fail-open
+    policy of the calling surface (see the module docstring). Programming
+    errors propagate.
 
     Returns:
         {"action": "allow"|"warn"|"block", "findings": [...], "summary": str}
+
+    A fail-closed verdict additionally carries ``fail_closed: True`` and a
+    ``reason_code`` so callers can tell "the scanner found something" from
+    "the scanner never ran".
     """
     global _crash_count, _circuit_open
 
@@ -745,32 +891,44 @@ def check_command_security(command: str) -> dict:
     if not cfg["tirith_enabled"]:
         return {"action": "allow", "findings": [], "summary": ""}
 
+    surface = _current_surface()
+    remote = surface in _REMOTE_SURFACES
+    fail_open = _effective_fail_open(cfg, surface)
+
     # Circuit breaker: if tirith has crashed _CRASH_LIMIT times in a row,
     # stop trying for the rest of the process.  Without this, a corrupted
     # or missing binary causes every tool call to hit the same spawn failure
     # → fail-open → agent retry loop, hanging the user for 20+ minutes
-    # (issue #41400).
+    # (issue #41400).  An open breaker still means "unscanned", so on a
+    # fail-closed surface it denies instead of waving the command through.
     if _circuit_open:
-        return {"action": "allow", "findings": [], "summary": "tirith disabled (circuit breaker)"}
+        return _unavailable_verdict(
+            "tirith_unavailable_circuit_open", command,
+            fail_open=fail_open, remote=remote,
+            summary="tirith disabled (circuit breaker)",
+        )
 
     # Unsupported platform (Windows etc.) — tirith has no binary here and
     # never will. Skip the resolver entirely so we don't even try to spawn.
-    # Pattern-matching guards still run via the rest of approval.py.
+    # Pattern-matching guards still run via the rest of approval.py. This
+    # stays allow on every surface: fail-closed here would brick a Windows
+    # gateway permanently, with no install the owner could perform to fix it.
     if not is_platform_supported():
         return {"action": "allow", "findings": [], "summary": ""}
 
-    tirith_path = _resolve_tirith_path(cfg["tirith_path"])
+    tirith_path = _resolve_tirith_path(cfg["tirith_path"], allow_download=not remote)
     timeout = cfg["tirith_timeout"]
-    fail_open = cfg["tirith_fail_open"]
 
     if tirith_path is None:
         _warn_once(
             "tirith_path_none",
             "tirith path resolved to None; scanning disabled",
         )
-        if fail_open:
-            return {"action": "allow", "findings": [], "summary": "tirith path unavailable"}
-        return {"action": "block", "findings": [], "summary": "tirith path unavailable (fail-closed)"}
+        return _unavailable_verdict(
+            "tirith_unavailable_path", command,
+            fail_open=fail_open, remote=remote,
+            summary="tirith path unavailable",
+        )
 
     try:
         result = subprocess.run(
@@ -791,9 +949,12 @@ def check_command_security(command: str) -> dict:
         spawn_key = f"tirith_spawn_failed:{type(exc).__name__}:{getattr(exc, 'errno', '')}"
         _warn_once(spawn_key, "tirith spawn failed: %s", exc)
         _record_tirith_crash()
-        if fail_open:
-            return {"action": "allow", "findings": [], "summary": f"tirith unavailable: {exc}"}
-        return {"action": "block", "findings": [], "summary": f"tirith spawn failed (fail-closed): {exc}"}
+        return _unavailable_verdict(
+            "tirith_unavailable_spawn_failed", command,
+            fail_open=fail_open, remote=remote,
+            summary=f"tirith unavailable: {exc}",
+            closed_summary=f"tirith spawn failed (fail-closed): {exc}",
+        )
     except subprocess.TimeoutExpired:
         _warn_once(
             f"tirith_timeout:{timeout}",
@@ -801,9 +962,12 @@ def check_command_security(command: str) -> dict:
             timeout,
         )
         _record_tirith_crash()
-        if fail_open:
-            return {"action": "allow", "findings": [], "summary": f"tirith timed out ({timeout}s)"}
-        return {"action": "block", "findings": [], "summary": "tirith timed out (fail-closed)"}
+        return _unavailable_verdict(
+            "tirith_unavailable_timeout", command,
+            fail_open=fail_open, remote=remote,
+            summary=f"tirith timed out ({timeout}s)",
+            closed_summary="tirith timed out (fail-closed)",
+        )
 
     # Map exit code to action
     exit_code = result.returncode
@@ -820,9 +984,12 @@ def check_command_security(command: str) -> dict:
         # — respect fail_open
         logger.warning("tirith returned unexpected exit code %d", exit_code)
         _record_tirith_crash()
-        if fail_open:
-            return {"action": "allow", "findings": [], "summary": f"tirith exit code {exit_code} (fail-open)"}
-        return {"action": "block", "findings": [], "summary": f"tirith exit code {exit_code} (fail-closed)"}
+        return _unavailable_verdict(
+            "tirith_unavailable_exit_code", command,
+            fail_open=fail_open, remote=remote,
+            summary=f"tirith exit code {exit_code} (fail-open)",
+            closed_summary=f"tirith exit code {exit_code} (fail-closed)",
+        )
 
     # Parse JSON for enrichment (never overrides the exit code verdict)
     findings = []

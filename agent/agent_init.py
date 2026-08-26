@@ -863,6 +863,12 @@ def init_agent(
     # no delayed review may register against that retired session.
     agent._background_review_closing = False
     agent._background_review_lock = threading.Lock()
+    # Registry tokens for the turns this agent currently has in flight
+    # (agent/live_turn_registry.py). The background-review idle gate excludes
+    # them so the agent's own finalizing turn doesn't read as "backend busy".
+    agent._live_turn_tokens = set()
+    # True only on the review fork itself; see agent/background_review.py.
+    agent._is_background_review_fork = False
 
     # Store OpenRouter provider preferences
     agent.providers_allowed = providers_allowed

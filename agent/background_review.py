@@ -24,6 +24,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from agent import live_turn_registry
 from agent.thread_scoped_output import thread_scoped_silence
 
 logger = logging.getLogger(__name__)
@@ -656,6 +657,8 @@ def _run_review_in_thread(
     messages_snapshot: List[Dict],
     prompt: str,
     cancellation_event: Any = None,
+    idle_gated: bool = False,
+    idle_gate_exclude: Any = (),
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
@@ -667,6 +670,55 @@ def _run_review_in_thread(
     # worker. Do not even construct the fork when that cancellation already
     # won; construction itself is intentionally kept API-free.
     if cancellation_event is not None and cancellation_event.is_set():
+        return
+
+    # Publish the cancel handle BEFORE the last gate check, so a live turn
+    # starting in any session either cancels this review or is seen by the
+    # re-check below — the window between the two can no longer let a review
+    # slip onto a backend a user is waiting on (H-034 / CR-008).
+    gate_handle = None
+    try:
+        gate_handle = live_turn_registry.register_background_review(
+            cancellation_event=cancellation_event,
+            session=live_turn_registry.session_label(agent),
+        )
+    except Exception:
+        logger.debug("background-review registration failed", exc_info=True)
+    try:
+        _run_review_body(
+            agent,
+            messages_snapshot,
+            prompt,
+            cancellation_event=cancellation_event,
+            idle_gated=idle_gated,
+            idle_gate_exclude=idle_gate_exclude,
+            gate_handle=gate_handle,
+        )
+    finally:
+        try:
+            live_turn_registry.unregister_background_review(gate_handle)
+        except Exception:
+            logger.debug("background-review deregistration failed", exc_info=True)
+
+
+def _run_review_body(
+    agent: Any,
+    messages_snapshot: List[Dict],
+    prompt: str,
+    cancellation_event: Any = None,
+    idle_gated: bool = False,
+    idle_gate_exclude: Any = (),
+    gate_handle: Any = None,
+) -> None:
+    """The review worker proper — see :func:`_run_review_in_thread`."""
+    if idle_gated:
+        busy = live_turn_registry.backend_busy_reason(exclude=idle_gate_exclude)
+        if busy:
+            logger.debug(
+                "background review dropped before start; backend busy: %s", busy
+            )
+            return
+    if gate_handle is not None and gate_handle.cancelled:
         return
 
     # Local import to avoid a hard circular dep at module load.
@@ -854,6 +906,11 @@ def _run_review_in_thread(
             )
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"
+            # Marks the fork's own run_conversation as a maintenance turn in
+            # agent/live_turn_registry.py: it holds the shared backend (so it
+            # keeps the idle gate closed for other reviews) but never cancels
+            # a review — least of all itself.
+            review_agent._is_background_review_fork = True
             # The review fork pins the parent's cached system prompt and keeps
             # ``tools[]`` byte-identical to the parent so its outbound request
             # hits the same provider cache prefix (see the toolset-parity note
@@ -975,6 +1032,12 @@ def _run_review_in_thread(
                     is cancellation_event
                 ):
                     agent._background_review_cancel_event = None
+                # Same step, cross-session surface: a live turn in ANOTHER
+                # session reaches the fork only through this handle.
+                if gate_handle is not None and not gate_handle.attach_agent(
+                    review_agent
+                ):
+                    cancelled_before_registration = True
 
             _br_lock = getattr(agent, "_background_review_lock", None)
             if _br_lock is not None:
@@ -1153,6 +1216,8 @@ def spawn_background_review_thread(
     review_skills: bool = False,
     focus: Optional[str] = None,
     cancellation_event: Any = None,
+    idle_gated: bool = False,
+    idle_gate_exclude: Any = (),
 ):
     """Build the review thread target and prompt for a background review.
 
@@ -1165,6 +1230,13 @@ def spawn_background_review_thread(
     the user asked for while keeping the same guardrails. Automatic
     post-turn reviews pass ``None`` — their prompts are byte-identical to
     before this parameter existed.
+
+    ``idle_gated`` re-checks the global idle gate on the worker thread, after
+    the review has published its cancel handle — the register-then-recheck
+    that closes the window between the caller's own gate check and the fork's
+    first API call. ``idle_gate_exclude`` carries the spawning turn's own
+    registry tokens, which must not count as "the backend is busy": the review
+    is spawned from inside that turn's finalizer.
     """
     # Pick the right prompt based on which triggers fired.  Allow per-agent
     # override (the prompts moved to module-level constants but old code paths
@@ -1191,6 +1263,8 @@ def spawn_background_review_thread(
             messages_snapshot,
             prompt,
             cancellation_event=cancellation_event,
+            idle_gated=idle_gated,
+            idle_gate_exclude=idle_gate_exclude,
         )
 
     return _target, prompt

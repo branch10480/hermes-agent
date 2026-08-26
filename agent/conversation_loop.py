@@ -37,7 +37,13 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
+from agent import live_turn_registry
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.history_mutation_log import (
+    PrefixStabilityTracker,
+    log_history_mutation,
+    note_history_mutation_intent,
+)
 from agent.final_response_sanitization import (
     sanitize_final_response,
     should_suppress_deepseek_discord_interim_content,
@@ -100,6 +106,49 @@ from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+
+def approval_breaker_final_message(halt: Dict[str, Any]) -> str:
+    """Turn-ending message for the approval denial circuit breaker.
+
+    *halt* is the redacted side-channel record (tool name, counts, reason
+    code, effect class, safe alternative) — never the blocked command, so
+    this message cannot echo one back to the user.
+
+    Two things are deliberately absent. ``/approve`` is not offered: on the
+    surfaces this breaker fires on, a policy denial resolves itself and
+    creates no pending approval, so approving is not something the user can
+    do. "Run it in your own terminal" is not offered either: it hands an
+    operation the security reviewer just refused — possibly one that
+    originated in content the agent was reading — to the user to execute
+    blind, which is the failure the review layer exists to prevent.
+    """
+    count = halt.get("count")
+    tool_name = str(halt.get("tool_name") or "terminal")
+    denial_count = f"{count}回連続で" if isinstance(count, int) else "連続で"
+
+    reason_line = ""
+    effect_class = halt.get("effect_class")
+    if effect_class:
+        reason_line = f"拒否された操作の分類: {effect_class}"
+        reason_code = halt.get("reason_code")
+        if reason_code:
+            reason_line += f"（理由コード: {reason_code}）"
+        reason_line += "。"
+
+    alternative_line = ""
+    safe_alternative = halt.get("safe_alternative")
+    if safe_alternative:
+        alternative_line = f"同じ目的を安全に進めるなら: {safe_alternative}。"
+
+    return (
+        f"このターンで {tool_name} の危険操作が{denial_count}拒否されたため、"
+        "危険操作の自動再試行を止め、このターンを終了しました。"
+        f"{reason_line}"
+        "次のメッセージでは通常の読み取り・編集・テストをそのまま"
+        f"続けられます。{alternative_line}"
+    )
+
 
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
@@ -206,6 +255,201 @@ def _append_answer_only_recovery_prompt(
                 {"type": "text", "text": "\n\n" + prompt},
             ]
         break
+
+
+def _has_unanswered_tool_calls(message: Any) -> bool:
+    """True when *message* is an assistant turn still awaiting tool results."""
+
+    return bool(
+        isinstance(message, dict)
+        and message.get("role") == "assistant"
+        and message.get("tool_calls")
+    )
+
+
+def _append_request_only_tail_block(
+    api_messages: list[dict[str, Any]],
+    prompt: str,
+    *,
+    component: str,
+    reason: str,
+    session_id: Any = "",
+    turn_id: Any = "",
+) -> bool:
+    """Add a request-only instruction as a trailing, provider-valid block.
+
+    The older ``_append_answer_only_recovery_prompt`` walks BACK to the active
+    user turn and rewrites it.  In a tool loop that message sits tens of
+    thousands of tokens behind the tail, so the rewrite invalidates the
+    provider's cached prefix from there forward — the measured cause of a
+    100% -> 23% prompt-cache collapse and a 466-second re-prefill when the
+    context-pressure checkpoint fired mid-turn.
+
+    Appending instead keeps every cached byte valid:
+
+    * a trailing ``user`` turn (start of a turn) takes the text directly;
+    * anything else (the ``tool`` results that end a tool-loop iteration)
+      gets a fresh trailing ``user`` message.  That is valid for
+      chat-completions, and the Anthropic adapter merges it into the same
+      user turn that carries the ``tool_result`` blocks, so the text lands
+      after them as a trailing block rather than as a second user turn.
+
+    The one case that cannot take a trailing user message is an assistant
+    turn with unanswered ``tool_calls``: the provider requires a tool result
+    next.  ``_sanitize_api_messages`` stubs those in before this runs, so it
+    should be unreachable — but if it ever is reached, fall back to the
+    in-place append rather than dropping the instruction, and let the logged
+    event show the prefix break that fallback costs.
+
+    Returns True when the append was prefix-preserving.
+    """
+
+    before = list(api_messages)
+    prefix_preserved = True
+    if not api_messages:
+        api_messages.append({"role": "user", "content": prompt})
+    else:
+        tail = api_messages[-1]
+        if _has_unanswered_tool_calls(tail):
+            _append_answer_only_recovery_prompt(api_messages, prompt)
+            prefix_preserved = False
+        elif isinstance(tail, dict) and tail.get("role") == "user":
+            tail_content = tail.get("content")
+            if isinstance(tail_content, str):
+                tail["content"] = tail_content.rstrip() + "\n\n" + prompt
+            elif isinstance(tail_content, list):
+                tail["content"] = [
+                    *tail_content,
+                    {"type": "text", "text": "\n\n" + prompt},
+                ]
+            else:
+                api_messages.append({"role": "user", "content": prompt})
+        else:
+            api_messages.append({"role": "user", "content": prompt})
+
+    log_history_mutation(
+        component=component,
+        reason=reason,
+        before=before,
+        after=api_messages,
+        session_id=session_id,
+        turn_id=turn_id,
+        extra={"prefix_preserved": prefix_preserved},
+    )
+    return prefix_preserved
+
+
+def _prefix_stability_tracker(agent: Any) -> PrefixStabilityTracker | None:
+    """Per-agent request-prefix tracker, created on first use.
+
+    Returns None for objects that cannot carry the attribute (frozen or
+    slotted test doubles); measurement is never allowed to fail a turn.
+    """
+
+    tracker = getattr(agent, "_prefix_stability_tracker", None)
+    if isinstance(tracker, PrefixStabilityTracker):
+        return tracker
+    tracker = PrefixStabilityTracker()
+    try:
+        agent._prefix_stability_tracker = tracker
+    except Exception:
+        return None
+    return tracker
+
+
+def _proactive_prune_armed(compressor: Any, observed_tokens: int) -> bool:
+    """True when the deterministic prune's own trigger would let it run.
+
+    Mirrors the cheap front gates of
+    ``ContextCompressor.prune_tool_results_only`` so a turn does not record a
+    deferral — and the log does not claim one — for a prune that is disabled
+    (the default) or still below its configured trigger.
+
+    Engines that do not expose the trigger (plugin context engines, minimal
+    test doubles) are treated as armed: they are consulted at the boundary
+    exactly as before and decide for themselves.
+    """
+
+    trigger = getattr(compressor, "proactive_prune_tokens", None)
+    if not isinstance(trigger, int) or isinstance(trigger, bool):
+        return True
+    return trigger > 0 and observed_tokens >= trigger
+
+
+def _flush_deferred_tool_result_prune(
+    agent: Any,
+    messages: list[dict[str, Any]],
+    deferred_tokens: int | None,
+    *,
+    turn_id: Any = "",
+) -> list[dict[str, Any]]:
+    """Commit the turn's held-back tool-result prune at the turn boundary.
+
+    The post-tool gate only records that the prune became eligible; the
+    rewrite happens here, once, after the turn's final API call. That keeps
+    the prompt-cache break out of the live turn (see the deferral site) and
+    collapses several eligible iterations into one boundary rewrite.
+
+    The gate is re-evaluated against the FRESHEST token reading rather than
+    the one observed at deferral time: a compression that ran later in the
+    turn is itself a boundary and has already run the same deterministic
+    prune, so the smaller post-compression reading correctly stands the
+    deferred prune down instead of paying a second break for nothing.
+
+    Returns the transcript to persist — the input list when nothing was
+    committed, so the caller's identity-based no-op checks keep working.
+    """
+
+    if deferred_tokens is None:
+        return messages
+    compressor = getattr(agent, "context_compressor", None)
+    prune = getattr(compressor, "prune_tool_results_only", None)
+    if not callable(prune):
+        return messages
+
+    current_tokens = deferred_tokens
+    latest = getattr(compressor, "last_prompt_tokens", None)
+    if isinstance(latest, int) and not isinstance(latest, bool) and latest > 0:
+        current_tokens = latest
+
+    try:
+        pruned_msgs, pruned_n = prune(messages, current_tokens=current_tokens)
+    except Exception:
+        logger.debug(
+            "deferred tool-result prune failed; skipping", exc_info=True
+        )
+        return messages
+
+    # Standard no-op caller contract: only commit when the engine returned a
+    # NEW list object with a non-zero count.
+    if not pruned_n or pruned_msgs is messages:
+        note_history_mutation_intent(
+            component="proactive_prune",
+            reason="boundary_flush_noop",
+            session_id=getattr(agent, "session_id", "") or "",
+            turn_id=turn_id,
+            extra={"current_tokens": current_tokens},
+        )
+        return messages
+
+    log_history_mutation(
+        component="proactive_prune",
+        reason="turn_boundary_commit",
+        before=messages,
+        after=pruned_msgs,
+        session_id=getattr(agent, "session_id", "") or "",
+        turn_id=turn_id,
+        extra={"pruned_results": pruned_n, "current_tokens": current_tokens},
+    )
+    # Do NOT rebuild conversation_history here. The compressor atomically
+    # rewrites the active transcript with the durable rearm threshold, then
+    # stamps every returned row with _DB_PERSISTED_MARKER, so the marker-based
+    # flush dedup (see _flush_messages_to_session_db) prevents duplicate
+    # writes. Calling conversation_history_after_compression (a compaction-only
+    # helper keyed on the _last_compaction_in_place flag) would be a no-op at
+    # best, and on a stale in-place flag could seed this turn's fresh,
+    # not-yet-persisted rows into history_ids and skip writing them.
+    return pruned_msgs
 
 
 def _apply_answer_only_recovery_overrides(api_kwargs: dict[str, Any]) -> None:
@@ -1543,7 +1787,7 @@ def _notify_context_engine_turn_complete(
         )
 
 
-def run_conversation(
+def _run_conversation_core(
     agent,
     user_message: Any,
     system_message: str = None,
@@ -1624,6 +1868,9 @@ def run_conversation(
     # A configured idle delay leaves automatic review work in a cancellable
     # timer after the prior turn.  A new user message supersedes that pending
     # work before it starts; an already-running fork is interrupted below.
+    # Reviews owned by OTHER sessions are cancelled by the wrapper below via
+    # agent/live_turn_registry.py — this block only reaches the one this agent
+    # owns, which is all it ever could (H-034 / CR-008).
     try:
         agent._cancel_background_review_timer()
     except AttributeError:
@@ -1727,6 +1974,11 @@ def run_conversation(
     # objects without the attribute (older pickles / minimal stubs).
     max_compression_attempts = getattr(agent, "max_compression_attempts", 3)
     _last_preflight_pressure: Optional[int] = None
+    # Freshest token reading at which the post-tool gate found the proactive
+    # tool-result prune eligible. None = never eligible this turn. The rewrite
+    # itself is held to the turn boundary so the cache break lands after this
+    # turn's last API call instead of between two of them.
+    _deferred_prune_tokens: Optional[int] = None
     _preflight_compression_blocked = _ctx.preflight_compression_blocked
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
     # Last composed answer intentionally held back by a verification gate. If
@@ -2233,13 +2485,31 @@ def run_conversation(
         # call. Inject the instruction into the request copy, never the durable
         # transcript, so the original user turn and prompt-cache history stay
         # clean. The request is also tool-free and low-reasoning below.
-        if thinking_budget_recovery_active:
-            _append_answer_only_recovery_prompt(
-                api_messages, _THINKING_BUDGET_RECOVERY_PROMPT
-            )
-        elif tool_guardrail_recovery_active:
-            _append_answer_only_recovery_prompt(
-                api_messages, _TOOL_GUARDRAIL_RECOVERY_PROMPT
+        #
+        # Unlike the context-pressure checkpoint, these two keep the in-place
+        # amend: a recovery request strips every tool definition, which already
+        # invalidates the cached prefix, so there is no prefix left to protect.
+        # They are still reported, so an unexplained divergence can be ruled in
+        # or out from the log alone.
+        if thinking_budget_recovery_active or tool_guardrail_recovery_active:
+            _recovery_before = list(api_messages)
+            if thinking_budget_recovery_active:
+                _recovery_reason = "thinking_budget_recovery"
+                _append_answer_only_recovery_prompt(
+                    api_messages, _THINKING_BUDGET_RECOVERY_PROMPT
+                )
+            else:
+                _recovery_reason = "tool_guardrail_recovery"
+                _append_answer_only_recovery_prompt(
+                    api_messages, _TOOL_GUARDRAIL_RECOVERY_PROMPT
+                )
+            log_history_mutation(
+                component="answer_only_recovery",
+                reason=_recovery_reason,
+                before=_recovery_before,
+                after=api_messages,
+                session_id=agent.session_id or "",
+                turn_id=turn_id,
             )
 
         # Drop thinking-only assistant turns (reasoning but no visible
@@ -2355,9 +2625,14 @@ def run_conversation(
         # Give plugins one request-only chance to checkpoint important working
         # state before the host compressor becomes the sole continuity path.
         # The hook also carries one-shot recovery context after a successful
-        # boundary.  Never append a synthetic message: amend the API copy of
-        # the active user turn so strict role alternation and SessionDB stay
-        # untouched.
+        # boundary.  Request-only: SessionDB never sees it.
+        #
+        # The text goes in a TRAILING block, not into the active user turn.
+        # Amending that turn was measured invalidating the cached prefix from
+        # its position forward — a 100% -> 23% prompt-cache collapse and a
+        # 466-second re-prefill on the call where the checkpoint level fired,
+        # because in a tool loop the active user turn sits far behind the tail.
+        # See _append_request_only_tail_block.
         from agent.context_checkpoint_hooks import context_pressure_context
 
         _pressure_context = context_pressure_context(
@@ -2376,7 +2651,14 @@ def run_conversation(
             platform=getattr(agent, "platform", None) or "",
         )
         if _pressure_context:
-            _append_answer_only_recovery_prompt(api_messages, _pressure_context)
+            _append_request_only_tail_block(
+                api_messages,
+                _pressure_context,
+                component="context_pressure_checkpoint",
+                reason="request_only_context",
+                session_id=agent.session_id or "",
+                turn_id=turn_id,
+            )
             approx_tokens = estimate_messages_tokens_rough(api_messages)
             request_pressure_tokens = approx_tokens + (
                 _estimate_tools_tokens_rough(tools_for_api)
@@ -2518,11 +2800,26 @@ def run_conversation(
                 agent._emit_status(_pre_api_status)
             _last_preflight_pressure = request_pressure_tokens
             _pre_api_input = messages
+            _pre_compress_len = len(messages)
             messages, active_system_prompt = agent._compress_context(
                 messages,
                 system_message,
                 approx_tokens=request_pressure_tokens,
                 task_id=effective_task_id,
+            )
+            # Same trail entry as the post-tool boundary: name the sanctioned
+            # cache break so the next request's divergence is attributed.
+            note_history_mutation_intent(
+                component="compression",
+                reason="pre_api_boundary",
+                session_id=agent.session_id or "",
+                turn_id=turn_id,
+                extra={
+                    "api_call": api_call_count,
+                    "messages_before": _pre_compress_len,
+                    "messages_after": len(messages),
+                    "approx_tokens": request_pressure_tokens,
+                },
             )
             if messages is _pre_api_input and compression_skipped_due_to_lock(agent):
                 # #69870 lock-skip: another path holds this session's
@@ -2821,6 +3118,27 @@ def run_conversation(
                         _recovery_effort or "unchanged/unspecified",
                     )
                     tool_guardrail_recovery_request_logged = True
+
+                # Measure prefix stability on the FULLY assembled request —
+                # after every sanitizer, injection, cache decoration and
+                # provider redecoration above, because those bytes are what
+                # the provider caches. One line per call records where this
+                # request diverged from its predecessor and which mutation
+                # events were logged in between, so a mid-turn re-prefill can
+                # be attributed to a component instead of guessed at.
+                _prefix_tracker = _prefix_stability_tracker(agent)
+                if _prefix_tracker is not None:
+                    _wire_messages = api_kwargs.get("messages")
+                    if not isinstance(_wire_messages, list):
+                        _wire_messages = api_kwargs.get("input")
+                    if not isinstance(_wire_messages, list):
+                        _wire_messages = api_messages
+                    _prefix_tracker.observe(
+                        _wire_messages,
+                        session_id=agent.session_id or "",
+                        turn_id=turn_id,
+                        api_call=api_call_count,
+                    )
 
                 try:
                     from hermes_cli.lifecycle import (
@@ -7196,18 +7514,8 @@ def run_conversation(
                     _turn_exit_reason = "approval_denial_breaker"
                     count = approval_breaker_halt.get("count")
                     threshold = approval_breaker_halt.get("threshold")
-                    tool_name = str(
-                        approval_breaker_halt.get("tool_name") or "terminal"
-                    )
-                    denial_count = (
-                        f"{count}回連続で" if isinstance(count, int) else "連続で"
-                    )
-                    final_response = (
-                        f"このターンで {tool_name} の危険操作が{denial_count}拒否されたため、"
-                        "危険操作の自動再試行を止め、このターンを終了しました。"
-                        "次のメッセージでは通常の読み取り・編集・テストをそのまま"
-                        "続けられます。必要な操作なら内容を確認して明示承認するか、"
-                        "手元の端末で実行してください。"
+                    final_response = approval_breaker_final_message(
+                        approval_breaker_halt
                     )
                     # This is an intentional policy stop, not an
                     # infrastructure/tool failure. Keep the turn successful
@@ -7352,6 +7660,7 @@ def run_conversation(
                         _clear_warn()
                     agent._safe_print("  ⟳ compacting context…")
                     _post_tool_input = messages
+                    _pre_compress_len = len(messages)
                     # Route the overhead-aware _real_tokens (computed above) into compression, not
                     # the bare last_prompt_tokens — which is 0 in the no-usage fallback, hiding the
                     # true request size from the engine's overflow guard (upstream PR #77169 review).
@@ -7359,6 +7668,24 @@ def run_conversation(
                         messages, system_message,
                         approx_tokens=_real_tokens,
                         task_id=effective_task_id,
+                    )
+                    # Compression is the one sanctioned cache break. Name it in
+                    # the mutation trail so the next request's divergence is
+                    # attributed to it instead of reading as unexplained. The
+                    # counts are recorded rather than a before/after diff: an
+                    # in-place compaction can rewrite the caller's own dicts,
+                    # which would make a snapshot diff under-report.
+                    note_history_mutation_intent(
+                        component="compression",
+                        reason="post_tool_boundary",
+                        session_id=agent.session_id or "",
+                        turn_id=turn_id,
+                        extra={
+                            "api_call": api_call_count,
+                            "messages_before": _pre_compress_len,
+                            "messages_after": len(messages),
+                            "approx_tokens": _real_tokens,
+                        },
                     )
                     if (
                         messages is _post_tool_input
@@ -7410,43 +7737,40 @@ def run_conversation(
                     # large-window models long before should_compress() (≈50% of
                     # the window) would ever fire. Deterministic, no LLM call;
                     # protects the recent tail. No-op unless proactive_prune_tokens
-                    # is configured and _real_tokens is above it — and even then
-                    # the prune only commits when it reclaims at least
-                    # proactive_prune_min_reclaim_tokens, so prompt-cache breaks
-                    # stay episodic like compression's (the one sanctioned cache
-                    # break) instead of firing every tool iteration. See
-                    # ContextCompressor.prune_tool_results_only.
+                    # is configured and the current reading is above it.
+                    #
+                    # The commit is DEFERRED to the turn boundary rather than
+                    # run here. A commit rewrites tool results the provider has
+                    # already cached, so it invalidates the prefix from the
+                    # earliest rewritten message forward; doing that between two
+                    # calls of a live tool loop makes the NEXT call of the same
+                    # turn re-prefill from cold — measured at 5-7 minutes on a
+                    # 100K-token local-model session, paid while the user is
+                    # still waiting for this turn's answer. Holding the rewrite
+                    # until the turn's last call has already been made keeps the
+                    # cache-breaking edit off the turn's critical path and
+                    # collapses repeat firings into a single boundary rewrite,
+                    # while the reclaimed tokens still benefit every later turn.
+                    # See _flush_deferred_tool_result_prune.
                     # getattr guard: plugin context engines predating the hook and
                     # minimal test doubles (SimpleNamespace compressors) lack the
                     # method — treat absence as a no-op.
-                    _prune = getattr(_compressor, "prune_tool_results_only", None)
-                    if callable(_prune):
-                        try:
-                            _pruned_msgs, _pruned_n = _prune(
-                                messages, current_tokens=_real_tokens
+                    if callable(
+                        getattr(_compressor, "prune_tool_results_only", None)
+                    ) and _proactive_prune_armed(_compressor, _real_tokens):
+                        if _deferred_prune_tokens is None:
+                            note_history_mutation_intent(
+                                component="proactive_prune",
+                                reason="deferred_to_turn_boundary",
+                                session_id=agent.session_id or "",
+                                turn_id=turn_id,
+                                extra={
+                                    "api_call": api_call_count,
+                                    "observed_tokens": _real_tokens,
+                                },
                             )
-                        except Exception:
-                            logger.debug(
-                                "proactive tool-result prune failed; skipping",
-                                exc_info=True,
-                            )
-                            _pruned_msgs, _pruned_n = messages, 0
-                        # Standard no-op caller contract: only commit when the
-                        # engine returned a NEW list object with a non-zero count.
-                        if _pruned_n and _pruned_msgs is not messages:
-                            # Do NOT rebuild conversation_history here. The compressor
-                            # atomically rewrites the active transcript with the durable
-                            # rearm threshold, then stamps every returned row with
-                            # _DB_PERSISTED_MARKER, so the marker-based flush dedup (see
-                            # _flush_messages_to_session_db) prevents duplicate writes.
-                            # Calling
-                            # conversation_history_after_compression (a compaction-only
-                            # helper keyed on the _last_compaction_in_place flag) would be
-                            # a no-op at best, and on a stale in-place flag could seed
-                            # this turn's fresh, not-yet-persisted rows into history_ids
-                            # and skip writing them.
-                            messages = _pruned_msgs
-                
+                        _deferred_prune_tokens = _real_tokens
+
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages
                 
@@ -8224,6 +8548,14 @@ def run_conversation(
                 messages.append({"role": "assistant", "content": final_response})
                 break
     
+    # Turn boundary: the last API call of this turn has been made, so a
+    # transcript rewrite can no longer cost this turn a re-prefill. Commit the
+    # tool-result prune the post-tool gate held back, if any.
+    messages = _flush_deferred_tool_result_prune(
+        agent, messages, _deferred_prune_tokens, turn_id=turn_id
+    )
+    agent._session_messages = messages
+
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
@@ -8245,6 +8577,56 @@ def run_conversation(
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )
 
+
+def run_conversation(agent, *args, **kwargs) -> Dict[str, Any]:
+    """Register the turn process-wide, then run it.
+
+    The bookkeeping around :func:`_run_conversation_core` is what makes the
+    background-review idle gate work across sessions (H-034 / CR-008):
+
+    * a live turn — any session, any surface — cancels every background review
+      running anywhere in this process, not just the one its own agent spawned;
+    * the turn stays registered for its whole duration, so a review about to
+      start in another session can see that the shared backend is busy and
+      wait instead of queueing behind a user who is still waiting.
+
+    Maintenance turns (the review fork itself, the curator sweep) register as
+    such: they occupy the backend, so they hold the gate closed, but they do
+    not cancel each other and they never cancel themselves.
+    """
+    kind = (
+        live_turn_registry.TURN_KIND_MAINTENANCE
+        if live_turn_registry.is_maintenance_agent(agent)
+        else live_turn_registry.TURN_KIND_LIVE
+    )
+    if kind == live_turn_registry.TURN_KIND_LIVE:
+        try:
+            live_turn_registry.cancel_background_reviews(
+                "superseded by a new live turn"
+            )
+        except Exception:
+            logger.debug(
+                "cross-session background-review cancellation failed",
+                exc_info=True,
+            )
+    token = None
+    try:
+        token = live_turn_registry.begin_turn(agent, kind=kind)
+    except Exception:
+        logger.debug("live-turn registration failed", exc_info=True)
+    try:
+        return _run_conversation_core(agent, *args, **kwargs)
+    finally:
+        try:
+            live_turn_registry.end_turn(agent, token)
+        except Exception:
+            logger.debug("live-turn deregistration failed", exc_info=True)
+
+
+# Keep ``inspect.signature`` and ``inspect.getsource`` pointed at the loop
+# itself — both follow ``__wrapped__``, and callers (plus the source-pinning
+# wiring tests) are asking about the turn body, not this bookkeeping shell.
+run_conversation.__wrapped__ = _run_conversation_core
 
 
 __all__ = ["run_conversation"]

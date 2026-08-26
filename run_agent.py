@@ -1910,6 +1910,7 @@ class AIAgent:
         intentionally distinct from an explicit ``focus=None`` so a manual
         no-argument ``/refine`` remains immediate.
         """
+        from agent import live_turn_registry
         from agent.background_review import spawn_background_review_thread
         from tools.thread_context import propagate_context_to_thread
 
@@ -1917,7 +1918,23 @@ class AIAgent:
         if automatic:
             focus = None
         delay = self._background_review_idle_delay_seconds() if automatic else 0.0
-        cancel_event = threading.Event() if delay > 0 else None
+        if automatic:
+            gate_enabled, gate_poll, gate_max_wait = (
+                live_turn_registry.idle_gate_settings()
+            )
+        else:
+            # Manual /refine is a user request they are waiting on, so it is a
+            # foreground turn in everything but name — never idle-gated.
+            gate_enabled, gate_poll, gate_max_wait = (False, 0.0, 0.0)
+        # This review is spawned from inside its own turn's finalizer, so that
+        # turn is still registered. Snapshot its tokens now and exclude them
+        # from every gate check: tokens are never reused, so a stale exclusion
+        # cannot hide a later turn.
+        own_turn_tokens = frozenset(getattr(self, "_live_turn_tokens", None) or ())
+        # Automatic reviews always carry a cancellation event now: the idle
+        # gate can park one for minutes, and a live turn in any session must be
+        # able to drop it before the fork issues an API call.
+        cancel_event = threading.Event() if (delay > 0 or automatic) else None
         target, _prompt = spawn_background_review_thread(
             self,
             messages_snapshot,
@@ -1925,6 +1942,8 @@ class AIAgent:
             review_skills=review_skills,
             focus=focus,
             cancellation_event=cancel_event,
+            idle_gated=gate_enabled,
+            idle_gate_exclude=own_turn_tokens,
         )
         # Capture the caller's context before deferring the worker.  Creating
         # the wrapper from the Timer thread would lose the active profile and
@@ -1954,16 +1973,55 @@ class AIAgent:
                 _start_review_thread()
             return
 
-        if delay <= 0:
+        def _busy_reason() -> Optional[str]:
+            """What is occupying the shared backend, or None when it is idle.
+
+            The gate is global on purpose (H-034): this agent being free says
+            nothing about the single local backend every Discord session, cron
+            job and maintenance fork shares.
+            """
+            if not gate_enabled:
+                return None
+            try:
+                return live_turn_registry.backend_busy_reason(
+                    exclude=own_turn_tokens
+                )
+            except Exception:
+                logger.debug("background-review idle gate check failed", exc_info=True)
+                return None
+
+        def _install_cancel_event() -> bool:
+            """Publish ``cancel_event`` so any live turn can drop this review."""
+            lock = getattr(self, "_background_review_lock", None)
+            if lock is None:
+                if getattr(self, "_background_review_closing", False):
+                    return False
+                self._background_review_cancel_event = cancel_event
+                return True
+            with lock:
+                if getattr(self, "_background_review_closing", False):
+                    return False
+                self._background_review_cancel_event = cancel_event
+                return True
+
+        if delay <= 0 and not _busy_reason():
             self._cancel_background_review_timer()
-            if _launch_allowed():
+            if _launch_allowed() and _install_cancel_event():
                 _start_review_thread()
             return
 
         self._cancel_background_review_timer()
-        timer_ref = None
+        # A busy backend re-arms the timer instead of queueing behind the user,
+        # up to ``idle_gate_max_wait_seconds`` (<= 0 waits indefinitely). Giving
+        # up is cheap: the next turn that trips the nudge interval spawns the
+        # review again.
+        deadline = (
+            time.monotonic() + gate_max_wait
+            if gate_enabled and gate_max_wait > 0
+            else None
+        )
 
-        def _delayed_start() -> None:
+        def _attempt(timer_ref: Any) -> None:
             lock = getattr(self, "_background_review_lock", None)
             if lock is None:
                 current = getattr(self, "_background_review_timer", None)
@@ -1975,31 +2033,48 @@ class AIAgent:
                     if getattr(self, "_background_review_timer", None) is not timer_ref:
                         return
                     self._background_review_timer = None
-            # Keep ``_background_review_cancel_event`` installed until the
-            # review fork registers itself. A foreground turn arriving after
-            # the Timer fired but before registration can therefore still
-            # cancel the launch without racing a hidden API call.
-            _start_review_thread()
-
-        timer_ref = threading.Timer(delay, _delayed_start)
-        timer_ref.daemon = True
-        lock = getattr(self, "_background_review_lock", None)
-        if lock is None:
-            if getattr(self, "_background_review_closing", False):
+            busy = _busy_reason()
+            if not busy:
+                # Keep ``_background_review_cancel_event`` installed until the
+                # review fork registers itself. A foreground turn arriving after
+                # the Timer fired but before registration can therefore still
+                # cancel the launch without racing a hidden API call.
+                _start_review_thread()
                 return
-            self._background_review_timer = timer_ref
-            self._background_review_cancel_event = cancel_event
-        else:
-            with lock:
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.debug(
+                    "background review gave up waiting for an idle backend: %s",
+                    busy,
+                )
+                self._cancel_background_review_timer()
+                return
+            logger.debug("background review deferred; backend busy: %s", busy)
+            if not _arm(gate_poll if gate_poll > 0 else delay):
+                self._cancel_background_review_timer()
+
+        def _arm(interval: float) -> bool:
+            timer_ref = threading.Timer(interval, lambda: _attempt(timer_ref))
+            timer_ref.daemon = True
+            lock = getattr(self, "_background_review_lock", None)
+            if lock is None:
                 if getattr(self, "_background_review_closing", False):
-                    return
+                    return False
                 self._background_review_timer = timer_ref
                 self._background_review_cancel_event = cancel_event
-        try:
-            timer_ref.start()
-        except Exception:
-            self._cancel_background_review_timer()
-            raise
+            else:
+                with lock:
+                    if getattr(self, "_background_review_closing", False):
+                        return False
+                    self._background_review_timer = timer_ref
+                    self._background_review_cancel_event = cancel_event
+            try:
+                timer_ref.start()
+            except Exception:
+                self._cancel_background_review_timer()
+                raise
+            return True
+
+        _arm(delay if delay > 0 else (gate_poll if gate_poll > 0 else 1.0))
 
     def _build_memory_write_metadata(
         self,
@@ -8207,6 +8282,18 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
+        # Hold this task's sandbox against the terminal-tool idle sweep for as
+        # long as the turn runs. The sweep measures idleness by the last tool
+        # call, which reads a turn parked in one long API call as abandoned and
+        # retires the environment out from under it (H-026). Released in the
+        # innermost finally so an early return, an interrupt, or a raise all
+        # unregister. Best-effort on both sides: bookkeeping for a cleanup
+        # heuristic must never be able to fail a turn.
+        try:
+            from tools.env_activity import register_active_turn
+            register_active_turn(relay_turn_id, effective_task_id)
+        except Exception:
+            logger.debug("active-turn env registration skipped", exc_info=True)
         try:
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
@@ -8309,6 +8396,15 @@ class AIAgent:
                             relay_lease
                         )
                 finally:
+                    # The turn is over: let the idle sweep reclaim this task's
+                    # environment again on its normal schedule.
+                    try:
+                        from tools.env_activity import release_active_turn
+                        release_active_turn(relay_turn_id)
+                    except Exception:
+                        logger.debug(
+                            "active-turn env release skipped", exc_info=True
+                        )
                     # Always clear mid-turn labels when the turn exits — including
                     # interrupted early returns that skip finalize_turn. Keep ts.
                     try:

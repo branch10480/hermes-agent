@@ -170,10 +170,16 @@ def _record_approval_breaker_halt(
     if not isinstance(metadata, dict):
         return
 
+    # Only the redacted denial detail crosses over: a reason code, an effect
+    # class, and a vetted alternative. The blocked command itself never enters
+    # this channel, so the turn-ending message cannot echo it back.
     agent._approval_breaker_halt = {
         "tool_name": function_name,
         "count": metadata.get("count"),
         "threshold": metadata.get("threshold"),
+        "reason_code": metadata.get("reason_code"),
+        "effect_class": metadata.get("effect_class"),
+        "safe_alternative": metadata.get("safe_alternative"),
     }
 
 

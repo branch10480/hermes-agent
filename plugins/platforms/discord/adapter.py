@@ -8585,11 +8585,15 @@ def _define_discord_view_classes() -> None:
             # A click that lands after the approval wait timed out (count == 0)
             # must not claim "Approved" — the command was already denied.
             try:
+                from agent.redact import session_key_fingerprint
                 from tools.approval import resolve_gateway_approval
                 count = resolve_gateway_approval(self.session_key, choice)
+                # The session key embeds channel, thread, and participant IDs
+                # and the display name identifies a person; logs persist, so
+                # neither may be written out in the clear.
                 logger.info(
-                    "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                    count, self.session_key, choice, interaction.user.display_name,
+                    "Discord button resolved %d approval(s) for session %s (choice=%s)",
+                    count, session_key_fingerprint(self.session_key), choice,
                 )
             except Exception as exc:
                 logger.error("Failed to resolve gateway approval from button: %s", exc)
@@ -8726,10 +8730,11 @@ def _define_discord_view_classes() -> None:
                 )
                 if result_text:
                     await interaction.followup.send(result_text)
+                from agent.redact import session_key_fingerprint
                 logger.info(
                     "Discord button resolved slash-confirm for session %s "
-                    "(choice=%s, user=%s)",
-                    self.session_key, choice, interaction.user.display_name,
+                    "(choice=%s)",
+                    session_key_fingerprint(self.session_key), choice,
                 )
             except Exception as exc:
                 logger.error("Discord slash-confirm resolve failed: %s", exc, exc_info=True)
