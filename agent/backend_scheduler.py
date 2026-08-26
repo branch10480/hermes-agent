@@ -266,6 +266,13 @@ class Ticket:
     waited_seconds: float = 0.0
     over_capacity: bool = False
     reentrant: bool = False
+    # The concurrency limit in force when this permit was issued. Carried on
+    # the ticket so :func:`release` — which runs on the latency-critical path,
+    # between the response arriving and the next waiter waking — needs no
+    # config read at all. A config read there would delay the wakeup, and a
+    # failed one would silently fall back to 1 and under-promote a multi-slot
+    # backend. A limit changed mid-flight takes effect on the next acquire.
+    capacity: int = _DEFAULT_MAX_CONCURRENT
     event: threading.Event = field(default_factory=threading.Event)
 
     @property
@@ -334,6 +341,26 @@ def _promote_locked(capacity: int) -> None:
         nxt = _waiting.pop(0)
         _grant_locked(nxt)
         nxt.event.set()
+
+
+def _abandon(ticket: Ticket, capacity: int) -> None:
+    """Drop a ticket whose admission could not be completed.
+
+    Wherever it ended up — still queued, or granted by a concurrent release
+    while admission was failing — it is removed and the permit handed on. The
+    alternative is the failure mode this guards: a permit counted as held by a
+    caller that never received the ticket and so can never release it, which
+    parks every later caller behind a full queue until each one's deadline
+    expires and it submits over capacity.
+    """
+    with _lock:
+        if ticket in _waiting:
+            _waiting.remove(ticket)
+        _active.pop(ticket.seq, None)
+        _promote_locked(capacity)
+    state = _thread_state()
+    state.depth = 0
+    state.ticket = None
 
 
 def _percentile(samples: List[float], fraction: float) -> float:
@@ -473,13 +500,14 @@ def acquire(
             state.depth = 0
             state.ticket = None
 
+        capacity = cfg.max_concurrent_requests
         ticket = Ticket(
             seq=next(_seq),
             priority=priority if priority is not None else _priority_for(agent),
             session=_session_label(agent),
             enqueued_at=time.monotonic(),
+            capacity=capacity,
         )
-        capacity = cfg.max_concurrent_requests
         with _lock:
             blockers = _blockers_locked(ticket.priority, capacity)
             if blockers == 0 and len(_active) < capacity:
@@ -492,61 +520,86 @@ def acquire(
         logger.debug("backend scheduler acquire failed", exc_info=True)
         return None
 
-    deadline = _wait_deadline_seconds(cfg, blockers, ticket.priority)
+    # Everything from here shares the same contract as the block above: this
+    # function may not raise into a turn, and it may not leave a permit
+    # recorded as held by a caller that never got the ticket back.
+    granted = None
     try:
-        outcome = _wait_for_grant(ticket, deadline, cfg, on_wait, should_abort)
-    except Exception:
-        logger.debug("backend scheduler wait failed", exc_info=True)
-        outcome = "expired"
+        deadline = _wait_deadline_seconds(cfg, blockers, ticket.priority)
+        try:
+            outcome = _wait_for_grant(ticket, deadline, cfg, on_wait, should_abort)
+        except Exception:
+            logger.debug("backend scheduler wait failed", exc_info=True)
+            outcome = "expired"
 
-    with _lock:
-        if ticket.seq in _active:
-            # A grant landed while we were deciding to give up; keep it.
-            outcome = "granted"
-        elif ticket in _waiting:
-            _waiting.remove(ticket)
-            if outcome != "aborted":
-                # Fail open: submit anyway rather than fail the turn. Counting
-                # it as active keeps the accounting honest, so the queue does
-                # not also promote a fresh waiter on top of this one.
-                _grant_locked(ticket, over_capacity=True)
+        with _lock:
+            if ticket.seq in _active:
+                # A grant landed while we were deciding to give up; keep it.
                 outcome = "granted"
-        else:
-            # Neither queued nor holding — the state was reset underneath us.
-            outcome = "abandoned"
+            elif ticket in _waiting:
+                _waiting.remove(ticket)
+                if outcome != "aborted":
+                    # Fail open: submit anyway rather than fail the turn.
+                    # Counting it as active keeps the accounting honest, so the
+                    # queue does not also promote a fresh waiter on top of it.
+                    _grant_locked(ticket, over_capacity=True)
+                    outcome = "granted"
+            else:
+                # Neither queued nor holding — state was reset underneath us.
+                outcome = "abandoned"
 
-    state = _thread_state()
-    if outcome != "granted":
-        state.depth = 0
-        state.ticket = None
+        state = _thread_state()
+        if outcome != "granted":
+            state.depth = 0
+            state.ticket = None
+            return None
+
+        # Claim it on the thread and mark it returnable *before* the logging
+        # below, so a failure there hands the permit to the caller (who will
+        # release it) rather than stranding it in ``_active``.
+        state.depth = 1
+        state.ticket = ticket
+        granted = ticket
+
+        if ticket.over_capacity:
+            logger.warning(
+                "Backend queue wait exceeded %.0fs for %s/%s — submitting "
+                "anyway (%d in flight, %d queued)",
+                deadline,
+                _priority_name(ticket.priority),
+                ticket.session,
+                len(_active),
+                len(_waiting),
+            )
+        elif ticket.waited_seconds >= 1.0:
+            logger.info(
+                "Backend queue admitted %s/%s after %.1fs "
+                "(%d in flight, %d queued)",
+                _priority_name(ticket.priority),
+                ticket.session,
+                ticket.waited_seconds,
+                len(_active),
+                len(_waiting),
+            )
+        return ticket
+    except Exception:
+        logger.debug("backend scheduler admission failed", exc_info=True)
+        if granted is not None:
+            # The permit is genuinely ours and the thread state says so; the
+            # caller's ``finally`` will release it.
+            return granted
+        _abandon(ticket, capacity)
         return None
-
-    if ticket.over_capacity:
-        logger.warning(
-            "Backend queue wait exceeded %.0fs for %s/%s — submitting anyway "
-            "(%d in flight, %d queued)",
-            deadline,
-            _priority_name(ticket.priority),
-            ticket.session,
-            len(_active),
-            len(_waiting),
-        )
-    elif ticket.waited_seconds >= 1.0:
-        logger.info(
-            "Backend queue admitted %s/%s after %.1fs (%d in flight, %d queued)",
-            _priority_name(ticket.priority),
-            ticket.session,
-            ticket.waited_seconds,
-            len(_active),
-            len(_waiting),
-        )
-    state.depth = 1
-    state.ticket = ticket
-    return ticket
 
 
 def release(ticket: Optional[Ticket]) -> None:
-    """Give the permit back and wake the best-ranked waiter immediately."""
+    """Give the permit back and wake the best-ranked waiter immediately.
+
+    This is the latency-critical half of the design: the next waiter is woken
+    from here, so the work between the response arriving and the wakeup has to
+    stay minimal. The concurrency limit therefore comes off the ticket rather
+    than from a config read — see ``Ticket.capacity``.
+    """
     if ticket is None:
         return
     try:
@@ -556,7 +609,9 @@ def release(ticket: Optional[Ticket]) -> None:
             return
         state.depth = 0
         state.ticket = None
-        capacity = settings().max_concurrent_requests
+        capacity = ticket.capacity
+        if capacity < 1:
+            capacity = _DEFAULT_MAX_CONCURRENT
         with _lock:
             _active.pop(ticket.seq, None)
             if ticket.granted_at is not None:

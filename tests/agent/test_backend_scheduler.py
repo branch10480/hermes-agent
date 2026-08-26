@@ -372,6 +372,113 @@ def test_interrupted_caller_leaves_the_queue(scheduler):
     backend_scheduler.release(holder)
 
 
+def test_a_raise_after_the_grant_still_hands_the_permit_back(scheduler):
+    """The permit is the caller's before anything that can raise runs.
+
+    Admission's bookkeeping — the log line saying who got in and how long they
+    waited — sits after the grant. If that raises and the ticket is dropped,
+    the permit stays counted in ``_active`` held by nobody: every later caller
+    then queues behind it until its own deadline expires and it submits over
+    capacity. Permanently, for the life of the process.
+    """
+    scheduler(queue_wait_seconds=0.2)
+
+    class _ExplodingLogger:
+        def warning(self, *_a, **_kw):
+            raise RuntimeError("log sink is on fire")
+
+        def info(self, *_a, **_kw):
+            raise RuntimeError("log sink is on fire")
+
+        def debug(self, *_a, **_kw):
+            pass
+
+    holder = backend_scheduler.acquire(_StubAgent("holder"))
+    monkey = _ExplodingLogger()
+    original = backend_scheduler.logger
+    backend_scheduler.logger = monkey
+    try:
+        order: list = []
+        waiter = _Claimant(_StubAgent("waiter"), log=order, name="w").start()
+        waiter.join()
+    finally:
+        backend_scheduler.logger = original
+
+    assert waiter.ticket is not None, "the caller must still get its permit"
+    backend_scheduler.release(waiter.ticket)
+    backend_scheduler.release(holder)
+    assert backend_scheduler.snapshot()["active"] == []
+
+
+def test_a_raise_before_the_grant_leaves_nothing_in_the_queue(scheduler):
+    """The other half: a failure while queued must not wedge the queue.
+
+    A ticket abandoned in ``_waiting`` (or granted by a concurrent release
+    while admission was failing) holds a place nobody is coming back for.
+    """
+    scheduler(queue_wait_seconds=30.0)
+    holder = backend_scheduler.acquire(_StubAgent("holder"))
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("deadline arithmetic failed")
+
+    original = backend_scheduler._wait_deadline_seconds
+    backend_scheduler._wait_deadline_seconds = _boom
+    try:
+        order: list = []
+        doomed = _Claimant(_StubAgent("doomed"), log=order, name="d").start()
+        doomed.join()
+    finally:
+        backend_scheduler._wait_deadline_seconds = original
+
+    assert doomed.ticket is None, "a failed admission holds no permit"
+    snapshot = backend_scheduler.snapshot()
+    assert snapshot["waiting"] == []
+    assert len(snapshot["active"]) == 1, "only the real holder is counted"
+
+    # And the queue still works: the next caller is admitted on the release.
+    backend_scheduler.release(holder)
+    nxt = backend_scheduler.acquire(_StubAgent("next"))
+    assert nxt is not None and nxt.waited_seconds < 1.0
+    backend_scheduler.release(nxt)
+
+
+def test_release_wakes_the_next_waiter_without_reading_config(scheduler):
+    """The wakeup path must not depend on a config read.
+
+    ``release`` sits between the response arriving and the next waiter waking.
+    A config read there costs latency on every single call, and a failed one
+    used to fall back to capacity 1 — silently under-promoting a multi-slot
+    backend. The limit rides on the ticket instead, so a config layer that is
+    broken (or just slow) cannot touch this path.
+    """
+    scheduler(max_concurrent_requests=2, queue_wait_seconds=30.0)
+    order: list = []
+    a = _Claimant(_StubAgent("a"), log=order, name="a").start()
+    b = _Claimant(_StubAgent("b"), log=order, name="b").start()
+    a.join()
+    b.join()
+    assert a.ticket.capacity == 2, "the limit is captured on the ticket"
+
+    waiter = _Claimant(_StubAgent("c"), log=order, name="c").start()
+    assert _wait_until(lambda: len(_queued_priorities()) == 1)
+
+    def _boom():
+        raise RuntimeError("config layer is down")
+
+    original = backend_scheduler.settings
+    backend_scheduler.settings = _boom
+    try:
+        a.release()
+        waiter.join()
+    finally:
+        backend_scheduler.settings = original
+
+    assert order[-1] == "c", "the waiter was woken without any config read"
+    waiter.release()
+    b.release()
+
+
 def test_reentrant_acquire_on_one_thread_does_not_deadlock(scheduler):
     """A permit holder that re-enters must not wait on itself."""
     outer = backend_scheduler.acquire(_StubAgent("a"))
