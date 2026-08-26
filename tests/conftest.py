@@ -22,6 +22,7 @@ test runner at ``scripts/run_tests.sh``.
 import asyncio
 import atexit
 import os
+import shlex
 import shutil
 import sqlite3
 import sys
@@ -1109,6 +1110,13 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     )
     config.addinivalue_line(
         "markers",
+        f"{_REAL_REPO_GIT_GUARD_BYPASS_MARK}: allow a test to run mutating "
+        "git commands against the checkout the suite lives in (incident "
+        "H-035). Nothing in the default suite needs this — the fix for a "
+        "test that trips the guard is a tmp_path repository, not this mark.",
+    )
+    config.addinivalue_line(
+        "markers",
         "require_symlinks: skip the test if symbolic links cannot be "
         "created in the current environment (needs admin/developer mode "
         "on Windows).",
@@ -1680,3 +1688,452 @@ def _moa_caches_isolated():
     yield
     moa._preset_cache.clear()
     moa._runtime_cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# Real-checkout git-mutation guard (incident H-035)
+# ---------------------------------------------------------------------------
+# ``hermes update`` autostashes before it moves HEAD: ``git stash push
+# --include-untracked -m hermes-update-autostash-<UTC>`` → ``git checkout main``
+# → ``git reset`` → ``git pull`` → ``git checkout <original branch>``.  A test
+# that reaches that code path without redirecting ``hermes_cli.main.PROJECT_ROOT``
+# at a throwaway repository runs the whole sequence against the developer's own
+# checkout: uncommitted work vanishes into a stash entry and HEAD moves under
+# the running editor.  Six such stash entries accumulated on this checkout
+# between 2026-08-25 and 2026-08-26 before the cause was found.
+#
+# The guard deliberately sits at the *subprocess* layer rather than around any
+# one helper (``_stash_local_changes_if_needed``, ``_run_logged_subprocess``,
+# ...).  It does not need to know which mock a test forgot — only that no git
+# process is permitted to mutate the repository the tests are running from.
+# Read-only git is untouched, and git against any OTHER repository (a
+# ``tmp_path`` fixture repo) is untouched, so correctly-hermetic tests such as
+# ``tests/hermes_cli/test_update_autostash.py`` keep working unchanged.
+#
+# The contract: **a test that fires a mutating git command at the real checkout
+# always fails.**  The blocked call raises, and — because the update path wraps
+# most git calls in broad ``except Exception`` handlers that would swallow that
+# — every violation is also recorded and re-raised at teardown.
+
+_REAL_REPO_GIT_GUARD_BYPASS_MARK = "real_repo_git_mutation_allowed"
+
+# The checkout the test suite itself lives in.  tests/conftest.py -> repo root.
+REAL_REPO_ROOT = Path(__file__).resolve().parent.parent
+_REAL_REPO_GIT_DIR = REAL_REPO_ROOT / ".git"
+
+_GIT_BASENAMES = frozenset({"git", "git.exe"})
+
+# Shell/launcher executables whose arguments are themselves a command line.
+_GIT_GUARD_WRAPPERS = frozenset({
+    "sh", "bash", "zsh", "dash", "env", "nohup", "setsid", "timeout",
+    "sudo", "xargs", "nice", "ionice", "stdbuf", "flock", "script",
+})
+
+# ``git <opt> ...`` options that consume the following token as their value.
+_GIT_GLOBAL_VALUE_OPTS = frozenset({
+    "-C", "-c", "--git-dir", "--work-tree", "--namespace",
+})
+
+# Subcommands that always write to the repository (index, refs, worktree,
+# object store or remote).  ``fetch`` is included: it is a network call plus a
+# ref update on the real repo, which no hermetic test should ever make.
+_GIT_MUTATING_SUBCOMMANDS = frozenset({
+    "add", "am", "apply", "checkout", "checkout-index", "cherry-pick",
+    "clean", "commit", "fetch", "filter-branch", "gc", "merge", "mv",
+    "prune", "pull", "push", "read-tree", "rebase", "repack", "reset",
+    "restore", "revert", "rm", "stash", "switch", "update-index",
+    "update-ref",
+})
+
+_GIT_CONFIG_READ_FLAGS = frozenset({
+    "--get", "--get-all", "--get-regexp", "--get-urlmatch", "--get-color",
+    "--get-colorbool", "-l", "--list",
+})
+_GIT_CONFIG_WRITE_FLAGS = frozenset({
+    "--unset", "--unset-all", "--replace-all", "--add", "-e", "--edit",
+    "--rename-section", "--remove-section",
+})
+_GIT_BRANCH_WRITE_FLAGS = frozenset({
+    "-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy",
+    "-f", "--force", "-u", "--set-upstream-to", "--unset-upstream",
+    "--edit-description",
+})
+_GIT_TAG_WRITE_FLAGS = frozenset({
+    "-d", "--delete", "-f", "--force", "-a", "--annotate", "-s", "--sign",
+    "-m", "--message",
+})
+
+
+def _git_positionals(args):
+    return [a for a in args if not a.startswith("-")]
+
+
+def _git_has_any(args, flags):
+    return any(a in flags or a.split("=", 1)[0] in flags for a in args)
+
+
+def _git_first_positional(args):
+    pos = _git_positionals(args)
+    return pos[0] if pos else ""
+
+
+# Subcommands with both read-only and writing forms.  Value: predicate over the
+# subcommand's argument list, True when this particular invocation writes.
+_GIT_CONDITIONAL_SUBCOMMANDS = {
+    "branch": lambda args: _git_has_any(args, _GIT_BRANCH_WRITE_FLAGS),
+    "tag": lambda args: _git_has_any(args, _GIT_TAG_WRITE_FLAGS),
+    "config": lambda args: (
+        not _git_has_any(args, _GIT_CONFIG_READ_FLAGS)
+        and (
+            _git_has_any(args, _GIT_CONFIG_WRITE_FLAGS)
+            or len(_git_positionals(args)) >= 2
+        )
+    ),
+    "notes": lambda args: _git_first_positional(args) in {
+        "add", "append", "copy", "edit", "remove", "prune", "merge",
+    },
+    "reflog": lambda args: _git_first_positional(args) in {
+        "expire", "delete", "drop",
+    },
+    "remote": lambda args: _git_first_positional(args) in {
+        "add", "remove", "rm", "rename", "set-url", "set-head",
+        "set-branches", "prune", "update",
+    },
+    "submodule": lambda args: _git_first_positional(args) in {
+        "add", "init", "update", "deinit", "sync", "absorbgitdirs",
+        "set-url", "set-branch",
+    },
+    "symbolic-ref": lambda args: (
+        _git_has_any(args, {"-d", "--delete"})
+        or len(_git_positionals(args)) >= 2
+    ),
+    "worktree": lambda args: _git_first_positional(args) in {
+        "add", "remove", "prune", "move", "repair", "lock", "unlock",
+    },
+}
+
+
+def _basename(token: str) -> str:
+    return token.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+
+
+def _git_guard_tokenize(cmd):
+    """Flatten ``cmd`` to a token list, plus the last absolute ``cd`` in it.
+
+    Wrapper invocations (``["bash", "-c", "cd /x && git stash"]``) get their
+    payload split so the git call inside is visible; plain argv lists are left
+    alone so a commit message that happens to mention git can't be mistaken
+    for one.
+    """
+    if cmd is None:
+        return [], None
+    if isinstance(cmd, (bytes, bytearray)):
+        cmd = bytes(cmd).decode("utf-8", errors="replace")
+    if isinstance(cmd, os.PathLike):
+        cmd = os.fspath(cmd)
+
+    if isinstance(cmd, str):
+        try:
+            tokens = shlex.split(cmd)
+        except ValueError:
+            tokens = cmd.split()
+    elif isinstance(cmd, (list, tuple)):
+        raw = []
+        for item in cmd:
+            if isinstance(item, (bytes, bytearray)):
+                raw.append(bytes(item).decode("utf-8", errors="replace"))
+            elif isinstance(item, os.PathLike):
+                raw.append(os.fspath(item))
+            else:
+                raw.append(str(item))
+        tokens = list(raw)
+        if raw and _basename(raw[0]) in _GIT_GUARD_WRAPPERS:
+            tokens = []
+            for item in raw:
+                if any(ch.isspace() for ch in item):
+                    try:
+                        tokens.extend(shlex.split(item))
+                        continue
+                    except ValueError:
+                        pass
+                tokens.append(item)
+    else:
+        return [], None
+
+    shell_cd = None
+    for idx, tok in enumerate(tokens[:-1]):
+        if tok == "cd" and tokens[idx + 1].startswith("/"):
+            shell_cd = tokens[idx + 1]
+    return tokens, shell_cd
+
+
+def _parse_git_invocation(tokens, start):
+    """Split ``git [global opts] <sub> [args]`` starting at ``tokens[start]``.
+
+    Returns ``(subcommand, args, chdir, git_dir)`` or None when the invocation
+    has no subcommand (``git --version``).
+    """
+    chdir = None
+    git_dir = None
+    i = start + 1
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if not tok.startswith("-"):
+            break
+        if tok.startswith("--") and "=" in tok:
+            name, _, value = tok.partition("=")
+            if name == "--git-dir":
+                git_dir = value
+            i += 1
+            continue
+        if tok in _GIT_GLOBAL_VALUE_OPTS:
+            if i + 1 < n:
+                if tok == "-C":
+                    chdir = tokens[i + 1]
+                elif tok == "--git-dir":
+                    git_dir = tokens[i + 1]
+                i += 2
+            else:
+                i += 1
+            continue
+        i += 1
+    if i >= n:
+        return None
+    return tokens[i], list(tokens[i + 1:]), chdir, git_dir
+
+
+def _git_subcommand_mutates(subcommand: str, args) -> bool:
+    if subcommand in _GIT_MUTATING_SUBCOMMANDS:
+        return True
+    predicate = _GIT_CONDITIONAL_SUBCOMMANDS.get(subcommand)
+    return bool(predicate and predicate(args))
+
+
+def _gitdir_belongs_to_real_repo(git_dir) -> bool:
+    try:
+        resolved = Path(git_dir).resolve()
+    except OSError:
+        return False
+    return resolved == _REAL_REPO_GIT_DIR or _REAL_REPO_GIT_DIR in resolved.parents
+
+
+def _targets_real_repo(start) -> bool:
+    """True when git run from ``start`` would act on this very checkout."""
+    try:
+        current = Path(start).resolve()
+    except (OSError, ValueError):
+        return False
+    for candidate in (current, *current.parents):
+        dot_git = candidate / ".git"
+        try:
+            if dot_git.is_dir():
+                return candidate == REAL_REPO_ROOT
+            if dot_git.is_file():
+                # Linked worktree: it shares this repo's object store AND its
+                # refs/stash, so mutating it is just as destructive.
+                try:
+                    text = dot_git.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    return candidate == REAL_REPO_ROOT
+                for line in text.splitlines():
+                    if line.startswith("gitdir:"):
+                        return _gitdir_belongs_to_real_repo(
+                            line.split(":", 1)[1].strip()
+                        )
+                return candidate == REAL_REPO_ROOT
+        except OSError:
+            continue
+    return False
+
+
+def describe_real_repo_git_mutation(cmd, cwd=None):
+    """Return why ``cmd`` would mutate this checkout, or None when it is safe.
+
+    ``cwd`` is the ``cwd=`` a caller passed to subprocess (None means the
+    process working directory, which under pytest is normally the repo root —
+    the reason an unmocked ``hermes update`` hits the real repo at all).
+    """
+    tokens, shell_cd = _git_guard_tokenize(cmd)
+    if not tokens:
+        return None
+    for index, token in enumerate(tokens):
+        if _basename(token) not in _GIT_BASENAMES:
+            continue
+        parsed = _parse_git_invocation(tokens, index)
+        if parsed is None:
+            continue
+        subcommand, args, chdir, git_dir = parsed
+        if not _git_subcommand_mutates(subcommand, args):
+            continue
+
+        if git_dir is not None:
+            if not _gitdir_belongs_to_real_repo(git_dir):
+                continue
+        else:
+            base = Path(cwd) if cwd is not None else Path.cwd()
+            if shell_cd is not None:
+                base = Path(shell_cd)
+            if chdir is not None:
+                base = base / chdir
+            if not _targets_real_repo(base):
+                continue
+
+        shown = " ".join(tokens[index:index + 8])
+        where = git_dir if git_dir is not None else (cwd if cwd is not None else "<process cwd>")
+        return (
+            f"blocked `git {subcommand}` against the real checkout "
+            f"({REAL_REPO_ROOT}): {shown!r} (cwd={where})"
+        )
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _real_repo_git_mutation_guard(request, monkeypatch):
+    """Fail any test that fires a mutating git command at this checkout.
+
+    See the block comment above (incident H-035) for the why.  The usual fix
+    for a test that trips this is not the marker — it is to point
+    ``hermes_cli.main.PROJECT_ROOT`` at a ``tmp_path`` repository (as
+    ``tests/hermes_cli/test_update_autostash.py`` does) or to stub the git
+    helper the code path actually calls.
+    """
+    if request.node.get_closest_marker(_REAL_REPO_GIT_GUARD_BYPASS_MARK):
+        yield
+        return
+
+    import asyncio as _asyncio
+    import os as _os
+    import subprocess as _subprocess
+    import traceback as _traceback
+
+    violations: list[str] = []
+
+    def _check(api: str, cmd, cwd=None):
+        try:
+            reason = describe_real_repo_git_mutation(cmd, cwd)
+        except Exception:  # never let the guard itself break a test
+            return
+        if reason is None:
+            return
+        # Record the call stack: callers that swallow the RuntimeError below
+        # (banner._check_via_local_git, most of the update path) would
+        # otherwise leave the teardown report with no way to find the origin.
+        origin = "".join(_traceback.format_stack()[:-1])
+        message = (
+            f"tests/conftest.py real-repo git guard: {api} {reason}. "
+            "A test reached a real git-mutating code path (hermes update's "
+            "autostash / checkout / reset / pull sequence, most likely) "
+            "without redirecting it at a throwaway repository. Point "
+            "hermes_cli.main.PROJECT_ROOT at a tmp_path repo, or stub the "
+            "helper this path calls. See incident H-035."
+        )
+        violations.append(f"{message}\ncalled from:\n{origin}")
+        raise RuntimeError(message)
+
+    def _wrap(name, real):
+        def _guarded(cmd, *args, **kwargs):
+            _check(name, cmd, kwargs.get("cwd"))
+            return real(cmd, *args, **kwargs)
+
+        _guarded.__name__ = f"_git_guarded_{name}"
+        if hasattr(real, "__class_getitem__"):
+            _guarded.__class_getitem__ = real.__class_getitem__
+        return _guarded
+
+    real_popen = _subprocess.Popen
+
+    class _GuardedPopen(real_popen):  # type: ignore[misc, valid-type]
+        def __init__(self, cmd, *args, **kwargs):
+            _check("Popen", cmd, kwargs.get("cwd"))
+            super().__init__(cmd, *args, **kwargs)
+
+    _GuardedPopen.__name__ = "Popen"
+    _GuardedPopen.__qualname__ = "Popen"
+
+    for api in ("run", "call", "check_call", "check_output"):
+        monkeypatch.setattr(_subprocess, api, _wrap(api, getattr(_subprocess, api)))
+    monkeypatch.setattr(_subprocess, "Popen", _GuardedPopen)
+
+    for api in ("getoutput", "getstatusoutput"):
+        real = getattr(_subprocess, api)
+
+        def _guarded_shell(cmd, _real=real, _api=api, **kwargs):
+            _check(_api, cmd, None)
+            return _real(cmd, **kwargs)
+
+        monkeypatch.setattr(_subprocess, api, _guarded_shell)
+
+    real_os_system = _os.system
+    real_os_popen = _os.popen
+
+    def _guarded_os_system(command):
+        _check("os.system", command, None)
+        return real_os_system(command)
+
+    def _guarded_os_popen(cmd, *args, **kwargs):
+        _check("os.popen", cmd, None)
+        return real_os_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(_os, "system", _guarded_os_system)
+    monkeypatch.setattr(_os, "popen", _guarded_os_popen)
+
+    real_async_exec = _asyncio.create_subprocess_exec
+    real_async_shell = _asyncio.create_subprocess_shell
+
+    async def _guarded_async_exec(program, *args, **kwargs):
+        _check("asyncio.create_subprocess_exec", [program, *args], kwargs.get("cwd"))
+        return await real_async_exec(program, *args, **kwargs)
+
+    async def _guarded_async_shell(cmd, *args, **kwargs):
+        _check("asyncio.create_subprocess_shell", cmd, kwargs.get("cwd"))
+        return await real_async_shell(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(_asyncio, "create_subprocess_exec", _guarded_async_exec)
+    monkeypatch.setattr(_asyncio, "create_subprocess_shell", _guarded_async_shell)
+
+    yield
+
+    if violations:
+        # Backstop: the update path swallows most subprocess exceptions, so the
+        # RuntimeError above can vanish into an `except Exception` and leave the
+        # test green. Surface it here regardless of what the test did with it.
+        pytest.fail(
+            "real-repo git guard blocked "
+            f"{len(violations)} mutating git call(s):\n" + "\n".join(violations),
+            pytrace=False,
+        )
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _neutralize_update_check_probe():
+    """Stop the banner's update check from touching the network or the checkout.
+
+    ``banner.prefetch_update_check()`` runs ``check_for_updates()`` on a daemon
+    thread (``tui_gateway.server`` starts one on import). With a hermetic
+    ``HERMES_HOME`` its 6-hour cache file is always empty, so every run reaches
+    ``_check_via_local_git`` and shells out to ``git fetch origin main --quiet``
+    against the developer's own checkout — a real network round-trip that also
+    moves ``refs/remotes/origin/main`` and ``FETCH_HEAD``.
+
+    Because the thread is asynchronous, that spawn lands in whichever test
+    happens to be running, which is the cross-test noise
+    ``tests/test_windows_subprocess_no_window_flags.py`` documents and works
+    around per-assertion. Neutralising the two probe helpers removes it at the
+    source. Session scope matters: a function-scoped patch would race the thread.
+
+    ``check_for_updates`` itself is left alone — its cache logic is under test in
+    ``tests/hermes_cli/test_update_check.py``, and tests that want a specific
+    answer patch ``check_for_updates`` directly.
+    """
+    patcher = pytest.MonkeyPatch()
+    try:
+        from hermes_cli import banner
+
+        patcher.setattr(banner, "_check_via_local_git", lambda *_a, **_k: None)
+        patcher.setattr(banner, "_check_via_rev", lambda *_a, **_k: None)
+    except Exception:
+        # banner not importable in this environment — nothing to neutralize.
+        pass
+    yield
+    patcher.undo()

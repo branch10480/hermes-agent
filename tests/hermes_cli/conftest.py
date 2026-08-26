@@ -2,7 +2,56 @@
 
 from __future__ import annotations
 
+import contextlib
+import sys
+
 import pytest
+
+
+def _is_hermes_runtime_module(name: str) -> bool:
+    return (
+        name in ("hermes_constants", "hermes_cli", "hermes_state")
+        or name.startswith("hermes_cli.")
+        or name.startswith("hermes_state.")
+    )
+
+
+@contextlib.contextmanager
+def fresh_hermes_module_imports():
+    """Drop cached ``hermes_cli`` / ``hermes_state`` modules, then put them back.
+
+    Several kanban fixtures point ``HERMES_HOME`` at a throwaway directory and
+    then evict these modules so the next import re-reads the env var. Evicting
+    is fine; *not restoring* is what caused incident H-035.
+
+    ``hermes_cli.main`` is imported at module scope by many other test files
+    (``from hermes_cli import main as cli_main``). Once it has been dropped from
+    ``sys.modules``, those files keep a reference to the now-orphaned module
+    object while the production code re-imports a *fresh* one at call time
+    (``hermes_cli.update_cmd._m()``). Every ``patch.object(cli_main, ...)`` in
+    those files then silently patches the orphan and the real code path runs
+    completely unmocked — which is how ``test_update_venv_health.py`` and
+    ``test_update_orphan_backend_reap.py`` came to run ``hermes update``'s real
+    git sequence (fetch → autostash → checkout main → reset → pull) against the
+    developer's own checkout.
+
+    Restoring the original module objects afterwards keeps the eviction local to
+    the test that asked for it. ``importlib.reload`` needs no such treatment: it
+    mutates the module in place, so identities never change.
+    """
+    saved = {
+        name: module
+        for name, module in sys.modules.items()
+        if _is_hermes_runtime_module(name)
+    }
+    for name in saved:
+        del sys.modules[name]
+    try:
+        yield
+    finally:
+        for name in [n for n in sys.modules if _is_hermes_runtime_module(n)]:
+            del sys.modules[name]
+        sys.modules.update(saved)
 
 
 @pytest.fixture
