@@ -23,6 +23,7 @@ import sqlite3
 import re
 import time
 import uuid
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import (
@@ -3911,6 +3912,53 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
+    @contextmanager
+    def _arbitrated_backend_slot(self):
+        """Hold the shared-backend permit for one summary call (plan item 2-2).
+
+        Compression pushes at the same single-slot local backend the turns use,
+        and used to submit straight into it: a 151-second summary and a user's
+        turn arriving together left the server to arbitrate by rejecting one of
+        them. Taking a permit puts the summary in the same queue as everyone
+        else — and only when it really is that backend, so a summary pinned to
+        a hosted endpoint keeps submitting immediately as it always has.
+
+        Fail-open throughout, like the rest of the scheduler: a disengaged
+        queue, a failed config read, or a wait past its deadline all end up
+        submitting anyway, which is the behaviour that existed before this.
+        """
+        try:
+            from agent import backend_scheduler
+        except Exception:
+            logger.debug(
+                "backend scheduler unavailable for compression", exc_info=True
+            )
+            yield None
+            return
+        # The queue wait honours the host's cancellation fence: once the host
+        # has timed out this attempt, a worker parked behind a busy backend
+        # (up to the maintenance wait cap) would otherwise send a summary
+        # nobody reads. The fence hook is installed by compress_context only
+        # for the fenced call, so this degrades to no abort check elsewhere.
+        cancelled_check = getattr(self, "_compression_cancelled_check", None)
+
+        def _abort() -> bool:
+            if not callable(cancelled_check):
+                return False
+            try:
+                return bool(cancelled_check())
+            except Exception:
+                return False
+
+        with backend_scheduler.auxiliary_slot(
+            "compression",
+            model=self.summary_model or None,
+            main_base_url=self.base_url or None,
+            priority=backend_scheduler.auxiliary_priority(),
+            should_abort=_abort,
+        ) as ticket:
+            yield ticket
+
     def _generate_summary(
         self,
         turns_to_summarize: List[Dict[str, Any]],
@@ -4254,7 +4302,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             # retry (_generate_summary recursion) re-enters harmlessly.
             _aux_call_start = time.monotonic()
             try:
-                with aux_interrupt_protection():
+                with self._arbitrated_backend_slot(), aux_interrupt_protection():
                     response = call_llm(**call_kwargs)
             finally:
                 self._record_aux_compression_call(
@@ -5916,7 +5964,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             })
 
         try:
-            with aux_interrupt_protection():
+            with self._arbitrated_backend_slot(), aux_interrupt_protection():
                 response = call_llm(**call_kwargs)
         except Exception as exc:
             logger.info("micro-summarization call failed: %s", exc)

@@ -1000,6 +1000,14 @@ DEFAULT_CONFIG = {
             "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
+            # Queue the summary call behind the same admission control the
+            # turns use (agent.backend_scheduler) when it lands on the shared
+            # local backend — a summary can occupy that single slot for
+            # minutes, and submitting into an occupied one just makes the
+            # server arbitrate by rejecting. Set false to submit immediately
+            # regardless. Read for every auxiliary task under the same key;
+            # documented here because compression is the one that needs it.
+            "scheduler_arbitration": True,
         },
         # Note: session_search no longer uses an auxiliary LLM (PR #27590 —
         # single-shape tool returns DB content directly). The old
@@ -1042,6 +1050,15 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
             "language": "",
+            # How long the title upgrade waits out a busy shared backend before
+            # giving up and letting the instantly-derived title stand. A title
+            # is the one backend user nobody is waiting on, so on a single-slot
+            # local backend (agent/backend_scheduler.py) it yields the slot
+            # rather than take a place in line for it. Only applies when the
+            # title lands on that same arbitrated backend — a hosted title
+            # endpoint has its own capacity and still calls immediately. 0
+            # disables the wait entirely, which is the pre-gate behaviour.
+            "busy_defer_seconds": 90,
         },
         "memory_query_rewrite": {
             "provider": "auto",

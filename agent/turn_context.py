@@ -252,6 +252,14 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
                 getattr(agent, "model", None) == _model
                 and getattr(agent, "provider", None) == _provider
             ),
+            # This turn's own live-turn registrations. The titler waits out a
+            # busy shared backend, and every turn is registered for its whole
+            # duration — without this it would read the turn that started it as
+            # the reason to stand down, and no session would ever be titled on
+            # a backend the scheduler arbitrates.
+            exclude_turn_tokens=frozenset(
+                getattr(agent, "_live_turn_tokens", None) or ()
+            ),
         )
     except Exception:
         logger.debug("Turn-start auto-title dispatch failed", exc_info=True)

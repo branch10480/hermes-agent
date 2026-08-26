@@ -251,6 +251,7 @@ class TestMaybeAutoTitle:
                 main_runtime=None,
                 title_callback=None,
                 runtime_validator=None,
+                exclude_turn_tokens=frozenset(),
             )
 
     def test_writes_instant_title_before_the_model_runs(self, tmp_path):

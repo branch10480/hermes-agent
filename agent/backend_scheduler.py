@@ -33,13 +33,23 @@ provider keeps its own concurrency and rate limits and is untouched, so the
 default is behaviour-identical for anyone not running a local backend. A
 multi-slot local server raises ``max_concurrent_requests``.
 
-**Only the conversation loop's own model call goes through here.** Auxiliary
-work that shares the backend — compression, title generation — deliberately
-does not, and adding it needs more than an ``acquire`` call: compression can
-run on a fork/worker thread while the turn that started it is blocked waiting
-for the result, and with one permit that is a deadlock, not a queue. The
-re-entrancy guard below only covers nesting on a *single* thread. Anything
-cross-thread has to be reasoned about first (H-031 / plan item 2-2).
+**Auxiliary work shares the queue too** (H-031 / plan item 2-2). Compression
+pushes at the same single slot as the turn it serves, so it claims a permit
+through :func:`auxiliary_slot`, resolved against the auxiliary task's *own*
+endpoint — a task pointed at a hosted provider is left alone exactly like a
+hosted main model is. Title generation is the one auxiliary call that does not
+queue: it is cosmetic, so it yields the slot outright rather than take a place
+in line (see ``agent/title_generator.py``).
+
+The cross-thread deadlock this note used to warn about does not exist on the
+paths that run today, and the arrangement that rules it out is worth stating
+because a change to either half would reintroduce it: a turn's permit covers
+exactly one API call — taken immediately before the request, released in the
+same ``finally`` — and every compression trigger sits outside that window. So
+when the compression pool worker queues for its own permit, the turn thread
+blocked on that worker's result is holding nothing. The re-entrancy guard
+below still only covers nesting on a *single* thread; new cross-thread nesting
+has to be re-checked against it.
 
 **Everything here is best-effort.** Admission is a scheduling heuristic, never
 a correctness boundary: a failed config read, an exception, or a wait that runs
@@ -60,8 +70,9 @@ import re
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, Iterator, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -231,14 +242,21 @@ def _is_local_backend(base_url: str) -> bool:
         return False
 
 
-def engaged_for(agent: Any, config: Optional[SchedulerSettings] = None) -> bool:
-    """Whether this agent's backend calls go through the queue."""
+def engaged_for_endpoint(
+    base_url: Any, config: Optional[SchedulerSettings] = None
+) -> bool:
+    """Whether calls to *base_url* go through the queue."""
     cfg = config if config is not None else settings()
     if cfg.mode == "off":
         return False
     if cfg.mode == "on":
         return True
-    return _is_local_backend(str(getattr(agent, "base_url", "") or ""))
+    return _is_local_backend(str(base_url or ""))
+
+
+def engaged_for(agent: Any, config: Optional[SchedulerSettings] = None) -> bool:
+    """Whether this agent's backend calls go through the queue."""
+    return engaged_for_endpoint(getattr(agent, "base_url", ""), config)
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +645,170 @@ def _priority_name(priority: int) -> str:
     return "maintenance" if priority >= PRIORITY_MAINTENANCE else "live"
 
 
+# ---------------------------------------------------------------------------
+# Auxiliary admission (H-031, plan item 2-2)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class _AuxiliaryCaller:
+    """The surface :func:`acquire` reads, for a caller that has no agent."""
+
+    base_url: str = ""
+    session_id: Optional[str] = None
+
+
+def auxiliary_endpoint(
+    task: str,
+    *,
+    model: Optional[str] = None,
+    main_base_url: Optional[str] = None,
+) -> str:
+    """Where an auxiliary *task*'s call actually lands (``""`` when unknown).
+
+    ``auxiliary.<task>.base_url`` wins when it is set. A task pinned to a named
+    provider instead resolves to that provider's own hosted endpoint, which
+    nothing here can name, so it reports unknown — and unknown is read as "not
+    ours", which is what keeps the pre-queue behaviour for anything this cannot
+    place. ``provider: auto``, the default, inherits the main runtime, so
+    *main_base_url* is what it resolves to: that is the case this exists for,
+    where compression quietly shares the very backend the turn is using.
+    """
+    try:
+        from agent.auxiliary_client import _resolve_task_provider_model
+
+        provider, _model, base_url, _key, _api_mode = _resolve_task_provider_model(
+            task or None, model=(model or None)
+        )
+    except Exception:
+        logger.debug("auxiliary endpoint resolution failed", exc_info=True)
+        return ""
+    if base_url:
+        return str(base_url)
+    if str(provider or "auto").strip().lower() != "auto":
+        return ""
+    return str(main_base_url or "")
+
+
+def _auxiliary_arbitration_allowed(task: str) -> bool:
+    """``auxiliary.<task>.scheduler_arbitration``, defaulting to on."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        from utils import is_truthy_value
+
+        auxiliary = (load_config_readonly() or {}).get("auxiliary") or {}
+        raw = auxiliary.get(task or "") if isinstance(auxiliary, dict) else None
+        if not isinstance(raw, dict) or "scheduler_arbitration" not in raw:
+            return True
+        return bool(is_truthy_value(raw.get("scheduler_arbitration"), default=True))
+    except Exception:
+        logger.debug("auxiliary arbitration config read failed", exc_info=True)
+        return True
+
+
+def engaged_for_auxiliary(
+    task: str,
+    *,
+    model: Optional[str] = None,
+    main_base_url: Optional[str] = None,
+    config: Optional[SchedulerSettings] = None,
+) -> bool:
+    """Whether an auxiliary task's call is arbitrated by this queue."""
+    cfg = config if config is not None else settings()
+    if cfg.mode == "off":
+        return False
+    if not _auxiliary_arbitration_allowed(task):
+        return False
+    if cfg.mode == "on":
+        return True
+    return _is_local_backend(
+        auxiliary_endpoint(task, model=model, main_base_url=main_base_url)
+    )
+
+
+def auxiliary_priority() -> int:
+    """Rank an auxiliary call by whether anyone is waiting on its result.
+
+    The call itself carries no caller identity — a summary runs on a pool
+    worker whose host thread is somewhere up the turn, and by then the context
+    is gone. What it can still observe is whether any live turn is registered
+    in this process, and that answers the question well enough: compaction
+    fires *during* a turn only as that turn's preflight/pre-API pass, so a live
+    turn in flight means a user is blocked on this summary. With none
+    registered, nothing is waiting — an idle-session compaction or a
+    maintenance sweep — and housekeeping must not take the slot ahead of a live
+    turn (H-034). A failed classification answers live, the safe side.
+    """
+    try:
+        from agent import live_turn_registry
+
+        for record in live_turn_registry.active_turns():
+            if record.get("kind") == live_turn_registry.TURN_KIND_LIVE:
+                return PRIORITY_LIVE
+    except Exception:
+        logger.debug("auxiliary priority classification failed", exc_info=True)
+        return PRIORITY_LIVE
+    return PRIORITY_MAINTENANCE
+
+
+def acquire_auxiliary(
+    task: str,
+    *,
+    model: Optional[str] = None,
+    main_base_url: Optional[str] = None,
+    session_id: Optional[str] = None,
+    priority: Optional[int] = None,
+    on_wait: Optional[Callable[[int, float], None]] = None,
+    should_abort: Optional[Callable[[], bool]] = None,
+    config: Optional[SchedulerSettings] = None,
+) -> Optional[Ticket]:
+    """Claim the backend for one auxiliary call, or ``None`` to just send it.
+
+    Prefer :func:`auxiliary_slot`, which cannot forget the release.
+    """
+    try:
+        cfg = config if config is not None else settings()
+        if not engaged_for_auxiliary(
+            task, model=model, main_base_url=main_base_url, config=cfg
+        ):
+            return None
+        caller = _AuxiliaryCaller(
+            base_url=auxiliary_endpoint(
+                task, model=model, main_base_url=main_base_url
+            ),
+            session_id=session_id,
+        )
+        return acquire(
+            caller,
+            priority=priority if priority is not None else auxiliary_priority(),
+            on_wait=on_wait,
+            should_abort=should_abort,
+            config=cfg,
+        )
+    except Exception:
+        logger.debug("auxiliary backend admission failed", exc_info=True)
+        return None
+
+
+@contextmanager
+def auxiliary_slot(task: str, **kwargs: Any) -> Iterator[Optional["Ticket"]]:
+    """Hold the backend permit around one auxiliary call.
+
+    The pairing lives here rather than at each call site because a leaked
+    permit is never reclaimed — nothing garbage-collects a hold (the
+    implausible-hold bound only filters the hold statistics), so every waiter
+    would ride out its own deadline and fail open, one full wait each. Too
+    costly to leave to a ``finally`` a future caller has to remember to
+    write. Yields the ticket
+    (``None`` when the queue is disengaged for this task); the body runs either
+    way, since admission is a scheduling heuristic and never a gate.
+    """
+    ticket = acquire_auxiliary(task, **kwargs)
+    try:
+        yield ticket
+    finally:
+        release(ticket)
+
+
 def looks_like_backend_busy(
     error: Any = None, status_code: Any = None
 ) -> bool:
@@ -758,8 +940,14 @@ __all__ = [
     "SchedulerSettings",
     "Ticket",
     "acquire",
+    "acquire_auxiliary",
+    "auxiliary_endpoint",
+    "auxiliary_priority",
+    "auxiliary_slot",
     "contended",
     "engaged_for",
+    "engaged_for_auxiliary",
+    "engaged_for_endpoint",
     "looks_like_backend_busy",
     "note_backend_busy",
     "record_call_duration",

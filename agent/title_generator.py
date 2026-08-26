@@ -21,7 +21,8 @@ import json
 import logging
 import re
 import threading
-from typing import Any, Callable, Optional
+import time
+from typing import Any, Callable, Iterable, Optional
 
 from agent.auxiliary_client import call_llm
 from agent.context_compressor import LEGACY_SUMMARY_PREFIX
@@ -157,6 +158,128 @@ def _title_language() -> str:
         ).strip()
     except Exception:
         return ""
+
+
+# Bounded wait for a busy shared backend before the title upgrade gives up.
+# Mirrored in hermes_cli/config_defaults.py under auxiliary.title_generation;
+# duplicated as a literal so a stub/partial config still yields the shipped
+# behavior.
+_DEFAULT_BUSY_DEFER_SECONDS = 90.0
+_BUSY_POLL_SECONDS = 5.0
+
+
+def _busy_defer_seconds() -> float:
+    """Seconds to wait out a busy backend before skipping. 0 = never wait."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        value = float(
+            ((load_config_readonly() or {}).get("auxiliary") or {})
+            .get("title_generation", {})
+            .get("busy_defer_seconds", _DEFAULT_BUSY_DEFER_SECONDS)
+        )
+    except Exception:
+        logger.debug(
+            "Failed to read title_generation.busy_defer_seconds", exc_info=True
+        )
+        return _DEFAULT_BUSY_DEFER_SECONDS
+    if value != value or value < 0 or value in (float("inf"), float("-inf")):
+        return _DEFAULT_BUSY_DEFER_SECONDS
+    return value
+
+
+def _backend_busy_reason(exclude_turn_tokens: Optional[Iterable[int]]) -> Optional[str]:
+    """Why the shared backend has no room for a title right now.
+
+    Two signals, because neither alone is right. The turn registry says a user
+    is mid-turn somewhere, which is the reason not to spend a single-slot
+    backend on a cosmetic call — but it always includes the turn that spawned
+    this thread, since titling is kicked off from the turn prologue, and
+    waiting for *that* one to end would mean never titling at all. So the
+    caller's own turn is excluded there and the scheduler's in-flight count
+    covers it instead: while that turn is actually on the wire the backend is
+    genuinely busy, and between its calls — running tools — it is not.
+    """
+    try:
+        from agent import live_turn_registry
+
+        reason = live_turn_registry.backend_busy_reason(
+            exclude=exclude_turn_tokens or ()
+        )
+        if reason:
+            return reason
+    except Exception:
+        logger.debug("Title backend-busy check failed", exc_info=True)
+        return None
+    try:
+        from agent import backend_scheduler
+
+        if backend_scheduler.contended():
+            return "a backend call is in flight"
+    except Exception:
+        logger.debug("Title backend-contention check failed", exc_info=True)
+    return None
+
+
+def _wait_for_idle_backend(exclude_turn_tokens: Optional[Iterable[int]]) -> bool:
+    """Wait out a busy backend, or report that this title is not worth it.
+
+    Returns True to make the call, False to keep the derived title and spend
+    nothing. Skipping is the designed outcome under sustained load: the session
+    is already named from the user's own words, and a name is not worth queuing
+    a user's turn behind.
+    """
+    budget = _busy_defer_seconds()
+    if budget <= 0:
+        return True
+    reason = _backend_busy_reason(exclude_turn_tokens)
+    if not reason:
+        return True
+    started = time.monotonic()
+    deadline = started + budget
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(_BUSY_POLL_SECONDS, remaining))
+        reason = _backend_busy_reason(exclude_turn_tokens)
+        if not reason:
+            logger.debug(
+                "Title generation resumed after %.0fs waiting on the backend",
+                time.monotonic() - started,
+            )
+            return True
+    logger.info(
+        "Auxiliary skipped: task=title_generation reason=backend_busy "
+        "waited=%.0fs detail=%s",
+        time.monotonic() - started,
+        reason,
+    )
+    return False
+
+
+def _backend_allows_title(
+    main_runtime: Optional[dict],
+    exclude_turn_tokens: Optional[Iterable[int]],
+) -> bool:
+    """Whether to spend a title call now, given who else wants the backend.
+
+    The gate applies only when the title lands on the same arbitrated local
+    backend the turns use. A hosted title endpoint has its own concurrency and
+    is unaffected, so it keeps the pre-gate behaviour of calling immediately.
+    """
+    try:
+        from agent import backend_scheduler
+
+        if not backend_scheduler.engaged_for_auxiliary(
+            "title_generation",
+            main_base_url=(main_runtime or {}).get("base_url"),
+        ):
+            return True
+    except Exception:
+        logger.debug("Title backend arbitration check failed", exc_info=True)
+        return True
+    return _wait_for_idle_backend(exclude_turn_tokens)
 
 
 def _auto_title_enabled() -> bool:
@@ -513,6 +636,7 @@ def auto_title_session(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    exclude_turn_tokens: Optional[Iterable[int]] = None,
 ) -> None:
     """Generate and store the model title for a session.
 
@@ -521,6 +645,7 @@ def auto_title_session(
     - the session already carries an ``llm`` or ``user`` title
     - title generation fails
     - runtime_validator returns False (model was switched)
+    - the shared backend stays busy past ``busy_defer_seconds``
 
     Never lets an exception escape: this is a daemon-thread target, and an
     escaping exception would spray a raw traceback into the user's terminal
@@ -540,6 +665,7 @@ def auto_title_session(
             main_runtime=main_runtime,
             title_callback=title_callback,
             runtime_validator=runtime_validator,
+            exclude_turn_tokens=exclude_turn_tokens,
         )
     except Exception as e:
         # WARNING (not debug) so operators see it in agent.log; the message
@@ -565,6 +691,7 @@ def _auto_title_session(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    exclude_turn_tokens: Optional[Iterable[int]] = None,
 ) -> None:
     """Body of :func:`auto_title_session` — see its docstring."""
     if not session_db or not session_id:
@@ -601,12 +728,17 @@ def _auto_title_session(
     # recorded against this session (task='title_generation', #23270).
     set_accounting_context(session_db, session_id)
 
-    title = generate_title(
-        user_message,
-        failure_callback=failure_callback,
-        main_runtime=main_runtime,
-        runtime_validator=runtime_validator,
-    )
+    # Titling shares one backend with the turns, and it is the only user of it
+    # nobody is waiting on. Yield the slot rather than queue for it: a skipped
+    # upgrade costs a sharper name, a taken slot costs someone's turn.
+    title = None
+    if _backend_allows_title(main_runtime, exclude_turn_tokens):
+        title = generate_title(
+            user_message,
+            failure_callback=failure_callback,
+            main_runtime=main_runtime,
+            runtime_validator=runtime_validator,
+        )
     source = "llm"
     if not title:
         # No model title, so the derived one has to hold — and it may never have
@@ -686,6 +818,7 @@ def maybe_auto_title(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    exclude_turn_tokens: Optional[Iterable[int]] = None,
 ) -> None:
     """Title a session from its opening message: instant, then upgraded.
 
@@ -695,6 +828,10 @@ def maybe_auto_title(
 
     Only acts on the session's opening exchange, and only when the message
     carries real user intent (machine-authored compaction handoffs are skipped).
+
+    ``exclude_turn_tokens`` names the caller's own live-turn registrations, so
+    the backend-busy gate on the forked thread does not read the very turn that
+    forked it as the reason to stand down.
     """
     if not session_db or not session_id or not user_message:
         return
@@ -732,6 +869,9 @@ def maybe_auto_title(
             "main_runtime": main_runtime,
             "title_callback": title_callback,
             "runtime_validator": runtime_validator,
+            # Snapshot now: the thread outlives this frame, and the caller's
+            # registration is what it must not mistake for someone else's turn.
+            "exclude_turn_tokens": frozenset(exclude_turn_tokens or ()),
         },
         daemon=True,
         name="auto-title",
