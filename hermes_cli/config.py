@@ -402,6 +402,11 @@ def self_update_enabled() -> bool:
         if not isinstance(updates, dict):
             return True
         value = updates.get("self_update_enabled", True)
+        if value is None:
+            # ``self_update_enabled:`` with no value parses to None. That is an
+            # absent setting, not an opt-out — ``bool(None)`` would silently
+            # block updates, the opposite of the fail-safe above.
+            return True
         if isinstance(value, str):
             # A hand-edited or template-generated config can quote the value;
             # "false" must still disable, not read as a truthy string.

@@ -309,7 +309,7 @@ class TestUpdateCommandSelfUpdateGate:
         fake_root = tmp_path / "project"
         (fake_root / "gateway").mkdir(parents=True)
         (fake_root / ".git").mkdir()
-        (fake_root / "gateway" / "run.py").touch()
+        (fake_root / "gateway" / "slash_commands.py").touch()
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
 
@@ -318,8 +318,12 @@ class TestUpdateCommandSelfUpdateGate:
             lambda: {"updates": {"non_interactive_local_changes": "stash"}},
         )
 
+        # The handler resolves the project root from
+        # ``gateway.slash_commands.__file__``; patching ``gateway.run.__file__``
+        # is inert and silently leaves the real checkout as the root.
         with patch("gateway.run._hermes_home", hermes_home), \
-             patch("gateway.run.__file__", str(fake_root / "gateway" / "run.py")), \
+             patch("gateway.slash_commands.__file__",
+                   str(fake_root / "gateway" / "slash_commands.py")), \
              patch("shutil.which",
                    side_effect=lambda x: "/usr/bin/hermes" if x == "hermes" else "/usr/bin/setsid"), \
              patch("subprocess.Popen"):

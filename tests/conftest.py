@@ -1719,7 +1719,61 @@ _REAL_REPO_GIT_GUARD_BYPASS_MARK = "real_repo_git_mutation_allowed"
 
 # The checkout the test suite itself lives in.  tests/conftest.py -> repo root.
 REAL_REPO_ROOT = Path(__file__).resolve().parent.parent
-_REAL_REPO_GIT_DIR = REAL_REPO_ROOT / ".git"
+
+
+def _resolve_dot_git(dot_git: Path):
+    """Real git dir behind a ``.git`` entry — a directory or a pointer file.
+
+    A linked worktree's ``.git`` is a FILE reading ``gitdir: <path>``. Treating
+    it as the git dir itself (which the first version of this guard did) makes
+    the guard fail OPEN for a suite running inside a worktree: nothing ever
+    matches, so every mutation is waved through.
+    """
+    try:
+        if dot_git.is_dir():
+            return dot_git.resolve()
+        if not dot_git.is_file():
+            return None
+        text = dot_git.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if not line.startswith("gitdir:"):
+            continue
+        pointer = Path(line.split(":", 1)[1].strip())
+        if not pointer.is_absolute():
+            pointer = dot_git.parent / pointer
+        try:
+            return pointer.resolve()
+        except OSError:
+            return None
+    return None
+
+
+def _git_dir_identity(git_dir: Path) -> set:
+    """Git dirs whose mutation can lose work in the repository at ``git_dir``.
+
+    For a linked worktree the git dir is ``<common>/worktrees/<name>``, but
+    ``refs/stash`` and the object store live in ``<common>`` — so an autostash
+    aimed at either one is equally destructive, and both must count as "this
+    checkout".
+    """
+    identity = {git_dir}
+    parent = git_dir.parent
+    if parent.name == "worktrees":
+        identity.add(parent.parent)
+    return identity
+
+
+def _git_dirs_identifying_checkout(root: Path) -> frozenset:
+    """The git dirs that identify the checkout rooted at ``root``."""
+    git_dir = _resolve_dot_git(Path(root) / ".git")
+    if git_dir is None:
+        return frozenset()
+    return frozenset(_git_dir_identity(git_dir))
+
+
+_REAL_REPO_GIT_DIRS = _git_dirs_identifying_checkout(REAL_REPO_ROOT)
 
 _GIT_BASENAMES = frozenset({"git", "git.exe"})
 
@@ -1911,11 +1965,18 @@ def _git_subcommand_mutates(subcommand: str, args) -> bool:
 
 
 def _gitdir_belongs_to_real_repo(git_dir) -> bool:
+    """True when an explicit ``--git-dir`` names this checkout's git dir."""
     try:
         resolved = Path(git_dir).resolve()
     except OSError:
         return False
-    return resolved == _REAL_REPO_GIT_DIR or _REAL_REPO_GIT_DIR in resolved.parents
+    if _git_dir_identity(resolved) & _REAL_REPO_GIT_DIRS:
+        return True
+    # --git-dir may also point somewhere *inside* the git dir (submodules).
+    return any(
+        resolved == known or known in resolved.parents
+        for known in _REAL_REPO_GIT_DIRS
+    )
 
 
 def _targets_real_repo(start) -> bool:
@@ -1927,23 +1988,17 @@ def _targets_real_repo(start) -> bool:
     for candidate in (current, *current.parents):
         dot_git = candidate / ".git"
         try:
-            if dot_git.is_dir():
-                return candidate == REAL_REPO_ROOT
-            if dot_git.is_file():
-                # Linked worktree: it shares this repo's object store AND its
-                # refs/stash, so mutating it is just as destructive.
-                try:
-                    text = dot_git.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    return candidate == REAL_REPO_ROOT
-                for line in text.splitlines():
-                    if line.startswith("gitdir:"):
-                        return _gitdir_belongs_to_real_repo(
-                            line.split(":", 1)[1].strip()
-                        )
-                return candidate == REAL_REPO_ROOT
+            present = dot_git.is_dir() or dot_git.is_file()
         except OSError:
             continue
+        if not present:
+            continue
+        git_dir = _resolve_dot_git(dot_git)
+        if git_dir is None:
+            # Unreadable/malformed pointer — fall back to the path comparison
+            # rather than guessing, so we still protect our own root.
+            return candidate == REAL_REPO_ROOT
+        return bool(_git_dir_identity(git_dir) & _REAL_REPO_GIT_DIRS)
     return False
 
 

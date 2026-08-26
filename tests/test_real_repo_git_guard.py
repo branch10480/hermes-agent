@@ -79,6 +79,71 @@ def test_mutating_git_against_another_repo_is_allowed(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
+def _make_repo_with_worktree(tmp_path):
+    """A temp repository plus one linked worktree, both ready for commits."""
+    main = tmp_path / "main"
+    main.mkdir()
+    git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", str(main)], check=True)
+    (main / "seed.txt").write_text("seed", encoding="utf-8")
+    subprocess.run(git + ["add", "-A"], cwd=main, check=True, capture_output=True)
+    subprocess.run(
+        git + ["commit", "-q", "-m", "seed"], cwd=main, check=True, capture_output=True
+    )
+    linked = tmp_path / "linked"
+    subprocess.run(
+        git + ["worktree", "add", "-q", str(linked)],
+        cwd=main,
+        check=True,
+        capture_output=True,
+    )
+    return main, linked
+
+
+def test_a_suite_running_inside_a_worktree_protects_that_worktree(tmp_path, monkeypatch):
+    """The guard must not fail open when the checkout IS a linked worktree.
+
+    A worktree's ``.git`` is a pointer FILE, not a directory. Comparing it to a
+    ``<root>/.git`` path never matches, so a guard that does not follow the
+    pointer waves through every mutation aimed at the tree it protects.
+    """
+    from tests import conftest as guard
+
+    main, linked = _make_repo_with_worktree(tmp_path)
+    monkeypatch.setattr(guard, "REAL_REPO_ROOT", linked)
+    monkeypatch.setattr(
+        guard, "_REAL_REPO_GIT_DIRS", guard._git_dirs_identifying_checkout(linked)
+    )
+
+    stash = ["git", "stash", "push", "--include-untracked"]
+    # The worktree the suite lives in...
+    assert describe_real_repo_git_mutation(stash, str(linked)) is not None
+    # ...and the repo it is linked to, which owns the shared refs/stash.
+    assert describe_real_repo_git_mutation(stash, str(main)) is not None
+    # Read-only git and unrelated repositories stay untouched.
+    assert describe_real_repo_git_mutation(["git", "status"], str(linked)) is None
+    other = tmp_path / "other"
+    subprocess.run(["git", "init", "-q", str(other)], check=True)
+    assert describe_real_repo_git_mutation(stash, str(other)) is None
+
+
+def test_a_worktree_of_this_checkout_is_protected(tmp_path):
+    """The mirror case: the suite runs in the main repo, git runs in a worktree.
+
+    Both directions matter because the two share ``refs/stash``; the worktree's
+    identity must therefore include the common git dir.
+    """
+    from tests import conftest as guard
+
+    main, linked = _make_repo_with_worktree(tmp_path)
+    main_dirs = guard._git_dirs_identifying_checkout(main)
+    linked_dirs = guard._git_dirs_identifying_checkout(linked)
+
+    assert main_dirs, "a plain checkout must resolve its .git directory"
+    assert linked_dirs & main_dirs, "a worktree must share identity with its repo"
+    assert linked_dirs - main_dirs, "and still carry its own worktree git dir"
+
+
 def test_guard_is_actually_installed_around_subprocess():
     """Catches the guard being disabled wholesale (renamed fixture, bad merge).
 

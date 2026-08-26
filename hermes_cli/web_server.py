@@ -78,6 +78,8 @@ from hermes_cli.config import (
     format_docker_update_message,
     recommended_update_command_for_method,
     redact_key,
+    SELF_UPDATE_DISABLED_MESSAGE,
+    self_update_enabled,
     write_platform_config_field,
     _deep_merge,
 )
@@ -4184,6 +4186,22 @@ async def gateway_drain(request: Request):
 @app.post("/api/hermes/update")
 async def update_hermes():
     """Kick off ``hermes update`` in the background."""
+    # Refuse before anything else, exactly as the CLI and gateway paths do.
+    # This endpoint spawns the same update pipeline, so without the check the
+    # dashboard button is a way around updates.self_update_enabled.
+    if not self_update_enabled():
+        _record_completed_action(
+            "hermes-update", SELF_UPDATE_DISABLED_MESSAGE, exit_code=1
+        )
+        return {
+            "ok": False,
+            "pid": None,
+            "name": "hermes-update",
+            "error": "self_update_disabled",
+            "message": SELF_UPDATE_DISABLED_MESSAGE,
+            "update_command": "self-update disabled by configuration",
+        }
+
     if _dashboard_local_update_managed_externally():
         message = (
             "Hermes updates are managed outside this dashboard in "

@@ -76,6 +76,17 @@ def test_self_update_enabled_honors_quoted_false(monkeypatch):
     assert hermes_config.self_update_enabled() is False
 
 
+def test_self_update_enabled_treats_a_valueless_key_as_absent(monkeypatch):
+    """``self_update_enabled:`` with nothing after it parses to None.
+
+    That is an unfinished line, not an opt-out. Reading it as ``bool(None)``
+    would block every update — the exact opposite of the fail-safe the rest of
+    this function is built around.
+    """
+    _set_updates_config(monkeypatch, {"self_update_enabled": None})
+    assert hermes_config.self_update_enabled() is True
+
+
 def test_self_update_enabled_fails_safe_when_config_unreadable(monkeypatch):
     """A broken config must not be what stops a user from updating."""
 
@@ -189,6 +200,41 @@ def test_check_path_is_unaffected_by_the_guard(monkeypatch, mutation_tripwires):
 
     assert len(checked) == 1
     assert mutation_tripwires == []
+
+
+# ---------------------------------------------------------------------------
+# Dashboard (`POST /api/hermes/update`)
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_update_endpoint_refuses_when_disabled(monkeypatch):
+    """The dashboard button spawns the same pipeline, so it needs the same gate.
+
+    Without this the System page is a way around the setting on any host whose
+    dashboard is reachable.
+    """
+    try:
+        from starlette.testclient import TestClient
+    except ImportError:
+        pytest.skip("fastapi/starlette not installed")
+
+    import hermes_cli.web_server as ws
+
+    monkeypatch.setattr(ws, "self_update_enabled", lambda: False)
+
+    def _must_not_spawn(*args, **kwargs):
+        raise AssertionError("the update pipeline must not start")
+
+    monkeypatch.setattr(ws.subprocess, "Popen", _must_not_spawn)
+
+    client = TestClient(ws.app)
+    client.headers[ws._SESSION_HEADER_NAME] = ws._SESSION_TOKEN
+    body = client.post("/api/hermes/update").json()
+
+    assert body["ok"] is False
+    assert body["error"] == "self_update_disabled"
+    assert body["pid"] is None
+    assert "self_update_enabled" in body["message"]
 
 
 def test_updates_subtree_is_protected_from_the_agent_surface():

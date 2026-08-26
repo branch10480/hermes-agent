@@ -2,6 +2,8 @@
 
 import argparse
 
+from tests.hermes_cli.conftest import fresh_hermes_module_imports
+
 
 def test_no_duplicate_skills_subparser():
     """Ensure 'skills' subparser is only registered once to avoid Python 3.11+ crash.
@@ -14,21 +16,20 @@ def test_no_duplicate_skills_subparser():
 
     if the duplicate 'skills' registration is reintroduced.
     """
-    # Force fresh import of the module where parser is constructed
+    # Force fresh import of the module where parser is constructed.
     # If there are duplicate 'skills' subparsers, this import will raise
-    # argparse.ArgumentError at module load time
-    import sys
-
-    # Remove cached module if present
-    if 'hermes_cli.main' in sys.modules:
-        del sys.modules['hermes_cli.main']
-
-    try:
-        import hermes_cli.main  # noqa: F401
-    except argparse.ArgumentError as e:
-        if "conflicting subparser" in str(e):
-            raise AssertionError(
-                f"Duplicate subparser detected: {e}. "
-                "See issue #898 for details."
-            ) from e
-        raise
+    # argparse.ArgumentError at module load time.
+    #
+    # The eviction must be undone afterwards: leaving a fresh hermes_cli.main
+    # in sys.modules orphans the module object every other test file bound at
+    # import time, which silently defeats their patches (incident H-035).
+    with fresh_hermes_module_imports():
+        try:
+            import hermes_cli.main  # noqa: F401
+        except argparse.ArgumentError as e:
+            if "conflicting subparser" in str(e):
+                raise AssertionError(
+                    f"Duplicate subparser detected: {e}. "
+                    "See issue #898 for details."
+                ) from e
+            raise

@@ -10,6 +10,7 @@ import sqlite3
 import pytest
 
 from hermes_cli.backup import copy_db_and_verify, verify_sqlite_integrity
+from tests.hermes_cli.conftest import fresh_hermes_module_imports
 
 
 @pytest.fixture()
@@ -92,7 +93,6 @@ class TestPreUpdateBackupIntegrityGuard:
     @pytest.fixture()
     def hermes_home(self, tmp_path, monkeypatch):
         from pathlib import Path
-        import sys
 
         root = tmp_path / ".hermes"
         root.mkdir()
@@ -104,10 +104,8 @@ class TestPreUpdateBackupIntegrityGuard:
         conn.close()
         monkeypatch.setenv("HERMES_HOME", str(root))
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        for mod in list(sys.modules.keys()):
-            if mod.startswith("hermes_cli.config") or mod == "hermes_constants":
-                del sys.modules[mod]
-        return root
+        with fresh_hermes_module_imports():
+            yield root
 
     def test_healthy_db_stays_quiet(self, hermes_home, capsys):
         from argparse import Namespace
