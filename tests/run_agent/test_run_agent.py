@@ -3241,6 +3241,102 @@ class TestRunConversation:
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
 
+    def test_queue_wait_seconds_forwarded_to_post_api_request_hook(self, agent, caplog):
+        """CR-016: backend_scheduler queue-wait time surfaces as its own
+        ``queue_wait_seconds`` hook field, additive to (not replacing)
+        ``api_duration`` — both keys carry their pre-existing meaning."""
+        self._setup_agent(agent)
+        resp = _mock_response(
+            content="Done",
+            finish_reason="stop",
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        )
+        agent.client.chat.completions.create.return_value = resp
+
+        from agent import backend_scheduler
+
+        fake_ticket = backend_scheduler.Ticket(waited_seconds=2.5)
+
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        caplog.set_level(logging.INFO, logger="agent.conversation_loop")
+        with (
+            patch.object(backend_scheduler, "acquire", return_value=fake_ticket),
+            patch(
+                "hermes_cli.lifecycle.has_hook",
+                side_effect=lambda name: name == "post_api_request",
+            ),
+            patch("hermes_cli.lifecycle.invoke_hook", side_effect=_record_hook),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "Done"
+        post_calls = [kw for name, kw in hook_calls if name == "post_api_request"]
+        assert len(post_calls) == 1
+        assert post_calls[0]["queue_wait_seconds"] == pytest.approx(2.5)
+        # api_duration keeps its pre-existing (queue-inclusive) meaning and type.
+        assert isinstance(post_calls[0]["api_duration"], float)
+
+        api_call_lines = [
+            r.message for r in caplog.records if r.message.startswith("API call #")
+        ]
+        assert len(api_call_lines) == 1
+        assert "queue_wait=2.5s" in api_call_lines[0]
+
+    def test_zero_queue_wait_omits_log_suffix_but_still_forwards_to_hook(
+        self, agent, caplog
+    ):
+        """No queueing (ticket.waited_seconds == 0, or acquire() returns None
+        because the scheduler is disengaged) must not add log noise, but the
+        hook still receives an explicit ``queue_wait_seconds=0.0``."""
+        self._setup_agent(agent)
+        resp = _mock_response(
+            content="Done",
+            finish_reason="stop",
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        )
+        agent.client.chat.completions.create.return_value = resp
+
+        from agent import backend_scheduler
+
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        caplog.set_level(logging.INFO, logger="agent.conversation_loop")
+        with (
+            patch.object(backend_scheduler, "acquire", return_value=None),
+            patch(
+                "hermes_cli.lifecycle.has_hook",
+                side_effect=lambda name: name == "post_api_request",
+            ),
+            patch("hermes_cli.lifecycle.invoke_hook", side_effect=_record_hook),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "Done"
+        post_calls = [kw for name, kw in hook_calls if name == "post_api_request"]
+        assert len(post_calls) == 1
+        assert post_calls[0]["queue_wait_seconds"] == 0.0
+
+        api_call_lines = [
+            r.message for r in caplog.records if r.message.startswith("API call #")
+        ]
+        assert len(api_call_lines) == 1
+        assert "queue_wait=" not in api_call_lines[0]
+
     def test_terminal_task_closes_logical_calls_before_metrics_scope(self, agent):
         from agent import relay_runtime
 

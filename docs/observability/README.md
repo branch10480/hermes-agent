@@ -207,6 +207,50 @@ Approval hooks are observer-only. Plugins cannot pre-answer or veto approvals
 from these hooks. To prevent a tool from reaching approval, use
 `pre_tool_call` blocking.
 
+#### Pre-approval policy blocks
+
+Three denial paths block a command *before* any approval request is opened:
+the hardline blocklist, the sudo-stdin guard, and user `approvals.deny` rules.
+Nobody is asked, so these fire `post_approval_response` only — there is no
+matching `pre_approval_request`. They are identified by `surface="policy"`
+and `decided_by="policy"`, and carry these additional fields:
+
+| Field | Meaning |
+| --- | --- |
+| `origin` | `hardline`, `sudo_stdin`, or `user_deny_rule`. Also mirrored as `approval_outcome`. |
+| `reason_code` | Normalized static detector label (never command text). |
+| `effect_class` | Effect the blocked operation would have had. |
+| `safe_alternative` | Vetted non-bypassing alternative for that effect class. |
+| `deny_count` | Denials observed so far in this turn, all origins. |
+| `command_fingerprint` | Opaque run-local digest of the command. |
+| `deny_rule_id` | `glob:<digest>` for a deny rule; the reason code otherwise. |
+
+`choice` is `"deny"` on these so consumers with a bounded outcome vocabulary
+still bucket them as denials; use `decided_by` to tell a policy block from a
+human deny. `command` is the force-redacted command (redaction runs before the
+cut, so a secret straddling the boundary cannot leak a fragment), truncated to
+4096 characters with `command_truncated` saying whether that happened, and
+omitted entirely if redaction fails. The raw command and the user's deny glob
+never appear in the payload or the logs. `session_key` is the **raw** gateway
+session key, matching the pre-existing pre/post approval hook payloads so
+consumers can correlate across them — it is in-process correlation data, and a
+plugin that persists payloads must fingerprint it first
+(`agent.redact.session_key_fingerprint`); the `approval_deny` log line already
+carries only the fingerprint.
+
+The same denial detail is also written to `agent.log` as one INFO line per
+denial, for every origin including `guardian_denied`, `user_denied`, and
+`timed_out` (wrapped here for readability; emitted as a single line):
+
+```text
+approval_deny origin=hardline reason_code=recursive_delete_of_root_filesystem
+  effect_class=destructive_filesystem deny_rule_id=recursive_delete_of_root_filesystem
+  command_fingerprint=1949707e56bb turn_deny_count=1 session=f386a07db0c4
+```
+
+`turn_deny_count` is observation-only. It is not the Smart Approval circuit
+breaker's tally, which counts consecutive guardian denials alone.
+
 ### Subagent Lifecycle
 
 Subagent hooks describe delegated child-agent work:

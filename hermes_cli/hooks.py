@@ -205,6 +205,7 @@ _DEFAULT_PAYLOADS = {
         "api_mode": "anthropic_messages",
         "api_call_count": 1,
         "api_duration": 1.234,
+        "queue_wait_seconds": 0.0,
         "finish_reason": "stop",
         "message_count": 4,
         "response_model": "claude-sonnet-4-6",

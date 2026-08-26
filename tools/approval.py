@@ -47,6 +47,23 @@ def _log_session_key(session_key) -> str:
         return "redacted"
 
 
+def _log_command(command) -> str:
+    """Fingerprint a command for logging.
+
+    Blocked commands used to be logged as ``command[:200]``, which put raw
+    agent input -- paths, hostnames, inlined credentials -- into the persisted
+    agent.log on every hardline / deny-rule / sudo-guard block. The fingerprint
+    keeps the only property those log lines actually needed: telling repeated
+    attempts at the same command apart from a new one.
+    """
+    try:
+        from agent.redact import command_fingerprint
+
+        return command_fingerprint(command)
+    except Exception:  # pragma: no cover -- redaction must never break logging
+        return "redacted"
+
+
 # Freeze YOLO mode at module import time. Reading os.environ on every call
 # would allow any skill running inside the process to set this variable and
 # instantly bypass all approval checks — a prompt-injection escalation path.
@@ -625,8 +642,31 @@ def _match_user_deny_rule(command: str) -> str | None:
     return None
 
 
+def _deny_block_metadata(reason_key: str, approval_outcome: str,
+                         *, user_consent) -> dict:
+    """Denial detail for a block that never opened an approval request.
+
+    Gives the three pre-approval block paths the same redacted
+    reason_code / effect_class / safe_alternative keys the guardian paths
+    already return, so a consumer does not have to special-case them.
+    """
+    context = _deny_context([reason_key])
+    return {
+        "outcome": _LEGACY_OUTCOME_BY_APPROVAL_OUTCOME[approval_outcome],
+        "approval_outcome": approval_outcome,
+        "user_consent": user_consent,
+        "reason_code": context["reason_code"],
+        "reason_codes": context["reason_codes"],
+        "effect_class": context["effect_class"],
+        "safe_alternative": context["safe_alternative"],
+    }
+
+
 def _user_deny_block_result(pattern: str) -> dict:
     """Build the standard block result for an ``approvals.deny`` match."""
+    # user_consent=False, not None: nobody was asked about this command, but
+    # the user did pre-refuse the whole pattern, so "the user has not
+    # consented" is the accurate reading rather than "nobody was asked".
     return {
         "approved": False,
         "user_deny": True,
@@ -636,6 +676,11 @@ def _user_deny_block_result(pattern: str) -> dict:
             "executed via the agent — not even with --yolo, /yolo, or "
             "approvals.mode=off. Do NOT retry or rephrase this command; "
             "the user has explicitly forbidden it."
+        ),
+        **_deny_block_metadata(
+            _USER_DENY_RULE_REASON,
+            APPROVAL_OUTCOME_USER_DENY_RULE,
+            user_consent=False,
         ),
     }
 
@@ -723,6 +768,11 @@ def _hardline_block_result(description: str, command: str = "") -> dict:
         "approved": False,
         "hardline": True,
         "message": message,
+        # user_consent=None: the hardline floor asks nobody and cannot be
+        # overridden by anybody, so there is no stance to report.
+        **_deny_block_metadata(
+            description, APPROVAL_OUTCOME_HARDLINE, user_consent=None,
+        ),
     }
 
 
@@ -737,7 +787,62 @@ def _sudo_stdin_block_result(description: str) -> dict:
             "agent needs passwordless sudo, or run the sudo command "
             "manually in your own terminal."
         ),
+        **_deny_block_metadata(
+            description, APPROVAL_OUTCOME_SUDO_STDIN, user_consent=None,
+        ),
     }
+
+
+# The three block paths below are each reached from two entry points
+# (check_dangerous_command and check_all_command_guards). Wrapping the log,
+# the observer report, and the result in one call keeps the two entry points
+# from drifting apart -- which is how the raw-command logging survived in
+# both places for as long as it did.
+
+def _hardline_block(command: str, hardline_desc: str) -> dict:
+    """Log, report, and build the block result for a hardline match."""
+    logger.warning("Hardline block: %s (command %s)",
+                   hardline_desc, _log_command(command))
+    _observe_policy_block(
+        origin=APPROVAL_OUTCOME_HARDLINE,
+        reason_key=hardline_desc,
+        description=hardline_desc,
+        command=command,
+    )
+    return _hardline_block_result(hardline_desc, command)
+
+
+def _sudo_stdin_block(command: str, sudo_guess_desc: str) -> dict:
+    """Log, report, and build the block result for the sudo stdin guard."""
+    logger.warning("Sudo stdin guard block: %s (command %s)",
+                   sudo_guess_desc, _log_command(command))
+    _observe_policy_block(
+        origin=APPROVAL_OUTCOME_SUDO_STDIN,
+        reason_key=sudo_guess_desc,
+        description=sudo_guess_desc,
+        command=command,
+    )
+    return _sudo_stdin_block_result(sudo_guess_desc)
+
+
+def _user_deny_block(command: str, deny_pattern: str) -> dict:
+    """Log, report, and build the block result for an ``approvals.deny`` match.
+
+    The glob itself never reaches the log: it is user-authored text that can
+    embed paths, hostnames, and project names, and the only thing the log
+    needs is a stable ID to tell one rule's blocks from another's.
+    """
+    deny_rule_id = f"glob:{_log_command(deny_pattern)}"
+    logger.warning("User deny rule %s blocked command %s",
+                   deny_rule_id, _log_command(command))
+    _observe_policy_block(
+        origin=APPROVAL_OUTCOME_USER_DENY_RULE,
+        reason_key=_USER_DENY_RULE_REASON,
+        description=_USER_DENY_RULE_DESCRIPTION,
+        command=command,
+        deny_rule_id=deny_rule_id,
+    )
+    return _user_deny_block_result(deny_pattern)
 
 
 # =========================================================================
@@ -2427,12 +2532,26 @@ APPROVAL_OUTCOME_TIMED_OUT = "timed_out"
 APPROVAL_OUTCOME_NOTIFY_FAILED = "notify_failed"
 APPROVAL_OUTCOME_NO_APPROVER = "no_approver"
 
+# Three more denial origins sit BEFORE the approval layer entirely: they never
+# open a request, never reach the guardian, and cannot be bypassed by yolo or
+# mode=off. They are deliberately not folded into ``guardian_denied``: in this
+# module "guardian" means the auxiliary-LLM security reviewer, and telling the
+# model (or a metrics consumer) that the reviewer refused a command the
+# reviewer never saw is the same class of lie as attributing a policy deny to
+# the user.
+APPROVAL_OUTCOME_HARDLINE = "hardline"
+APPROVAL_OUTCOME_SUDO_STDIN = "sudo_stdin"
+APPROVAL_OUTCOME_USER_DENY_RULE = "user_deny_rule"
+
 _LEGACY_OUTCOME_BY_APPROVAL_OUTCOME = {
     APPROVAL_OUTCOME_GUARDIAN_DENIED: "denied",
     APPROVAL_OUTCOME_USER_DENIED: "denied",
     APPROVAL_OUTCOME_TIMED_OUT: "timeout",
     APPROVAL_OUTCOME_NOTIFY_FAILED: "notify_failed",
     APPROVAL_OUTCOME_NO_APPROVER: "blocked",
+    APPROVAL_OUTCOME_HARDLINE: "blocked",
+    APPROVAL_OUTCOME_SUDO_STDIN: "blocked",
+    APPROVAL_OUTCOME_USER_DENY_RULE: "blocked",
 }
 
 _REASON_CODE_SAFE_RE = re.compile(r"[^a-z0-9]+")
@@ -2841,6 +2960,189 @@ def _denial_breaker_addendum(session_key: str,
         f"operation.{detail} Tell the user which class of operation was "
         "refused and continue with work that does not need it."
     )
+
+
+# =========================================================================
+# Structured denial logging
+# =========================================================================
+# A denial can come from six different layers, and until now they logged in
+# six different shapes -- three of them printing the raw command. One INFO
+# line per denial, identical fields whatever refused it, so a reader can
+# answer "what class of operation got refused, how often, and by which layer"
+# without the command text ever reaching disk.
+#
+# INFO and not WARNING on purpose: every one of these paths already reports
+# the denial through its own channel (the block message returned to the model,
+# the breaker's own WARNING). A second WARNING per denial would double-count
+# in any log-based alerting built on warning volume.
+#
+# Nothing here may leak: the command, the session key, and the user's deny
+# glob are all replaced by run-local fingerprints, and the reason code /
+# effect class come from :func:`_deny_context`, which is derived from static
+# detector labels only.
+_DENY_ORIGINS = (
+    APPROVAL_OUTCOME_GUARDIAN_DENIED,
+    APPROVAL_OUTCOME_USER_DENIED,
+    APPROVAL_OUTCOME_TIMED_OUT,
+    APPROVAL_OUTCOME_HARDLINE,
+    APPROVAL_OUTCOME_SUDO_STDIN,
+    APPROVAL_OUTCOME_USER_DENY_RULE,
+)
+
+# Static reason keys for the two origins whose natural label would leak. The
+# user's deny glob is user-authored text that can embed paths and hostnames,
+# so it is never normalized into a reason code -- the glob only ever appears
+# as a fingerprint in ``deny_rule_id``.
+_USER_DENY_RULE_REASON = "user deny rule"
+_USER_DENY_RULE_DESCRIPTION = "blocked by a user-defined approvals.deny rule"
+
+# Ceiling on the command text handed to observers. The parser-limit hardline
+# block fires precisely on oversized payloads (heredoc scripts, base64 blobs)
+# with no upper bound, and running the full redaction regex set over megabytes
+# of blob on every block buys a telemetry consumer nothing. Denials are
+# correlated by ``command_fingerprint``, which covers the whole command.
+_POLICY_BLOCK_HOOK_COMMAND_CHARS = 4096
+
+# Redaction input bound for the hook command preview. Redaction must run over a
+# window that extends well past the preview cut so any secret visible in the
+# final 4096 chars was seen by the redactor in full; only then is cutting the
+# already-redacted text safe (H-014 ordering).
+_POLICY_BLOCK_HOOK_REDACTION_WINDOW_CHARS = 65536
+
+# Observation-only per-turn deny counter. Deliberately SEPARATE from
+# ``_denial_tally``: that one is the circuit breaker's input and counts only
+# consecutive guardian DANGEROUS denials, so folding the pre-approval policy
+# blocks into it would trip the breaker on commands the guardian never
+# assessed and change a safety-critical threshold. Same (session_key, turn_id)
+# key and the same bounded-dict eviction so a churn of short-lived turns
+# cannot grow it without bound.
+_deny_event_tally: dict[tuple[str, str], int] = {}
+_DENY_EVENT_TALLY_MAX_SESSIONS = 256
+
+
+def _record_deny_event(session_key: str) -> int:
+    """Increment and return this turn's observed deny count (all origins)."""
+    with _lock:
+        key = _denial_tally_key(session_key)
+        count = _deny_event_tally.pop(key, 0) + 1
+        _deny_event_tally[key] = count
+        while len(_deny_event_tally) > _DENY_EVENT_TALLY_MAX_SESSIONS:
+            _deny_event_tally.pop(next(iter(_deny_event_tally)))
+        return count
+
+
+def _session_key_for_deny_log() -> str:
+    """Resolve the session key for a denial that runs before the normal gates.
+
+    The hardline / sudo-stdin / deny-rule blocks fire before the approval flow
+    looks up a session, and session resolution reaches into gateway context.
+    Observability must never be the reason a block fails to return.
+    """
+    try:
+        return get_current_session_key(default="")
+    except Exception:  # pragma: no cover -- defensive
+        return ""
+
+
+def _log_deny_event(*, origin: str, context: dict, command,
+                    session_key: str, deny_rule_id: str | None = None) -> int:
+    """Emit the one structured line for a denial; return this turn's count.
+
+    Returns 0 if anything goes wrong, so a caller can still pass the count to
+    observers. Never raises: a denial must be returned to the model whether or
+    not it could be logged.
+    """
+    try:
+        count = _record_deny_event(session_key)
+        reason_code = context.get("reason_code") or "unspecified"
+        logger.info(
+            "approval_deny origin=%s reason_code=%s effect_class=%s "
+            "deny_rule_id=%s command_fingerprint=%s turn_deny_count=%d "
+            "session=%s",
+            origin,
+            reason_code,
+            context.get("effect_class") or _UNCLASSIFIED_EFFECT,
+            deny_rule_id or reason_code,
+            _log_command(command),
+            count,
+            _log_session_key(session_key),
+        )
+        return count
+    except Exception:  # pragma: no cover -- observability is never load-bearing
+        logger.debug("Structured deny logging failed", exc_info=True)
+        return 0
+
+
+def _fire_policy_block_hook(*, origin: str, context: dict, description: str,
+                            command, session_key: str, deny_count: int,
+                            deny_rule_id: str | None = None) -> None:
+    """Report a pre-approval policy block to observers.
+
+    Only ``post_approval_response`` fires: no approval request was ever opened,
+    so a matching ``pre_approval_request`` would claim someone was asked.
+    ``choice="deny"`` keeps the bounded outcome vocabulary of existing
+    consumers meaningful (the command was refused); ``decided_by="policy"``
+    and ``origin`` are how a consumer tells this apart from a human deny.
+
+    The command is force-redacted, exactly as the smart-approval observer does
+    it, bounded by :data:`_POLICY_BLOCK_HOOK_COMMAND_CHARS`, and dropped
+    entirely if redaction fails -- observability is skipped before anything raw
+    is handed to a plugin.
+    """
+    payload = {
+        "description": description,
+        "pattern_key": context["reason_code"],
+        "pattern_keys": list(context["reason_codes"]),
+        "session_key": session_key,
+        "surface": "policy",
+        "choice": "deny",
+        "decided_by": "policy",
+        "origin": origin,
+        "approval_outcome": origin,
+        "reason_code": context["reason_code"],
+        "effect_class": context["effect_class"],
+        "safe_alternative": context["safe_alternative"],
+        "deny_count": deny_count,
+        "command_fingerprint": _log_command(command),
+        "deny_rule_id": deny_rule_id or context["reason_code"],
+    }
+    try:
+        from agent.redact import redact_sensitive_text
+
+        text = str(command or "")
+        payload["command_truncated"] = len(text) > _POLICY_BLOCK_HOOK_COMMAND_CHARS
+        # Redact before cutting: a secret straddling the preview cut would
+        # otherwise leak its head fragment un-redacted (H-014; same ordering
+        # as terminal_tool's interactive-launch preview).
+        payload["command"] = redact_sensitive_text(
+            text[:_POLICY_BLOCK_HOOK_REDACTION_WINDOW_CHARS], force=True,
+        )[:_POLICY_BLOCK_HOOK_COMMAND_CHARS]
+    except Exception as exc:
+        logger.debug("Policy block hook redaction failed: %s", exc)
+        payload.pop("command_truncated", None)
+    _fire_approval_hook("post_approval_response", **payload)
+
+
+def _observe_policy_block(*, origin: str, reason_key: str, description: str,
+                          command, deny_rule_id: str | None = None) -> None:
+    """Log and report one pre-approval policy block.
+
+    Shared by the hardline floor, the sudo-stdin guard, and user deny rules so
+    all three produce the same structured line and the same observer payload
+    the guardian paths do.
+    """
+    context = _deny_context([reason_key])
+    session_key = _session_key_for_deny_log()
+    deny_count = _log_deny_event(
+        origin=origin, context=context, command=command,
+        session_key=session_key, deny_rule_id=deny_rule_id,
+    )
+    _fire_policy_block_hook(
+        origin=origin, context=context, description=description,
+        command=command, session_key=session_key, deny_count=deny_count,
+        deny_rule_id=deny_rule_id,
+    )
+
 
 # =========================================================================
 # Blocking gateway approval (mirrors CLI's synchronous input() flow)
@@ -3728,6 +4030,12 @@ def _run_approval_gate(
                 reason_addendum = ""
                 if resolved and deny_reason:
                     reason_addendum = f' Reason given by the user: "{deny_reason}".'
+                _log_deny_event(
+                    origin=(APPROVAL_OUTCOME_USER_DENIED if resolved
+                            else APPROVAL_OUTCOME_TIMED_OUT),
+                    context=_deny_context([pattern_key]),
+                    command=display_target, session_key=session_key,
+                )
                 return {
                     "approved": False,
                     "message": (
@@ -3794,6 +4102,14 @@ def _run_approval_gate(
         surface="cli",
         choice=choice,
     )
+
+    if choice in ("timeout", "deny"):
+        _log_deny_event(
+            origin=(APPROVAL_OUTCOME_TIMED_OUT if choice == "timeout"
+                    else APPROVAL_OUTCOME_USER_DENIED),
+            context=_deny_context([pattern_key]),
+            command=display_target, session_key=session_key,
+        )
 
     if choice == "timeout":
         return {
@@ -3878,17 +4194,14 @@ def check_dangerous_command(command: str, env_type: str,
     # to wipe the disk or power the box off.
     is_hardline, hardline_desc = detect_hardline_command(command)
     if is_hardline:
-        logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
-        return _hardline_block_result(hardline_desc, command)
+        return _hardline_block(command, hardline_desc)
 
     # User-defined deny rules (approvals.deny in config.yaml): like the
     # hardline floor, these fire BEFORE the yolo bypass — a deny rule is the
     # user saying "never, even under yolo".
     deny_pattern = _match_user_deny_rule(command)
     if deny_pattern is not None:
-        logger.warning("User deny rule %r blocked command: %s",
-                       deny_pattern, command[:200])
-        return _user_deny_block_result(deny_pattern)
+        return _user_deny_block(command, deny_pattern)
 
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.
@@ -4208,8 +4521,7 @@ def check_all_command_guards(command: str, env_type: str,
     # no session-level setting can bypass it.
     is_hardline, hardline_desc = detect_hardline_command(command)
     if is_hardline:
-        logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
-        return _hardline_block_result(hardline_desc, command)
+        return _hardline_block(command, hardline_desc)
 
     # == Sudo stdin guard ==
     # Like the hardline floor above, this is unconditional: there is never a
@@ -4218,18 +4530,14 @@ def check_all_command_guards(command: str, env_type: str,
     # check so even yolo/smart approval/mode=off cannot bypass it.
     is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
     if is_sudo_guess:
-        logger.warning("Sudo stdin guard block: %s (command: %s)",
-                       sudo_guess_desc, command[:200])
-        return _sudo_stdin_block_result(sudo_guess_desc)
+        return _sudo_stdin_block(command, sudo_guess_desc)
 
     # User-defined deny rules (approvals.deny in config.yaml): like the
     # hardline floor, these fire BEFORE the yolo / mode=off bypass — a deny
     # rule is the user saying "never, even under yolo".
     deny_pattern = _match_user_deny_rule(command)
     if deny_pattern is not None:
-        logger.warning("User deny rule %r blocked command: %s",
-                       deny_pattern, command[:200])
-        return _user_deny_block_result(deny_pattern)
+        return _user_deny_block(command, deny_pattern)
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
@@ -4390,6 +4698,10 @@ def check_all_command_guards(command: str, env_type: str,
         _fc_key = f"tirith:{_fc_rule_id}"
         _fc_desc = _format_tirith_description(tirith_result)
         _fc_ctx = _deny_context([_fc_key])
+        _log_deny_event(
+            origin=APPROVAL_OUTCOME_GUARDIAN_DENIED, context=_fc_ctx,
+            command=command, session_key=session_key,
+        )
         return {
             "approved": False,
             "message": (
@@ -4468,6 +4780,10 @@ def check_all_command_guards(command: str, env_type: str,
             # "the user refused this".
             _record_denial(session_key)
             deny_context = _deny_context([key for key, _, _ in warnings])
+            _log_deny_event(
+                origin=APPROVAL_OUTCOME_GUARDIAN_DENIED, context=deny_context,
+                command=command, session_key=session_key,
+            )
             breaker_addendum = _denial_breaker_addendum(session_key, deny_context)
             return _attach_denial_breaker_metadata({
                 "approved": False,
@@ -4578,6 +4894,10 @@ def check_all_command_guards(command: str, env_type: str,
                 deny_context = _deny_context(all_keys)
                 approval_outcome = _classify_gateway_denial(
                     decision, smart_denied_for_owner=smart_denied_for_owner
+                )
+                _log_deny_event(
+                    origin=approval_outcome, context=deny_context,
+                    command=command, session_key=session_key,
                 )
                 if approval_outcome == APPROVAL_OUTCOME_GUARDIAN_DENIED:
                     breaker_addendum = _denial_breaker_addendum(
@@ -4720,6 +5040,14 @@ def check_all_command_guards(command: str, env_type: str,
     )
 
     cli_deny_context = _deny_context(all_keys)
+
+    if choice in ("timeout", "deny"):
+        _log_deny_event(
+            origin=(APPROVAL_OUTCOME_TIMED_OUT if choice == "timeout"
+                    else APPROVAL_OUTCOME_USER_DENIED),
+            context=cli_deny_context, command=command,
+            session_key=session_key,
+        )
 
     if choice == "timeout":
         breaker_addendum = _denial_breaker_addendum(session_key, cli_deny_context)
@@ -4894,6 +5222,10 @@ def check_execute_code_guard(code: str, env_type: str,
         ):
             _record_denial(session_key)
             deny_context = _deny_context([pattern_key])
+            _log_deny_event(
+                origin=APPROVAL_OUTCOME_GUARDIAN_DENIED, context=deny_context,
+                command=command, session_key=session_key,
+            )
             breaker_addendum = _denial_breaker_addendum(session_key, deny_context)
             return _attach_denial_breaker_metadata({
                 "approved": False,
@@ -4997,6 +5329,10 @@ def check_execute_code_guard(code: str, env_type: str,
         deny_context = _deny_context([pattern_key])
         approval_outcome = _classify_gateway_denial(
             decision, smart_denied_for_owner=smart_denied_for_owner
+        )
+        _log_deny_event(
+            origin=approval_outcome, context=deny_context,
+            command=command, session_key=session_key,
         )
         breaker_addendum = _denial_breaker_addendum(session_key, deny_context)
         if approval_outcome == APPROVAL_OUTCOME_GUARDIAN_DENIED:

@@ -176,6 +176,20 @@ def clear_session_context() -> None:
     _session_context.session_id = None
 
 
+def get_session_context() -> Optional[str]:
+    """Return the session ID set on the current thread via
+    :func:`set_session_context`, or ``None`` if unset/cleared.
+
+    Read accessor used by ``tools.thread_context.propagate_context_to_thread``
+    (H-030): ``_session_context`` is ``threading.local``, which — unlike
+    ``contextvars.Context`` — is never inherited by a worker thread, so a
+    parallel tool dispatched onto a ``ThreadPoolExecutor`` worker silently
+    drops the ``[session_id]`` log tag unless the parent thread's value is
+    captured here and re-applied on the worker via ``set_session_context()``.
+    """
+    return getattr(_session_context, "session_id", None)
+
+
 # ---------------------------------------------------------------------------
 # Record factory — injects session_tag into every LogRecord at creation
 # ---------------------------------------------------------------------------

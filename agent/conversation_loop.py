@@ -2998,6 +2998,11 @@ def _run_conversation_core(
         retry_count = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
+        # Time spent waiting on backend_scheduler.acquire() (queue position +
+        # over-capacity wait), summed across every retry of this logical API
+        # call. `api_duration` below stays queue-inclusive for backward
+        # compatibility (CR-016) -- this is a separate, additive breakdown.
+        _queue_wait_seconds = 0.0
 
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
@@ -3383,6 +3388,13 @@ def _run_conversation_core(
                         should_abort=lambda: bool(
                             getattr(agent, "_interrupt_requested", False)
                         ),
+                    )
+                    # Captured immediately on return (CR-016): a ticket's
+                    # `waited_seconds` is fixed at grant time, so this survives
+                    # whatever the rest of the attempt does to `_backend_ticket`.
+                    # `None` (scheduler disengaged/aborted) contributes 0.
+                    _queue_wait_seconds += float(
+                        getattr(_backend_ticket, "waited_seconds", 0.0) or 0.0
                     )
                     # Marked in-flight only once the backend is ours. While the
                     # claim is still queued nothing is on the wire, so a
@@ -4387,11 +4399,20 @@ def _run_conversation_core(
                     _cache_pct = ""
                     if canonical_usage.cache_read_tokens and prompt_tokens:
                         _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
+                    # CR-016: queue_wait is appended AFTER the optional cache=
+                    # segment (not between latency= and cache=) so hstat's
+                    # SLOT_API_CALL_RE — which expects cache= immediately
+                    # after latency=Xs — keeps matching unchanged.
+                    _queue_wait_suffix = (
+                        f" queue_wait={_queue_wait_seconds:.1f}s"
+                        if _queue_wait_seconds > 0
+                        else ""
+                    )
                     logger.info(
-                        "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
+                        "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s%s",
                         agent.session_api_calls, agent.model, agent.provider or "unknown",
                         prompt_tokens, completion_tokens, total_tokens,
-                        api_duration, _cache_pct,
+                        api_duration, _cache_pct, _queue_wait_suffix,
                     )
 
                     # On the MoA path, agent.model/provider are the virtual
@@ -6861,6 +6882,11 @@ def _run_conversation_core(
                         api_mode=agent.api_mode,
                         api_call_count=api_call_count,
                         api_duration=api_duration,
+                        # CR-016: backend_scheduler queue-wait time, summed
+                        # across every acquire() this logical call made
+                        # (retries included). Additive breakdown only —
+                        # api_duration is unchanged and still queue-inclusive.
+                        queue_wait_seconds=_queue_wait_seconds,
                         started_at=api_start_time,
                         ended_at=_api_ended_at,
                         finish_reason=finish_reason,

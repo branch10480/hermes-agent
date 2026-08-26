@@ -30,6 +30,13 @@ logger = logging.getLogger(__name__)
 # though the ID space is small enough to enumerate.
 _SESSION_KEY_LOG_SALT = secrets.token_bytes(16)
 
+# Separate salt for command fingerprints. Deliberately NOT the session salt:
+# sharing one would make the fingerprint of a string that appears both as a
+# command and as a session key identical, linking the two across log lines.
+# Regenerated every process start for the same reason as the session salt --
+# a command is short enough to brute-force from a persisted log otherwise.
+_COMMAND_LOG_SALT = secrets.token_bytes(16)
+
 
 def session_key_fingerprint(session_key) -> str:
     """Opaque, run-local label for a session key, safe to log.
@@ -47,6 +54,27 @@ def session_key_fingerprint(session_key) -> str:
     return hashlib.blake2s(
         text.encode("utf-8", "surrogateescape"),
         key=_SESSION_KEY_LOG_SALT,
+        digest_size=6,
+    ).hexdigest()
+
+
+def command_fingerprint(command) -> str:
+    """Opaque, run-local label for a command string, safe to log.
+
+    A blocked command is the one piece of denial detail that must never reach
+    a log file: it can carry paths, hostnames, and inlined credentials, and
+    redaction only catches the secret shapes it knows. Logs that need to tell
+    two denials apart -- "is the model retrying the same command or trying a
+    new one?" -- use this instead of the text. Correlatable only inside one
+    run of one process, and it is not a redaction helper: it returns a digest,
+    never any part of the input.
+    """
+    text = "" if command is None else str(command)
+    if not text:
+        return "none"
+    return hashlib.blake2s(
+        text.encode("utf-8", "surrogateescape"),
+        key=_COMMAND_LOG_SALT,
         digest_size=6,
     ).hexdigest()
 

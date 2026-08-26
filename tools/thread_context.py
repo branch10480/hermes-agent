@@ -11,7 +11,11 @@ Tool dispatch inside such a thread therefore silently loses:
     dangerous commands run without prompting (#33057, #30882);
   * the thread-local CLI approval/sudo callbacks (``tools.terminal_tool``) —
     so ``prompt_dangerous_approval`` cannot reach the user
-    (GHSA-qg5c-hvr5-hjgr, #15216).
+    (GHSA-qg5c-hvr5-hjgr, #15216);
+  * the ``hermes_logging`` session tag (``threading.local``, not a
+    ContextVar) — so log lines emitted from a parallel-tool worker thread
+    lose their ``[session_id]`` prefix, breaking correlation in ``agent.log``
+    for any turn that ran tools concurrently (H-030).
 
 This helper factors out that capture/install/clear lifecycle so the several
 places that fan tool dispatch onto worker threads (``agent.tool_executor`` and
@@ -61,6 +65,20 @@ def _callback_api():
     )
 
 
+def _session_context_api():
+    """Resolve the ``hermes_logging`` session-tag get/set/clear accessors.
+
+    Imported lazily for the same reason as :func:`_callback_api` — keep this
+    low-level module free of top-level imports into higher-level packages.
+    """
+    from hermes_logging import (
+        clear_session_context,
+        get_session_context,
+        set_session_context,
+    )
+    return get_session_context, set_session_context, clear_session_context
+
+
 def propagate_context_to_thread(target: Callable) -> Callable:
     """Wrap *target* for execution on a worker thread with the *current*
     thread's ContextVars and approval/sudo callbacks propagated.
@@ -86,6 +104,15 @@ def propagate_context_to_thread(target: Callable) -> Callable:
     except Exception:
         logger.debug("Could not capture parent approval/sudo callbacks", exc_info=True)
 
+    parent_session_id = None
+    session_setters = None
+    try:
+        get_session, set_session, clear_session = _session_context_api()
+        parent_session_id = get_session()
+        session_setters = (set_session, clear_session)
+    except Exception:
+        logger.debug("Could not capture parent session log tag", exc_info=True)
+
     def _runner(*args, **kwargs):
         def _inner():
             if setters is not None:
@@ -101,6 +128,15 @@ def propagate_context_to_thread(target: Callable) -> Callable:
                         "dangerous-command approval will fail closed",
                         exc_info=True,
                     )
+            if session_setters is not None and parent_session_id is not None:
+                set_session, _clear_session = session_setters
+                try:
+                    set_session(parent_session_id)
+                except Exception:
+                    logger.debug(
+                        "Failed to install propagated session log tag",
+                        exc_info=True,
+                    )
             try:
                 return target(*args, **kwargs)
             finally:
@@ -112,6 +148,15 @@ def propagate_context_to_thread(target: Callable) -> Callable:
                     except Exception:
                         logger.debug(
                             "Failed to clear propagated approval/sudo callbacks",
+                            exc_info=True,
+                        )
+                if session_setters is not None and parent_session_id is not None:
+                    _set_session, clear_session = session_setters
+                    try:
+                        clear_session()
+                    except Exception:
+                        logger.debug(
+                            "Failed to clear propagated session log tag",
                             exc_info=True,
                         )
 

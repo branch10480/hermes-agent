@@ -436,8 +436,32 @@ def finalize_turn(
                     _last_tool_name = _tcs[-1].get("function", {}).get("name")
                 break
 
-    _turn_tool_count = sum(
+    # `history_tool_turns` scans the whole in-memory transcript (session-
+    # cumulative across turns, since `messages` is never truncated between
+    # turns within a session). `tool_turns` scopes to just this turn, anchored
+    # at `agent._persist_user_message_idx` — the same index `turn_context`/
+    # the mid-loop re-anchor path (conversation_loop.py) maintain as "the
+    # current turn's user message row in `messages`" for the persist-flush
+    # boundary. Reusing it here (rather than threading a new parameter through
+    # finalize_turn's call chain) keeps the two consumers of that anchor in
+    # sync by construction. After a mid-turn compaction is adopted the anchor
+    # is re-anchored past the compacted prefix, so `tool_turns` then counts
+    # only post-compaction tool calls of that turn — an accepted undercount
+    # for this observation-only field. Fall back to the last user-role row
+    # when the anchor is absent/out of range (defensive; should not happen in
+    # practice) so the field degrades to an approximation instead of raising.
+    _history_tool_turns = sum(
         1 for m in messages
+        if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
+    )
+    _turn_start_idx = getattr(agent, "_persist_user_message_idx", None)
+    if not (isinstance(_turn_start_idx, int) and 0 <= _turn_start_idx <= len(messages)):
+        _turn_start_idx = 0
+        for _idx, _m in enumerate(messages):
+            if isinstance(_m, dict) and _m.get("role") == "user":
+                _turn_start_idx = _idx
+    _turn_tool_count = sum(
+        1 for m in messages[_turn_start_idx:]
         if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
     )
     _resp_len = len(final_response) if final_response else 0
@@ -446,12 +470,12 @@ def finalize_turn(
 
     _diag_msg = (
         "Turn ended: reason=%s model=%s api_calls=%d/%d budget=%d/%d "
-        "tool_turns=%d last_msg_role=%s response_len=%d session=%s"
+        "tool_turns=%d history_tool_turns=%d last_msg_role=%s response_len=%d session=%s"
     )
     _diag_args = (
         _turn_exit_reason, agent.model, api_call_count, agent.max_iterations,
         _budget_used, _budget_max,
-        _turn_tool_count, _last_msg_role, _resp_len,
+        _turn_tool_count, _history_tool_turns, _last_msg_role, _resp_len,
         agent.session_id or "none",
     )
 
