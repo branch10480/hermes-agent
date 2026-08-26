@@ -37,6 +37,7 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
+from agent import backend_scheduler
 from agent import live_turn_registry
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.history_mutation_log import (
@@ -355,6 +356,63 @@ def _prefix_stability_tracker(agent: Any) -> PrefixStabilityTracker | None:
     except Exception:
         return None
     return tracker
+
+
+def _backend_queue_notice(agent: Any):
+    """Callback that tells a queued caller where it stands (H-032 / H-033).
+
+    A session waiting on a busy single-slot backend used to look identical to
+    a session whose model was simply slow — the observed case was a 147-second
+    first response with nothing said about why. The scheduler calls this while
+    a claim is queued, so the session learns its position and elapsed wait
+    instead of guessing.
+
+    Live turns get it on the user's surface; maintenance work (the review
+    fork, the curator sweep) only writes it to the log, because nobody is
+    watching a housekeeping queue. The activity touch matters for both: the
+    gateway's inactivity monitor measures silence, and a long legitimate queue
+    wait must not read as a stalled turn.
+
+    Classification and the session fingerprint are resolved inside the
+    callback, not here: this runs before every backend call and the callback
+    runs only when one actually waits.
+    """
+
+    def _notice(ahead: int, waited: float) -> None:
+        is_maintenance = False
+        try:
+            is_maintenance = live_turn_registry.is_maintenance_agent(agent)
+        except Exception:
+            pass
+        session = live_turn_registry.session_label(agent)
+        if ahead <= 0:
+            message = f"⏳ Waiting for the backend to free up ({int(waited)}s)"
+        else:
+            noun = "request" if ahead == 1 else "requests"
+            message = (
+                f"⏳ Queued for the backend — {ahead} {noun} ahead, "
+                f"waiting {int(waited)}s"
+            )
+        logger.info(
+            "backend queue: %s ahead=%d waited=%.0fs session=%s",
+            "maintenance" if is_maintenance else "live",
+            ahead,
+            waited,
+            session,
+        )
+        if not is_maintenance:
+            try:
+                agent._emit_status(message)
+            except Exception:
+                logger.debug("backend queue status emit failed", exc_info=True)
+        try:
+            agent._touch_activity(
+                f"queued for backend ({ahead} ahead, {int(waited)}s)"
+            )
+        except Exception:
+            logger.debug("backend queue activity touch failed", exc_info=True)
+
+    return _notice
 
 
 def _proactive_prune_armed(compressor: Any, observed_tokens: int) -> bool:
@@ -3298,16 +3356,44 @@ def _run_conversation_core(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
+                # Claim the shared backend before submitting (H-032 / H-033).
+                # A single-slot local backend used to arbitrate between
+                # sessions by rejecting whoever arrived second, so the queue
+                # is here rather than in the retry loop: nothing is submitted
+                # while the backend is occupied, and the wait ends on the
+                # previous call's release instead of a backoff timer. The
+                # claim covers exactly one call — an agentic turn spends most
+                # of its time in tools with the backend idle, and holding the
+                # permit across the whole turn would lease it to one session
+                # for hours. Fail-open by construction: a disengaged
+                # scheduler, an interrupt, or an expired wait all return a
+                # ticket (or None) that submits anyway.
+                #
+                # The claim and everything after it share one ``finally`` so
+                # the permit cannot outlive the attempt: a permit leaked here
+                # would wedge every other session in the process.
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
-                if _redirect_lock is not None:
-                    with _redirect_lock:
-                        if _model_request_active is not None:
-                            _model_request_active.set()
-                elif _model_request_active is not None:
-                    _model_request_active.set()
+                _backend_ticket = None
                 _redirect_crossed_response = False
                 try:
+                    _backend_ticket = backend_scheduler.acquire(
+                        agent,
+                        on_wait=_backend_queue_notice(agent),
+                        should_abort=lambda: bool(
+                            getattr(agent, "_interrupt_requested", False)
+                        ),
+                    )
+                    # Marked in-flight only once the backend is ours. While the
+                    # claim is still queued nothing is on the wire, so a
+                    # redirect must be rejected and re-queued as its own turn
+                    # rather than interrupt a request that does not exist.
+                    if _redirect_lock is not None:
+                        with _redirect_lock:
+                            if _model_request_active is not None:
+                                _model_request_active.set()
+                    elif _model_request_active is not None:
+                        _model_request_active.set()
                     response = run_llm_execution_middleware(
                         api_kwargs,
                         _perform_api_call,
@@ -3325,6 +3411,10 @@ def _run_conversation_core(
                         middleware_trace=list(_llm_middleware_trace),
                     )
                 finally:
+                    # First thing on the way out: the next waiter is woken by
+                    # this release, so anything slower in front of it becomes
+                    # dead time on a backend nobody is using.
+                    backend_scheduler.release(_backend_ticket)
                     if _redirect_lock is not None:
                         with _redirect_lock:
                             if _model_request_active is not None:
@@ -3580,6 +3670,19 @@ def _run_conversation_core(
                     
                     # Backoff before retry — jittered exponential: 5s base, 120s cap
                     wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
+                    # Unless the failure was "the backend is busy" and the
+                    # scheduler is arbitrating it: then the retry's real wait
+                    # is the queue at the top of this loop, which ends when the
+                    # occupying call releases. Sleeping first only delays that.
+                    _queue_backoff = backend_scheduler.retry_wait_override(
+                        agent,
+                        wait_time,
+                        error=error_msg,
+                        status_code=_resp_error_code,
+                    )
+                    if _queue_backoff is not None:
+                        wait_time = _queue_backoff
+                        _failure_hint = f"{_failure_hint} — waiting for the backend queue"
                     agent._buffer_vprint(f"⏳ Retrying in {wait_time:.1f}s ({_failure_hint})...")
                     logger.warning("Invalid API response (retry %d/%d): %s | Provider: %s", retry_count, max_retries, ', '.join(error_details), provider_name)
                     
@@ -6540,6 +6643,17 @@ def _run_conversation_core(
                         error=api_error,
                         default_wait=wait_time,
                     )
+                if not _retry_after:
+                    # Same rule as the invalid-response path: when the backend
+                    # rejected us because it was occupied and the scheduler is
+                    # arbitrating it, the queue at the top of the loop is the
+                    # wait. A provider-supplied Retry-After always wins.
+                    _queue_backoff = backend_scheduler.retry_wait_override(
+                        agent, wait_time, error=api_error
+                    )
+                    if _queue_backoff is not None:
+                        wait_time = _queue_backoff
+                        _backoff_policy = "backend_queue"
                 if is_rate_limited or _is_zai_coding_overload:
                     _policy_note = ""
                     if _backoff_policy == "zai_coding_overload_long":

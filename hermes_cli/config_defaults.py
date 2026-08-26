@@ -45,6 +45,52 @@ DEFAULT_CONFIG = {
         # rejected with a resend notice rather than run without serialization.
         # Non-positive values fall back to 1800 seconds.
         "gateway_turn_lease_timeout": 1800,
+        # Admission control for a shared backend (agent/backend_scheduler.py).
+        # Several Discord sessions, cron jobs and maintenance forks push
+        # inference at one local server that serves a single request at a
+        # time; with nobody arbitrating, they all submitted at once and the
+        # server arbitrated by rejecting (503 "worker inference queue timed
+        # out"). One permit per in-flight backend call fixes that: live turns
+        # outrank maintenance (background review, curator sweep), and within a
+        # class the queue is first-come-first-served. The permit covers one
+        # call, not a whole turn, so a long agentic turn keeps giving the slot
+        # back between tool calls.
+        "backend_scheduler": {
+            # auto  — engage only for a local endpoint (loopback, private
+            #         range, Tailscale, container DNS). Hosted providers have
+            #         their own concurrency and rate limits and are left
+            #         alone, so "auto" is behaviour-identical unless you run a
+            #         local backend.
+            # on/off — force it either way.
+            "mode": "auto",
+            # In-flight backend calls allowed at once. 1 matches a
+            # single-slot server (llama.cpp/ds4-server style); raise it to the
+            # slot count of a multi-slot server (vLLM, TGI) so the queue only
+            # holds back genuine oversubscription.
+            "max_concurrent_requests": 1,
+            # How long a queued call waits before giving up and submitting
+            # anyway (never a turn failure — the fallback is the pre-queue
+            # behaviour). 0 derives it from the p90 of recent measured call
+            # durations × the claims ahead, which is the point of measuring:
+            # a fixed timeout is simultaneously too short for a legitimate
+            # 6-minute prefill behind another session and too long for a
+            # wedged backend. The floor covers a cold process with no samples
+            # yet; the cap bounds a pathological outlier.
+            "queue_wait_seconds": 0,
+            "queue_wait_min_seconds": 120,
+            "queue_wait_cap_seconds": 1800,
+            # Stand-in call duration until this process has measured any.
+            "assumed_call_seconds": 120,
+            # Deadline/notice bookkeeping cadence while queued. The grant
+            # itself is event-driven (the previous call's release wakes the
+            # next waiter), so this does not add latency.
+            "poll_seconds": 1.0,
+            # Tell a queued session its position and elapsed wait after this
+            # long, then every notify_interval_seconds. 0 disables the notice
+            # (the wait still happens, silently).
+            "notify_after_seconds": 20,
+            "notify_interval_seconds": 60,
+        },
         # Per-session AIAgent cache in the gateway. Each cached agent keeps a
         # warm prompt prefix AND the session's full transcript, so the cache
         # trades memory for cost: too small and every turn re-pays an uncached
