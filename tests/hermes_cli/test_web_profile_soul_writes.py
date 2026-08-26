@@ -29,11 +29,16 @@ SOUL = "# Persona\n\nYou are a careful, terse assistant.\n"
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "soul-test-token")
     from hermes_cli import web_server
 
+    # ``_SESSION_TOKEN`` is resolved once at first import of this module in
+    # the process and never re-read from the env afterwards (see
+    # tests/hermes_cli/test_web_server.py::TestSessionTokenInjection), so
+    # setting HERMES_DASHBOARD_SESSION_TOKEN here is a no-op whenever some
+    # earlier test file already imported ``hermes_cli.web_server`` in this
+    # process. Authenticate with the token the module actually adopted.
     with TestClient(web_server.app, raise_server_exceptions=False) as c:
-        c.headers["Authorization"] = "Bearer soul-test-token"
+        c.headers["Authorization"] = f"Bearer {web_server._SESSION_TOKEN}"
         yield c
 
 

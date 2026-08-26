@@ -238,30 +238,42 @@ def main():
         os.environ["HOME"] = home
         sys.path.insert(0, WT)
 
-        # Fresh module state per sequence to avoid cached init paths.
-        for m in list(sys.modules.keys()):
-            if m.startswith("hermes_cli"):
-                del sys.modules[m]
-        from hermes_cli import kanban_db as kb
-
-        kb.init_db()
-        conn = kb.connect()
-        task_pool = []
-        ops_log = []
-
+        # Fresh module state per sequence to avoid cached init paths. Save the
+        # evicted modules and put them back afterwards — leaving them evicted
+        # is the same pattern that caused incident H-035 (see
+        # tests/hermes_cli/conftest.py:fresh_hermes_module_imports).
+        saved_modules = {
+            name: module
+            for name, module in sys.modules.items()
+            if name == "hermes_cli" or name.startswith("hermes_cli.")
+        }
+        for name in saved_modules:
+            del sys.modules[name]
         try:
-            for i in range(OPS_PER_SEQUENCE):
-                result = random_op(rng, conn, kb, task_pool)
-                if result is None:
-                    continue
-                ops_log.append(result)
-                total_ops += 1
-                if not assert_invariants(conn, kb, ops_log):
-                    total_violations += 1
-                    print(f"  sequence {seq_idx} (seed={seed}) failed at op {i}")
-                    break
+            from hermes_cli import kanban_db as kb
+
+            kb.init_db()
+            conn = kb.connect()
+            task_pool = []
+            ops_log = []
+
+            try:
+                for i in range(OPS_PER_SEQUENCE):
+                    result = random_op(rng, conn, kb, task_pool)
+                    if result is None:
+                        continue
+                    ops_log.append(result)
+                    total_ops += 1
+                    if not assert_invariants(conn, kb, ops_log):
+                        total_violations += 1
+                        print(f"  sequence {seq_idx} (seed={seed}) failed at op {i}")
+                        break
+            finally:
+                conn.close()
         finally:
-            conn.close()
+            for name in [n for n in sys.modules if n == "hermes_cli" or n.startswith("hermes_cli.")]:
+                del sys.modules[name]
+            sys.modules.update(saved_modules)
 
         if seq_idx % 10 == 0:
             print(f"  seq {seq_idx:3d}: {total_ops} ops so far, {total_violations} violations")

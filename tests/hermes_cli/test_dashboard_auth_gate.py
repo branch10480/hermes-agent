@@ -15,6 +15,25 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 
 
+@pytest.fixture(autouse=True)
+def _restore_auth_required():
+    """Restore ``web_server.app.state.auth_required`` after every test.
+
+    Several tests below call the real ``start_server()`` (or set the flag
+    directly) to observe how it stashes ``auth_required`` on ``app.state``,
+    but never restore it. Since ``web_server.app`` is a process-wide
+    singleton, a leaked ``True`` here makes ``auth_middleware`` skip the
+    legacy ``_SESSION_TOKEN`` bearer-token check for every later test in the
+    process (it defers to the OAuth cookie gate instead), which surfaces as
+    spurious 401s in unrelated dashboard tests such as
+    ``test_dashboard_param_clamps.py`` and ``test_web_profile_soul_writes.py``
+    whenever this file runs earlier in the same pytest process.
+    """
+    prev_required = getattr(web_server.app.state, "auth_required", None)
+    yield
+    web_server.app.state.auth_required = prev_required
+
+
 @pytest.fixture
 def client_loopback():
     # Pin the bound-host state for host_header_middleware so requests with

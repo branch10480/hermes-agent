@@ -187,12 +187,24 @@ class TestCmdUpdateTermuxUvBootstrap:
 
         pkg_uv = "/data/data/com.termux/files/usr/bin/uv"
         monkeypatch.setattr(hm, "_is_termux_env", lambda env=None: True)
-        # Production resolve_uv only checks $HERMES_HOME/bin/uv; model an empty
-        # managed dir so the PATH probe is what surfaces the packaged uv.
-        monkeypatch.setattr("hermes_cli.managed_uv.resolve_uv", lambda: None)
         monkeypatch.setattr("shutil.which", lambda name: pkg_uv if name == "uv" else None)
 
-        uv_bin = hm._ensure_uv_for_termux(["/termux/python", "-m", "pip"])
+        # Production resolve_uv only checks $HERMES_HOME/bin/uv; model an empty
+        # managed dir so the PATH probe is what surfaces the packaged uv.
+        #
+        # This module's autouse ``_patch_managed_uv`` fixture already has
+        # ``hermes_cli.managed_uv.resolve_uv`` patched via ``unittest.mock.patch``.
+        # Re-patching the same attribute here with ``monkeypatch.setattr`` instead
+        # of ``patch`` mixes two independent teardown mechanisms on one target;
+        # depending on pytest's fixture-finalizer order, monkeypatch's restore can
+        # run before the autouse fixture's ``with patch(...)`` block exits, which
+        # then permanently stamps that fixture's mock back over the real
+        # ``resolve_uv`` for the rest of the test process (see incident: this
+        # leaked into tests/hermes_cli/test_managed_uv.py when run after this
+        # file in a single process). Using ``patch(...)`` here nests correctly
+        # with the outer ``patch(...)`` regardless of finalizer order.
+        with patch("hermes_cli.managed_uv.resolve_uv", lambda: None):
+            uv_bin = hm._ensure_uv_for_termux(["/termux/python", "-m", "pip"])
 
         assert uv_bin == pkg_uv
         mock_run.assert_not_called()
