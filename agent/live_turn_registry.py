@@ -1,26 +1,37 @@
-"""Process-global turn registry — the background-review idle gate (H-034).
+"""Process-global registry of the turns that are in flight right now.
 
 Several Discord sessions, cron jobs and maintenance forks share one local
-backend. Background review used to be gated and cancelled purely through the
-agent that owned it: it started even while a *different* session was mid-turn,
-and only the owning agent's next turn stopped it. Observed effect: a
-skill-library review enqueued right after one session finished kept the single
-backend slot busy, and the still-live session's own calls came back 503 —
-housekeeping starving user-facing work.
+backend, and two separate subsystems need the same fact — "which turns are
+running?" — so both read this one registry.
 
-Two process-wide facts fix that, and both live here:
+**The background-review idle gate (H-034).** Background review used to be gated
+and cancelled purely through the agent that owned it: it started even while a
+*different* session was mid-turn, and only the owning agent's next turn stopped
+it. Observed effect: a skill-library review enqueued right after one session
+finished kept the single backend slot busy, and the still-live session's own
+calls came back 503 — housekeeping starving user-facing work. Two process-wide
+facts fix that: every conversation turn registers for its duration, so a review
+can ask "is anything else in flight anywhere?" before it starts and while it
+runs; and every in-flight review registers a cancel hook, so a live turn in
+*any* session can stop it.
 
-* every conversation turn registers for its duration, so a review can ask
-  "is anything else in flight anywhere?" before it starts, and while it runs;
-* every in-flight review registers a cancel hook, so a live turn in *any*
-  session can stop it.
+**Sandbox retention (H-026).** ``tools.terminal_tool`` retires a task's
+environment once it has gone ``lifetime_seconds`` without a *tool* call. That
+measure reads a turn parked inside a single model API call as idle: local
+backends routinely spend five to eight minutes prefilling a large context, so
+the sweep tore the environment down mid-turn and the next tool call rebuilt it,
+losing the session cwd and whatever shell state the turn had established. Each
+turn record therefore carries its task id, and :func:`active_task_ids` tells
+the sweep which environments to leave alone. Scope note: it protects the
+*environment*. A background process whose tracked wrapper exited early still
+loses its handle; that is a separate defect with a separate fix.
 
 Sessions are identified in messages by ``agent.redact.session_key_fingerprint``
 output only. Gateway session keys embed Discord channel/thread/participant IDs
 and must never reach logs (H-014).
 
 Everything here is best-effort coordination, never correctness-critical: a
-process that never registers a turn behaves exactly as it did before the gate.
+process that never registers a turn behaves exactly as it did before.
 """
 
 from __future__ import annotations
@@ -29,7 +40,7 @@ import itertools
 import logging
 import threading
 import time
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +56,12 @@ TURN_KIND_MAINTENANCE = "maintenance"
 _DEFAULT_IDLE_GATE_ENABLED = True
 _DEFAULT_IDLE_GATE_POLL_SECONDS = 5.0
 _DEFAULT_IDLE_GATE_MAX_WAIT_SECONDS = 300.0
+
+# Safety valve for a turn that never reaches ``end_turn``. Well above the
+# longest turns seen in practice (multi-hour agentic sessions): this is a leak
+# stop, not a turn timeout, and expiring sooner would reintroduce the mid-turn
+# sandbox teardown the task-id half of this registry exists to prevent.
+MAX_TURN_AGE_SECONDS = 12 * 3600.0
 
 _lock = threading.RLock()
 _turns: Dict[int, Dict[str, Any]] = {}
@@ -89,12 +106,21 @@ def is_maintenance_agent(agent: Any) -> bool:
 # Turn registration
 # ---------------------------------------------------------------------------
 
-def begin_turn(agent: Any, kind: str = TURN_KIND_LIVE) -> int:
+def begin_turn(
+    agent: Any,
+    kind: str = TURN_KIND_LIVE,
+    task_id: Optional[str] = None,
+) -> int:
     """Register a running turn and return its token.
 
     The token is also recorded on the agent (``_live_turn_tokens``) so its own
     post-turn review can exclude it — the review is spawned from inside
     ``finalize_turn``, i.e. while the owning turn is still registered.
+
+    *task_id* names the sandbox this turn is working in, and is what
+    :func:`active_task_ids` reports to the terminal-tool idle sweep. A turn
+    that cannot name one still registers for the idle gate; it simply holds no
+    environment open.
     """
     token = next(_token_seq)
     record = {
@@ -102,6 +128,9 @@ def begin_turn(agent: Any, kind: str = TURN_KIND_LIVE) -> int:
         "kind": kind if kind in (TURN_KIND_LIVE, TURN_KIND_MAINTENANCE) else TURN_KIND_LIVE,
         "session": session_label(agent),
         "platform": str(getattr(agent, "platform", "") or "") or "unknown",
+        "task_id": task_id if isinstance(task_id, str) and task_id else "",
+        # Monotonic: the timestamp is only ever read as an age, and a wall-clock
+        # step (NTP, sleep/wake) must not expire a live turn's registration.
         "started_at": time.monotonic(),
     }
     with _lock:
@@ -140,6 +169,52 @@ def active_turns(exclude: Iterable[int] = ()) -> List[Dict[str, Any]]:
             for token, record in sorted(_turns.items())
             if token not in skip
         ]
+
+
+def active_task_ids(
+    *,
+    now: Optional[float] = None,
+    max_age_seconds: Optional[float] = None,
+) -> Set[str]:
+    """Return the task ids whose turn is still running.
+
+    Registrations older than *max_age_seconds* are dropped and reported — a
+    turn that outlives the cap has lost its ``end_turn``, and leaving it in
+    place would keep its environment alive (and the idle gate closed) for the
+    rest of the process. The sweep is done here rather than in
+    :func:`active_turns` because the terminal-tool cleanup is the caller that
+    runs on a timer; the gate sees the same freed entries because both read the
+    one registry.
+
+    *now* is a ``time.monotonic()`` reading; tests pass one to age entries out
+    without waiting.
+    """
+    clock = time.monotonic() if now is None else float(now)
+    cap = MAX_TURN_AGE_SECONDS if max_age_seconds is None else float(max_age_seconds)
+
+    expired: List[Dict[str, Any]] = []
+    with _lock:
+        for token, record in list(_turns.items()):
+            if clock - record["started_at"] > cap:
+                _turns.pop(token, None)
+                expired.append(record)
+        live = {
+            record["task_id"] for record in _turns.values() if record["task_id"]
+        }
+
+    # The session field is already a fingerprint (H-014); the task prefix is
+    # enough to say which environment was affected.
+    for record in expired:
+        logger.warning(
+            "Dropping stale active-turn registration for task %s (%s/%s) after "
+            "%.0fs — its turn never released it, and its environment is "
+            "eligible for cleanup again",
+            (record["task_id"] or "unknown")[:8],
+            record["kind"],
+            record["session"],
+            clock - record["started_at"],
+        )
+    return live
 
 
 def backend_busy_reason(exclude: Iterable[int] = ()) -> Optional[str]:
@@ -320,10 +395,12 @@ def reset_for_tests() -> None:
 
 
 __all__ = [
+    "MAX_TURN_AGE_SECONDS",
     "TURN_KIND_LIVE",
     "TURN_KIND_MAINTENANCE",
     "BackgroundReviewHandle",
     "active_background_reviews",
+    "active_task_ids",
     "active_turns",
     "backend_busy_reason",
     "begin_turn",

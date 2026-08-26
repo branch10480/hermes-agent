@@ -8282,18 +8282,6 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
-        # Hold this task's sandbox against the terminal-tool idle sweep for as
-        # long as the turn runs. The sweep measures idleness by the last tool
-        # call, which reads a turn parked in one long API call as abandoned and
-        # retires the environment out from under it (H-026). Released in the
-        # innermost finally so an early return, an interrupt, or a raise all
-        # unregister. Best-effort on both sides: bookkeeping for a cleanup
-        # heuristic must never be able to fail a turn.
-        try:
-            from tools.env_activity import register_active_turn
-            register_active_turn(relay_turn_id, effective_task_id)
-        except Exception:
-            logger.debug("active-turn env registration skipped", exc_info=True)
         try:
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
@@ -8336,14 +8324,17 @@ class AIAgent:
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
             with bind_subagent_parent(self), scoped_runtime_main({}):
+                # task_id by keyword: the turn-registration wrapper in
+                # agent/conversation_loop.py reads it to hold this task's
+                # sandbox out of the terminal-tool idle sweep (H-026).
                 result = run_conversation(
                     self,
                     user_message,
                     system_message,
                     conversation_history,
-                    effective_task_id,
-                    stream_callback,
-                    persist_user_message,
+                    task_id=effective_task_id,
+                    stream_callback=stream_callback,
+                    persist_user_message=persist_user_message,
                     persist_user_timestamp=persist_user_timestamp,
                     persist_user_display_kind=persist_user_display_kind,
                     persist_user_display_metadata=persist_user_display_metadata,
@@ -8396,15 +8387,6 @@ class AIAgent:
                             relay_lease
                         )
                 finally:
-                    # The turn is over: let the idle sweep reclaim this task's
-                    # environment again on its normal schedule.
-                    try:
-                        from tools.env_activity import release_active_turn
-                        release_active_turn(relay_turn_id)
-                    except Exception:
-                        logger.debug(
-                            "active-turn env release skipped", exc_info=True
-                        )
                     # Always clear mid-turn labels when the turn exits — including
                     # interrupted early returns that skip finalize_turn. Keep ts.
                     try:

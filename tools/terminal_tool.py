@@ -1971,7 +1971,7 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     # spellings. Resolve before taking _env_lock: the container-alias lookup
     # takes its own lock and the sweep must not nest the two.
     try:
-        from tools.env_activity import active_task_ids
+        from agent.live_turn_registry import active_task_ids
         busy_task_ids = set()
         for raw_task_id in active_task_ids():
             busy_task_ids.add(raw_task_id)

@@ -8578,6 +8578,18 @@ def _run_conversation_core(
     )
 
 
+def _turn_task_id(args: tuple, kwargs: Dict[str, Any]) -> Optional[str]:
+    """The ``task_id`` :func:`_run_conversation_core` is about to receive.
+
+    ``AIAgent.run_conversation`` passes it by keyword; the positional fallback
+    keeps any other caller registering the right sandbox.
+    """
+    if "task_id" in kwargs:
+        return kwargs["task_id"]
+    # (user_message, system_message, conversation_history, task_id, ...)
+    return args[3] if len(args) > 3 else None
+
+
 def run_conversation(agent, *args, **kwargs) -> Dict[str, Any]:
     """Register the turn process-wide, then run it.
 
@@ -8593,6 +8605,15 @@ def run_conversation(agent, *args, **kwargs) -> Dict[str, Any]:
     Maintenance turns (the review fork itself, the curator sweep) register as
     such: they occupy the backend, so they hold the gate closed, but they do
     not cancel each other and they never cancel themselves.
+
+    The same registration carries the turn's task id, which holds its sandbox
+    out of the terminal-tool idle sweep for as long as the turn runs (H-026):
+    that sweep measures idleness by the last tool call, so a turn parked inside
+    one long API call reads as abandoned and has its environment retired out
+    from under it. Registration is best-effort on both sides — bookkeeping for
+    a cleanup heuristic and a housekeeping gate must never be able to fail a
+    turn — and the release lives in a ``finally`` so an early return, an
+    interrupt, or a raise all unregister.
     """
     kind = (
         live_turn_registry.TURN_KIND_MAINTENANCE
@@ -8611,7 +8632,9 @@ def run_conversation(agent, *args, **kwargs) -> Dict[str, Any]:
             )
     token = None
     try:
-        token = live_turn_registry.begin_turn(agent, kind=kind)
+        token = live_turn_registry.begin_turn(
+            agent, kind=kind, task_id=_turn_task_id(args, kwargs)
+        )
     except Exception:
         logger.debug("live-turn registration failed", exc_info=True)
     try:
