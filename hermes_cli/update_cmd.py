@@ -3830,6 +3830,21 @@ def _normalize_managed_eol(git_cmd, repo_root):
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
+    # Owner opt-out for externally-managed checkouts. This must stay the very
+    # first thing the apply path does: everything below it mutates the tree
+    # (pre-update backup, autostash, branch checkout, git pull), and on a
+    # checkout owned by Nix or similar that mutation is exactly what the
+    # setting exists to prevent. ``--check`` never reaches here — cmd_update
+    # branches to _cmd_update_check first — so the read-only path stays open.
+    from hermes_cli.config import (
+        SELF_UPDATE_DISABLED_MESSAGE,
+        self_update_enabled,
+    )
+
+    if not self_update_enabled():
+        print(f"✗ {SELF_UPDATE_DISABLED_MESSAGE}")
+        sys.exit(1)
+
     # In gateway mode, use file-based IPC for prompts instead of stdin
     gw_input_fn = (
         (lambda prompt, default="": _gateway_prompt(prompt, default))

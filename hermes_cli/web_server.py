@@ -1005,6 +1005,16 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "description": "Reasoning effort for delegated subagents",
         "options": ["", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
     },
+    "updates.self_update_enabled": {
+        "type": "boolean",
+        "description": (
+            "Allow Hermes to update its own checkout. Turn this off when the "
+            "checkout is owned by something outside Hermes (a pinned Nix "
+            "revision, config management): `hermes update` and /update then "
+            "refuse before touching the tree, and updates go through the "
+            "managing system instead."
+        ),
+    },
     "updates.non_interactive_local_changes": {
         "type": "select",
         "description": (

@@ -5683,7 +5683,12 @@ class GatewaySlashCommandsMixin:
         import shutil
         import subprocess
         from datetime import datetime
-        from hermes_cli.config import is_managed, format_managed_message
+        from hermes_cli.config import (
+            SELF_UPDATE_DISABLED_MESSAGE,
+            format_managed_message,
+            is_managed,
+            self_update_enabled,
+        )
 
         # Block non-messaging platforms (API server, webhooks, ACP)
         platform = event.source.platform
@@ -5700,6 +5705,13 @@ class GatewaySlashCommandsMixin:
 
         if is_managed():
             return f"✗ {format_managed_message('update Hermes Agent')}"
+
+        # Refuse before the pending-update markers are written and before
+        # `hermes update` is spawned — the spawned process would refuse on the
+        # same setting, but only after detaching, so the user would be left
+        # waiting on a stream that never arrives.
+        if not self_update_enabled():
+            return f"✗ {SELF_UPDATE_DISABLED_MESSAGE}"
 
         project_root = Path(__file__).parent.parent.resolve()
         git_dir = project_root / '.git'

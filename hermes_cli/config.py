@@ -379,6 +379,39 @@ def is_managed() -> bool:
     return get_managed_system() is not None
 
 
+SELF_UPDATE_DISABLED_MESSAGE = (
+    "Self-update is disabled by configuration "
+    "(updates.self_update_enabled=false). This checkout is managed "
+    "externally — update it through the managing system instead."
+)
+
+
+def self_update_enabled() -> bool:
+    """Whether Hermes may update its own checkout.
+
+    Reads ``updates.self_update_enabled``. Unlike ``is_managed()`` this gates
+    only the update path, so an externally-owned checkout (a pinned Nix
+    revision, config management) can forbid self-update without freezing the
+    rest of the config.
+
+    Fail-safe: any read failure returns True. A broken/unreadable config must
+    not be what stops a user from updating.
+    """
+    try:
+        updates = (load_config_readonly() or {}).get("updates", {})
+        if not isinstance(updates, dict):
+            return True
+        value = updates.get("self_update_enabled", True)
+        if isinstance(value, str):
+            # A hand-edited or template-generated config can quote the value;
+            # "false" must still disable, not read as a truthy string.
+            return value.strip().lower() not in {"false", "no", "off", "0", ""}
+        return bool(value)
+    except Exception as exc:
+        logger.debug("Could not read updates.self_update_enabled: %s", exc)
+        return True
+
+
 _NIX_UPDATE_MSG = (
     "Update Hermes through the Nix source that installed it "
     "(e.g. nix profile upgrade, or update your flake input and rebuild with nixos-rebuild or home-manager switch)"

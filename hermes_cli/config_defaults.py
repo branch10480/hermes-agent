@@ -2903,6 +2903,20 @@ DEFAULT_CONFIG = {
 
     # ``hermes update`` behaviour.
     "updates": {
+        # Master switch for updating this checkout from inside Hermes.
+        # Set to false and ``hermes update`` and the gateway's ``/update``
+        # both refuse at the entry point — before any backup, autostash or
+        # git operation runs. Intended for installations whose checkout is
+        # owned by something outside Hermes (a Nix flake pinning a revision,
+        # a config-management system, a distro package built from source):
+        # there, a self-update rewrites a tree the managing system believes
+        # it controls, and any uncommitted work in it can be swept into an
+        # autostash the owner never asked for. The managing system (e.g. a
+        # dotfiles repo that pins the revision) is expected to pin this to
+        # false and drive updates through its own channel.
+        # Unlike HERMES_MANAGED / the ``.managed`` marker this only gates
+        # updating — the rest of the config stays writable.
+        "self_update_enabled": True,
         # Pre-update safety backup — ONE consolidated mechanism, three modes:
         #
         #   quick (default) — snapshot critical small state files (pairing

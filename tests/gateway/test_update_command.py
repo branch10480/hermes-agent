@@ -258,6 +258,78 @@ class TestUpdateCommandPlatformGate:
 
 
 # ---------------------------------------------------------------------------
+# updates.self_update_enabled gate
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateCommandSelfUpdateGate:
+    """``updates.self_update_enabled: false`` marks a checkout as owned by
+    something outside Hermes (a pinned Nix revision, config management).
+    /update must then refuse in-process — spawning the detached updater would
+    leave the user waiting on a stream that never arrives, and the pending
+    markers would already be on disk."""
+
+    @pytest.mark.asyncio
+    async def test_refuses_and_spawns_nothing_when_disabled(self, tmp_path, monkeypatch):
+        runner = _make_runner()
+        event = _make_event()
+        monkeypatch.setenv("HERMES_MANAGED", "")
+
+        fake_root = tmp_path / "project"
+        (fake_root / "gateway").mkdir(parents=True)
+        (fake_root / ".git").mkdir()
+        (fake_root / "gateway" / "slash_commands.py").touch()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"updates": {"self_update_enabled": False}},
+        )
+
+        mock_popen = MagicMock()
+        with patch("gateway.run._hermes_home", hermes_home), \
+             patch("gateway.slash_commands.__file__",
+                   str(fake_root / "gateway" / "slash_commands.py")), \
+             patch("subprocess.Popen", mock_popen):
+            result = await runner._handle_update_command(event)
+
+        assert "updates.self_update_enabled=false" in result
+        mock_popen.assert_not_called()
+        # No markers written — the refusal happens before that bookkeeping.
+        assert not (hermes_home / ".update_pending.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_allows_when_key_absent(self, tmp_path, monkeypatch):
+        """Default config leaves /update behaving exactly as before."""
+        runner = _make_runner()
+        event = _make_event()
+        monkeypatch.setenv("HERMES_MANAGED", "")
+
+        fake_root = tmp_path / "project"
+        (fake_root / "gateway").mkdir(parents=True)
+        (fake_root / ".git").mkdir()
+        (fake_root / "gateway" / "run.py").touch()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"updates": {"non_interactive_local_changes": "stash"}},
+        )
+
+        with patch("gateway.run._hermes_home", hermes_home), \
+             patch("gateway.run.__file__", str(fake_root / "gateway" / "run.py")), \
+             patch("shutil.which",
+                   side_effect=lambda x: "/usr/bin/hermes" if x == "hermes" else "/usr/bin/setsid"), \
+             patch("subprocess.Popen"):
+            result = await runner._handle_update_command(event)
+
+        assert "self_update_enabled" not in result
+        assert (hermes_home / ".update_pending.json").exists()
+
+
+# ---------------------------------------------------------------------------
 # _send_update_notification
 # ---------------------------------------------------------------------------
 
