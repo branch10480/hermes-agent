@@ -2563,8 +2563,13 @@ _UNCLASSIFIED_EFFECT = "unclassified"
 # pattern keys, which are static detector labels or tirith rule IDs — never
 # command text — so this table can never leak the blocked command.
 _EFFECT_CLASS_RULES = (
+    # "script_execution" covers both interpreter inline-exec labels
+    # ("script execution via -e/-c flag", "script execution via heredoc"),
+    # which used to fall through to unclassified and hand the model the
+    # generic advice — the exact loop that tripped the denial breaker.
     ("arbitrary_code_execution", ("execute_code", "fork_bomb", "shell_c",
-                                  "inline_code", "eval", "encoded_command")),
+                                  "inline_code", "eval", "encoded_command",
+                                  "script_execution")),
     ("destructive_data", ("sql_drop", "sql_delete", "truncate", "mkfs",
                           "format_filesystem", "disk_copy", "block_device")),
     ("destructive_filesystem", ("delete", "remove_item", "rmdir", "erase",
@@ -2575,15 +2580,20 @@ _EFFECT_CLASS_RULES = (
                            "sudo", "setuid")),
     ("credential_exposure", ("credential", "secret", "token", "api_key",
                              "password", "private_key", "env_file")),
+    # "lookalike_tld" is the tirith rule id for a suspicious domain, which
+    # reaches here as the reason code "tirith_lookalike_tld".
     ("network_egress", ("curl", "wget", "upload", "publish", "push",
-                        "exfil", "network", "http")),
+                        "exfil", "network", "http", "lookalike_tld")),
 )
 
 _SAFE_ALTERNATIVES_BY_EFFECT_CLASS = {
     "arbitrary_code_execution": (
         "use the dedicated built-in tools (read_file / write_file / terminal "
         "with a single explicit command) instead of a script that can spawn "
-        "its own subprocesses"
+        "its own subprocesses. If the work genuinely needs a script, write it "
+        "to a file with write_file, then run that one file: "
+        "terminal(command=\"bash /path/script.sh\") or "
+        "\"python3 /path/script.py\". Do not retry it inline"
     ),
     "destructive_data": (
         "read or export the data first (SELECT / dump to a file) and let the "

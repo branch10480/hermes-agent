@@ -376,7 +376,15 @@ def _check_fn_cached(fn: Callable) -> bool:
 
         # No recent success (or grace expired) — honor the failure. Log it so
         # silent tool loss in quiet mode (subagents) is diagnosable.
-        logger.warning(
+        #
+        # Level split: a raise is a genuine fault (the probe itself broke), but
+        # a plain False is the documented way to say "not configured" or to
+        # hide a tool on purpose (e.g. the legacy browser_* checks under
+        # browser-use CLI mode), which turned this into steady WARNING noise
+        # every turn. Same message either way — only the level differs, so
+        # nothing is lost, it just stops crying wolf.
+        logger.log(
+            logging.WARNING if raised else logging.INFO,
             "check_fn %s %s; dependent tools will be unavailable this turn",
             getattr(fn, "__qualname__", fn),
             "raised" if raised else "returned False",

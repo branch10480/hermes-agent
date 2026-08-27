@@ -24,7 +24,10 @@ import logging
 
 import pytest
 
-from agent.conversation_loop import approval_breaker_final_message
+from agent.conversation_loop import (
+    _SAFE_ALTERNATIVE_JA_BY_EFFECT_CLASS,
+    approval_breaker_final_message,
+)
 from tools import approval as A
 
 # A session key shaped like the gateway's Discord keys: every segment is an
@@ -373,11 +376,73 @@ def test_session_fingerprint_is_stable_and_not_reversible():
     ("force kill processes", "process_control"),
     ("world/other-writable permissions", "permission_change"),
     ("something nobody classified", "unclassified"),
+    # These three fell through to "unclassified" and handed the model the
+    # generic advice, which is what let it keep re-trying the same inline
+    # script under a different syntax until the denial breaker tripped.
+    ("script execution via heredoc", "arbitrary_code_execution"),
+    ("script execution via -e/-c flag", "arbitrary_code_execution"),
+    ("tirith:lookalike_tld", "network_egress"),
 ])
 def test_effect_class_derivation(pattern_key, expected_class):
     context = A._deny_context([pattern_key])
     assert context["effect_class"] == expected_class
     assert context["safe_alternative"]
+
+
+def test_inline_script_denial_names_the_write_file_recipe():
+    """The advice must be actionable, not just "don't do that"."""
+    context = A._deny_context(["script execution via heredoc"])
+    alternative = context["safe_alternative"]
+
+    assert "write_file" in alternative
+    assert "inline" in alternative
+
+
+def test_every_effect_class_has_a_japanese_alternative():
+    """The user-facing breaker message must not fall back to English.
+
+    ``approval_breaker_final_message`` writes Japanese, so a new effect class
+    added to tools.approval without a counterpart here would silently drop an
+    English sentence into the middle of it.
+    """
+    # A class added to _EFFECT_CLASS_RULES but not to the English table falls
+    # back to the generic advice — the same silent hole that left inline-script
+    # denials unactionable. _UNCLASSIFIED_EFFECT is table-only, hence subset.
+    assert {c for c, _ in A._EFFECT_CLASS_RULES} <= set(
+        A._SAFE_ALTERNATIVES_BY_EFFECT_CLASS
+    )
+    assert set(_SAFE_ALTERNATIVE_JA_BY_EFFECT_CLASS) == set(
+        A._SAFE_ALTERNATIVES_BY_EFFECT_CLASS
+    )
+
+
+def test_final_turn_message_localizes_the_safe_alternative():
+    message = approval_breaker_final_message({
+        "tool_name": "terminal",
+        "count": 3,
+        "threshold": 3,
+        "reason_code": "script_execution_via_heredoc",
+        "effect_class": "arbitrary_code_execution",
+        # The English text the model saw travels on the side channel; the
+        # user-facing message renders the Japanese counterpart instead.
+        "safe_alternative": A._safe_alternative_for("arbitrary_code_execution"),
+    })
+
+    assert _SAFE_ALTERNATIVE_JA_BY_EFFECT_CLASS["arbitrary_code_execution"] in message
+    assert "use the dedicated built-in tools" not in message
+
+
+def test_final_turn_message_keeps_an_unknown_class_alternative():
+    """An effect class this build has no translation for still says something."""
+    message = approval_breaker_final_message({
+        "tool_name": "terminal",
+        "count": 3,
+        "threshold": 3,
+        "effect_class": "some_future_class",
+        "safe_alternative": "do the safe thing instead",
+    })
+
+    assert "do the safe thing instead" in message
 
 
 def test_reason_code_is_bounded_and_alphanumeric():

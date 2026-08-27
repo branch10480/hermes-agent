@@ -109,6 +109,47 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+# Japanese renderings of tools.approval's safe-alternative advice, keyed by
+# effect class. The model-facing English text in the tool result is the
+# authority and stays untouched; only this user-facing turn-ending message is
+# localized, so an English sentence no longer sits inside a Japanese one. Keys
+# mirror _SAFE_ALTERNATIVES_BY_EFFECT_CLASS — an unknown or missing class falls
+# back to whatever string the side-channel record carried, so a record written
+# by an older build still renders.
+_SAFE_ALTERNATIVE_JA_BY_EFFECT_CLASS = {
+    "arbitrary_code_execution": (
+        "スクリプトをインラインで実行せず、write_file で一度ファイルに書き出し、"
+        "そのファイルだけを単一の明示コマンド（bash /path/script.sh、"
+        "python3 /path/script.py など）として実行する"
+    ),
+    "destructive_data": (
+        "先に SELECT やダンプでデータを読み出しておき、破壊的な文の実行は"
+        "ユーザーに任せる"
+    ),
+    "destructive_filesystem": (
+        "削除せず、削除対象になるパスを列挙して報告する"
+    ),
+    "process_control": (
+        "停止や kill はせず、プロセス / サービスの状態（一覧・status・ログ）を"
+        "確認して報告する"
+    ),
+    "permission_change": (
+        "権限を変更せず、現在の権限と必要な変更内容を報告する"
+    ),
+    "credential_exposure": (
+        "秘密の値そのものは読まず動かさず、キー名や存在確認などの非機密な"
+        "メタデータだけを扱う"
+    ),
+    "network_egress": (
+        "送信せずローカルで完結させ、何を送ろうとしたかを報告する"
+    ),
+    "unclassified": (
+        "操作を読み取りだけの手順に狭めるか、必要なことを報告してユーザーの"
+        "判断を仰ぐ"
+    ),
+}
+
+
 def approval_breaker_final_message(halt: Dict[str, Any]) -> str:
     """Turn-ending message for the approval denial circuit breaker.
 
@@ -138,7 +179,9 @@ def approval_breaker_final_message(halt: Dict[str, Any]) -> str:
         reason_line += "。"
 
     alternative_line = ""
-    safe_alternative = halt.get("safe_alternative")
+    safe_alternative = _SAFE_ALTERNATIVE_JA_BY_EFFECT_CLASS.get(
+        str(effect_class or "")
+    ) or halt.get("safe_alternative")
     if safe_alternative:
         alternative_line = f"同じ目的を安全に進めるなら: {safe_alternative}。"
 
