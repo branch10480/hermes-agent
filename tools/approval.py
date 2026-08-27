@@ -4731,7 +4731,20 @@ def check_all_command_guards(command: str, env_type: str,
     # inspect the explanation and approve if they understand the risk.
     if tirith_result["action"] in {"block", "warn"}:
         findings = tirith_result.get("findings") or []
-        rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
+        # Key off the most severe finding, not findings[0]: tirith's finding
+        # order is arbitrary, and a MEDIUM lookalike_tld listed before a HIGH
+        # curl_pipe_shell would otherwise mislabel the deny reason in logs.
+        _sev_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+        rule_id = "unknown"
+        if findings:
+            top = max(
+                findings,
+                key=lambda f: _sev_rank.get(
+                    str(f.get("severity", "")).lower(), 0
+                ) if isinstance(f, dict) else -1,
+            )
+            if isinstance(top, dict):
+                rule_id = top.get("rule_id", "unknown")
         tirith_key = f"tirith:{rule_id}"
         tirith_desc = _format_tirith_description(tirith_result)
         if not is_approved(session_key, tirith_key):

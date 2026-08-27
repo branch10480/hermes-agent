@@ -6,7 +6,9 @@ threats (homograph URLs, pipe-to-interpreter, terminal injection, etc.).
 Exit code is the verdict source of truth:
   0 = allow, 1 = block, 2 = warn
 
-JSON stdout enriches findings/summary but never overrides the verdict.
+JSON stdout enriches findings/summary and never escalates the verdict.  The
+single downgrade is the .app lookalike_tld false-positive suppression in
+check_command_security (see the comment there for its guard conditions).
 Operational failures (spawn error, timeout, unknown exit code) respect
 the fail_open config setting. Programming errors propagate.
 
@@ -34,6 +36,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -873,7 +876,9 @@ def check_command_security(command: str) -> dict:
     """Run tirith security scan on a command.
 
     Exit code determines action (0=allow, 1=block, 2=warn). JSON enriches
-    findings/summary. Spawn failures and timeouts respect the fail-open
+    findings/summary; the only verdict override is the .app lookalike_tld
+    false-positive suppression documented inline below. Spawn failures and
+    timeouts respect the fail-open
     policy of the calling surface (see the module docstring). Programming
     errors propagate.
 
@@ -991,12 +996,16 @@ def check_command_security(command: str) -> dict:
             closed_summary=f"tirith exit code {exit_code} (fail-closed)",
         )
 
-    # Parse JSON for enrichment (never overrides the exit code verdict)
+    # Parse JSON for enrichment. Findings never escalate the exit code
+    # verdict; the sole downgrade is the .app lookalike_tld suppression below.
     findings = []
+    raw_findings = []
     summary = ""
     try:
         data = json.loads(result.stdout) if result.stdout.strip() else {}
         raw_findings = data.get("findings", [])
+        if not isinstance(raw_findings, list):
+            raw_findings = []
         findings = raw_findings[:_MAX_FINDINGS]
         summary = (data.get("summary", "") or "")[:_MAX_SUMMARY_LEN]
     except (json.JSONDecodeError, AttributeError):
@@ -1007,14 +1016,24 @@ def check_command_security(command: str) -> dict:
         elif action == "warn":
             summary = "security warning detected (details unavailable)"
 
-    # Suppress warn verdicts that consist solely of a lookalike_tld finding for
-    # the .app TLD.  .app is a legitimate gTLD used by many production services
-    # and the "can be confused with file extensions" heuristic generates false
-    # positives for normal API calls.  Any other finding (including other
-    # lookalike_tld entries for non-.app TLDs) preserves the warn action.
-    if action == "warn" and findings:
-        non_suppressible = [f for f in findings if not _is_app_tld_finding(f)]
-        if not non_suppressible:
+    # Suppress warn/block verdicts that consist solely of lookalike_tld
+    # findings for the .app TLD.  .app is a legitimate gTLD used by many
+    # production services (api.bsky.app, etc.) and the "can be confused with
+    # file extensions" heuristic generates false positives for normal API
+    # calls.  Any other finding (including other lookalike_tld entries for
+    # non-.app TLDs) preserves the original action.  The check runs over the
+    # full untruncated finding list so a non-.app finding past the
+    # _MAX_FINDINGS cap still preserves the verdict; a JSON parse failure
+    # leaves raw_findings empty, so detail-less blocks are never downgraded.
+    # A block is additionally downgraded only when every finding carries a
+    # LOW/MEDIUM severity: tirith can escalate a Warn to Block via policy
+    # override or correlation, and that escalation may not be represented as
+    # a finding, so a HIGH/CRITICAL or severity-less block is never touched.
+    if action in ("warn", "block") and raw_findings:
+        non_suppressible = [f for f in raw_findings if not _is_app_tld_finding(f)]
+        if not non_suppressible and (
+            action == "warn" or _all_findings_low_or_medium(raw_findings)
+        ):
             action = "allow"
             findings = []
             summary = ""
@@ -1022,18 +1041,38 @@ def check_command_security(command: str) -> dict:
     return {"action": action, "findings": findings, "summary": summary}
 
 
+_APP_TLD_QUOTED_RE = re.compile(r"'\.app'", re.IGNORECASE)
+_SUPPRESSIBLE_SEVERITIES = frozenset({"low", "medium"})
+
+
+def _all_findings_low_or_medium(findings: list) -> bool:
+    """True when every finding carries an explicit LOW or MEDIUM severity."""
+    for f in findings:
+        sev = str(f.get("severity", "")).lower() if isinstance(f, dict) else ""
+        if sev not in _SUPPRESSIBLE_SEVERITIES:
+            return False
+    return True
+
+
 def _is_app_tld_finding(finding: dict) -> bool:
     """Return True if this finding is a lookalike_tld warning for the .app TLD only.
 
-    Checks the rule_id and inspects common value/detail field names that
-    Tirith may use to carry the TLD string.
+    Matches conservatively so a suppression miss fails safe: ``value``/``tld``
+    must equal ``.app`` exactly, and free-text fields must contain the quoted
+    ``'.app'`` form tirith's real schema uses ("Domain uses '.app' TLD ...").
+    A bare ``.app`` substring (e.g. an upstream wording change listing several
+    TLDs, or ``.application``) does NOT match.
     """
     if not isinstance(finding, dict):
         return False
     if finding.get("rule_id") != "lookalike_tld":
         return False
-    for field in ("value", "tld", "detail", "description", "message"):
+    for field in ("value", "tld"):
         val = finding.get(field)
-        if val is not None and ".app" in str(val).lower():
+        if val is not None and str(val).strip().lower() == ".app":
+            return True
+    for field in ("detail", "description", "message"):
+        val = finding.get(field)
+        if val is not None and _APP_TLD_QUOTED_RE.search(str(val)):
             return True
     return False

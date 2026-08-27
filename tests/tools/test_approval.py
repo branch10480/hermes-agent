@@ -99,10 +99,16 @@ class TestDetectDangerousRm:
             assert "delete" in desc.lower()
 
 
-    def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self):
-        with mock_patch("tempfile.gettempdir", return_value="/tmp"):
+    def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self, tmp_path):
+        # Use a canonical directory: the exemption only accepts operands
+        # written against the resolved temp dir, and a literal "/tmp" is a
+        # symlink to /private/tmp on macOS (so it would NOT be exempt there).
+        temp_dir = os.path.realpath(str(tmp_path))
+        with mock_patch("tempfile.gettempdir", return_value=temp_dir):
             for prefix in ("hermes-verify-", "hermes-ad-hoc-"):
-                assert detect_dangerous_command(f"rm -f /tmp/{prefix}example.py") == (
+                assert detect_dangerous_command(
+                    f"rm -f {temp_dir}/{prefix}example.py"
+                ) == (
                     False,
                     None,
                     None,
