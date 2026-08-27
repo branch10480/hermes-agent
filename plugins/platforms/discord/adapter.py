@@ -3089,6 +3089,32 @@ class DiscordAdapter(BasePlatformAdapter):
             final_delivery = bool(metadata and metadata.get("notify"))
             silent_kwargs = {"silent": True} if nonconversational else {}
 
+            # Discord channel/thread ids are numeric snowflakes. A non-numeric
+            # id (e.g. a session key fragment like "base" leaking in from a
+            # caller that skipped session-origin parsing) would otherwise hit
+            # int() below and blow up with a full traceback for what is really
+            # just an invalid target — fail quietly instead.
+            target_id = thread_id if thread_id else chat_id
+            if not str(target_id).isdigit():
+                logger.debug(
+                    "[%s] Refusing to send: non-numeric Discord %s id %r",
+                    self.name,
+                    "thread" if thread_id else "channel",
+                    target_id,
+                )
+                result = SendResult(
+                    success=False,
+                    error=f"Invalid Discord {'thread' if thread_id else 'channel'} id: {target_id!r} (must be numeric)",
+                )
+                await asyncio.to_thread(
+                    self._record_discord_response,
+                    reply_to=reply_to,
+                    result=result,
+                    content=content,
+                    final=final_delivery,
+                )
+                return result
+
             if thread_id:
                 # Fetch the thread directly — threads are addressed by their own ID.
                 channel = self._client.get_channel(int(thread_id))

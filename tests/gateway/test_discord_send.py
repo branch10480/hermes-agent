@@ -114,6 +114,65 @@ async def test_send_rejects_whitespace_and_records_failed_final_reply(
     assert "Dropped empty message to chat=555" in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_send_rejects_non_numeric_chat_id_without_traceback(caplog):
+    """A non-numeric session-key chat_id (e.g. the shutdown-notify fallback
+    parsing a session key like "base") must fail quietly instead of hitting
+    ``int(chat_id)`` and blowing up with a full traceback."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    get_channel = MagicMock()
+    adapter._client = SimpleNamespace(
+        get_channel=get_channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    with caplog.at_level("DEBUG"):
+        result = await adapter.send("base", "Gateway shutting down")
+
+    assert result.success is False
+    assert "base" in result.error
+    assert "must be numeric" in result.error
+    get_channel.assert_not_called()
+    assert "Failed to send Discord message" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_send_rejects_non_numeric_thread_id_without_traceback(caplog):
+    """Same guard applies to a non-numeric thread_id in metadata."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    get_channel = MagicMock()
+    adapter._client = SimpleNamespace(
+        get_channel=get_channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    with caplog.at_level("DEBUG"):
+        result = await adapter.send(
+            "555", "Gateway shutting down", metadata={"thread_id": "base"}
+        )
+
+    assert result.success is False
+    assert "base" in result.error
+    get_channel.assert_not_called()
+    assert "Failed to send Discord message" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_send_still_delivers_to_numeric_chat_id():
+    """Regression guard: the numeric-id happy path must be unaffected."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(id=42)))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send("555", "Gateway shutting down")
+
+    assert result.success is True
+    assert result.message_id == "42"
+
+
 def _voice_adapter(reference_obj, *, native_result=None, native_error=None):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     ref_msg = SimpleNamespace(id=99, to_reference=MagicMock(return_value=reference_obj))
