@@ -8606,6 +8606,7 @@ def _define_discord_view_classes() -> None:
                 return
 
             self.resolved = True
+            self.stop()
 
             # Unblock the waiting agent thread FIRST, then render the outcome.
             # A click that lands after the approval wait timed out (count == 0)
@@ -8668,6 +8669,8 @@ def _define_discord_view_classes() -> None:
 
         async def on_timeout(self):
             """Handle view timeout -- disable buttons and mark as expired."""
+            if self.resolved:
+                return
             self.resolved = True
             for child in self.children:
                 child.disabled = True
@@ -8736,6 +8739,7 @@ def _define_discord_view_classes() -> None:
                 return
 
             self.resolved = True
+            self.stop()
 
             embed = interaction.message.embeds[0] if interaction.message.embeds else None
             if embed:
@@ -8784,6 +8788,8 @@ def _define_discord_view_classes() -> None:
             await self._resolve(interaction, "cancel", discord.Color.greyple(), "Cancelled")
 
         async def on_timeout(self):
+            if self.resolved:
+                return
             self.resolved = True
             for child in self.children:
                 child.disabled = True
@@ -8841,6 +8847,7 @@ def _define_discord_view_classes() -> None:
                 return
 
             self.resolved = True
+            self.stop()
 
             # Update embed
             embed = interaction.message.embeds[0] if interaction.message.embeds else None
@@ -8880,6 +8887,8 @@ def _define_discord_view_classes() -> None:
             await self._respond(interaction, "n", discord.Color.red(), "No")
 
         async def on_timeout(self):
+            if self.resolved:
+                return
             self.resolved = True
             for child in self.children:
                 child.disabled = True
@@ -9096,6 +9105,7 @@ def _define_discord_view_classes() -> None:
                 return
 
             self.resolved = True
+            self.stop()
             self.clear_items()
             await interaction.response.edit_message(
                 embed=discord.Embed(
@@ -9198,6 +9208,7 @@ def _define_discord_view_classes() -> None:
 
         async def _on_cancel(self, interaction: discord.Interaction):
             self.resolved = True
+            self.stop()
             self.clear_items()
             await interaction.response.edit_message(
                 embed=discord.Embed(
@@ -9209,6 +9220,8 @@ def _define_discord_view_classes() -> None:
             )
 
         async def on_timeout(self):
+            if self.resolved:
+                return
             self.resolved = True
             self.clear_items()
             # Visually update the Discord message so it appears expired.
@@ -9433,6 +9446,7 @@ def _define_discord_view_classes() -> None:
                 return
 
             self.resolved = True
+            self.stop()
             for child in self.children:
                 child.disabled = True
 
@@ -9513,6 +9527,7 @@ def _define_discord_view_classes() -> None:
                 )
 
             self.resolved = True
+            self.stop()
             for child in self.children:
                 child.disabled = True
 
@@ -9536,6 +9551,8 @@ def _define_discord_view_classes() -> None:
                     pass
 
         async def on_timeout(self):
+            if self.resolved:
+                return
             self.resolved = True
             for child in self.children:
                 child.disabled = True

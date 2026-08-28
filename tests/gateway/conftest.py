@@ -226,10 +226,15 @@ def _ensure_discord_mock() -> None:
         def __init__(self, timeout=None):
             self.timeout = timeout
             self.children = []
+            self._stopped = False
         def add_item(self, item):
             self.children.append(item)
         def clear_items(self):
             self.children.clear()
+        def stop(self):
+            self._stopped = True
+        def is_finished(self):
+            return self._stopped
 
     class _FakeSelect:
         def __init__(self, *, placeholder=None, options=None, custom_id=None, **_):

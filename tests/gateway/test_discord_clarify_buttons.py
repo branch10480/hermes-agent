@@ -165,6 +165,88 @@ class TestClarifyChoiceResolve:
 
 
 # ===========================================================================
+# on_timeout must not clobber an already-resolved prompt
+# ===========================================================================
+#
+# Regression test for a real-world bug: the view's discord.py timeout timer
+# kept running after a choice/Other click resolved the prompt (no
+# ``self.stop()`` call), so ``on_timeout`` fired later and unconditionally
+# overwrote the "Answered by ..." / "Awaiting typed response from ..."
+# footer with "⏱ Prompt expired — no action taken", even though the prompt
+# had already been handled.
+
+class TestClarifyChoiceViewTimeoutAfterResolve:
+
+    def setup_method(self):
+        _clear_clarify_state()
+
+    @pytest.mark.asyncio
+    async def test_on_timeout_is_noop_after_choice_resolved(self):
+        from tools import clarify_gateway as cm
+        cm.register("cidT", "sk-T", "Pick", ["x", "y"])
+
+        view = ClarifyChoiceView(
+            choices=["x", "y"],
+            clarify_id="cidT",
+            allowed_user_ids={"42"},
+        )
+
+        interaction = _make_interaction(user_id="42")
+        await view._resolve_choice(interaction, index=0, choice="x")
+
+        # The click resolved the prompt and set the "Answered by" footer.
+        embed = interaction.message.embeds[0]
+        assert embed.set_footer.call_args.kwargs["text"] == "Answered by Tester: x"
+        assert view.resolved is True
+        assert view.is_finished() is True  # self.stop() was called
+
+        # A late-firing timeout must not overwrite that footer.
+        await view.on_timeout()
+        embed.set_footer.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_on_timeout_is_noop_after_other_resolved(self):
+        from tools import clarify_gateway as cm
+        cm.register("cidT2", "sk-T2", "Pick", ["x"])
+
+        view = ClarifyChoiceView(
+            choices=["x"],
+            clarify_id="cidT2",
+            allowed_user_ids={"42"},
+        )
+
+        interaction = _make_interaction(user_id="42")
+        await view._on_other(interaction)
+
+        embed = interaction.message.embeds[0]
+        assert embed.set_footer.call_args.kwargs["text"] == (
+            "Awaiting typed response from Tester…"
+        )
+        assert view.resolved is True
+        assert view.is_finished() is True
+
+        await view.on_timeout()
+        embed.set_footer.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_on_timeout_still_fires_when_never_resolved(self):
+        view = ClarifyChoiceView(
+            choices=["x"],
+            clarify_id="cidT3",
+            allowed_user_ids={"42"},
+        )
+        view._message = _make_interaction(user_id="42").message
+
+        await view.on_timeout()
+
+        embed = view._message.embeds[0]
+        embed.set_footer.assert_called_once_with(
+            text="⏱ Prompt expired — no action taken"
+        )
+        assert view.resolved is True
+
+
+# ===========================================================================
 # "Other" button → mark_awaiting_text
 # ===========================================================================
 
