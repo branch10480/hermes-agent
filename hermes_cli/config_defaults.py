@@ -1189,6 +1189,13 @@ DEFAULT_CONFIG = {
             "idle_gate": True,
             "idle_gate_poll_seconds": 5,
             "idle_gate_max_wait_seconds": 300,
+            # Iteration budget for the review fork (clamped to 1..100). On a
+            # slow local backend each iteration can cost ~a minute of
+            # exclusive model time, so lowering this cuts losses earlier when
+            # a review isn't converging. The fork also arms a strict
+            # tool-loop breaker (hard stop after a few consecutive failures
+            # of the same tool), so most stuck reviews end well before this.
+            "max_iterations": 16,
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },

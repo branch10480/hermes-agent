@@ -335,6 +335,26 @@ identical and skill capture near-identical to the main-model review.
 Leave it at `auto` (or set it to your main model) and nothing changes — the
 review keeps running on the main model with the full warm-cache replay.
 
+### Bounding a stuck review (`max_iterations` + the built-in breaker)
+
+The fork's loop is bounded by `auxiliary.background_review.max_iterations`
+(default 16, clamped to 1–100). On a slow local backend each iteration can
+cost about a minute of exclusive model time, so lowering it cuts losses
+earlier when a review isn't converging:
+
+```yaml
+auxiliary:
+  background_review:
+    max_iterations: 8
+```
+
+Independently of the budget, every review fork arms a strict tool-loop
+breaker: if the same tool fails a few times in a row without a success in
+between (or the exact same call keeps failing), the review hard-stops with
+one final answer instead of burning the rest of the budget. With
+`display.background_review_run_notifications` enabled, such runs surface as
+`🧠 Self-improvement review aborted — repeated tool failures`.
+
 ## Controlling skill writes (`skills.write_approval`)
 
 Skills use the same on/off gate, but the review UX differs because a

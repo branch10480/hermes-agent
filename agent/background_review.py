@@ -113,6 +113,67 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
         return parent
 
 
+_REVIEW_MAX_ITERATIONS_DEFAULT = 16
+# Fixed strict thresholds for the review fork's tool-loop breaker. Derived
+# from a real failed run: 13/16 iterations burned on the same malformed
+# skill_manage call at ~60s/call on a local model. A success resets the
+# counters, so these only trip on genuine no-progress loops.
+_REVIEW_SAME_TOOL_FAILURE_HALT_AFTER = 4
+_REVIEW_EXACT_FAILURE_BLOCK_AFTER = 3
+
+
+def _review_max_iterations() -> int:
+    """Iteration budget for the review fork.
+
+    ``auxiliary.background_review.max_iterations`` (default 16). On a slow
+    local model each iteration can cost ~a minute of exclusive backend time,
+    so profiles may lower this to cut losses earlier; clamped to [1, 100].
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
+        aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
+        task = aux.get("background_review", {}) if isinstance(aux.get("background_review"), dict) else {}
+        raw = int(task.get("max_iterations", _REVIEW_MAX_ITERATIONS_DEFAULT))
+        return max(1, min(raw, 100))
+    except Exception:
+        return _REVIEW_MAX_ITERATIONS_DEFAULT
+
+
+def _tighten_review_guardrails(review_agent: Any) -> None:
+    """Arm a strict tool-loop breaker on the review fork.
+
+    The fork is unattended: nobody is watching to steer it out of a loop, and
+    every wasted iteration is real model cost (on local backends, exclusive
+    GPU time). The main-session guardrail defaults are warn-only with a halt
+    threshold of 8 — tuned for interactive sessions where the user can
+    intervene. Here we force hard stops on, and lower the consecutive
+    same-tool-failure halt so a fork stuck re-sending a malformed write gives
+    up after a few attempts instead of burning the whole iteration budget.
+    User-configured thresholds stricter than ours are kept (min()).
+    """
+    try:
+        from dataclasses import replace as _dc_replace
+        from agent.tool_guardrails import ToolCallGuardrailController
+        base = review_agent._tool_guardrails.config
+        review_agent._tool_guardrails = ToolCallGuardrailController(
+            _dc_replace(
+                base,
+                hard_stop_enabled=True,
+                same_tool_failure_halt_after=min(
+                    base.same_tool_failure_halt_after,
+                    _REVIEW_SAME_TOOL_FAILURE_HALT_AFTER,
+                ),
+                exact_failure_block_after=min(
+                    base.exact_failure_block_after,
+                    _REVIEW_EXACT_FAILURE_BLOCK_AFTER,
+                ),
+            )
+        )
+    except Exception:
+        logger.debug("review guardrail tightening failed", exc_info=True)
+
+
 def _run_notifications_enabled(agent: Any) -> bool:
     """Whether review lifecycle notices (started/finished/failed) are on.
 
@@ -801,6 +862,7 @@ def _run_review_body(
 
     review_agent = None
     review_messages: List[Dict] = []
+    guardrail_halted = False
 
     def _unregister_review_agent(agent_ref) -> None:
         """Idempotent: clears the review fork from both tracking slots.
@@ -947,7 +1009,7 @@ def _run_review_body(
                         _fork_kwargs[_pref_attr] = _pref_val
             review_agent = AIAgent(
                 model=_rt.get("model") or agent.model,
-                max_iterations=16,
+                max_iterations=_review_max_iterations(),
                 quiet_mode=True,
                 platform=agent.platform,
                 provider=_rt.get("provider") or agent.provider,
@@ -1046,6 +1108,7 @@ def _run_review_body(
             # detail. Both compression triggers in conversation_loop.py gate on
             # agent.compression_enabled, so this short-circuits both paths.
             review_agent.compression_enabled = False
+            _tighten_review_guardrails(review_agent)
 
             # Register this fork on the PARENT's _active_children (the same
             # list interrupt() fans out to for subagent delegation) and
@@ -1178,6 +1241,10 @@ def _run_review_body(
             # clean per-session state, but the user-visible self-improvement
             # summary still needs the completed review agent's tool results.
             review_messages = list(getattr(review_agent, "_session_messages", []))
+            guardrail_halted = (
+                getattr(review_agent, "_tool_guardrail_halt_decision", None)
+                is not None
+            )
 
             # Tear down memory providers while stdout is still
             # redirected so background thread teardown (Honcho flush,
@@ -1244,6 +1311,12 @@ def _run_review_body(
                 _notify_review_event(
                     agent,
                     f"🧠 Self-improvement review cancelled by a live turn ({elapsed})",
+                )
+            elif guardrail_halted:
+                _notify_review_event(
+                    agent,
+                    "🧠 Self-improvement review aborted — repeated tool "
+                    f"failures, nothing saved ({elapsed})",
                 )
             else:
                 _notify_review_event(
