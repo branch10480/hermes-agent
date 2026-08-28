@@ -15,10 +15,10 @@ Three tiers are joined with ``\\n\\n``:
   alibaba model-name workaround, environment hints, coding guidance,
   platform hints.
 * ``context``  — caller-supplied ``system_message`` plus context files
-  (AGENTS.md / .cursorrules / etc.) discovered under ``TERMINAL_CWD``,
-  plus the session's coding-workspace snapshot.
+  (AGENTS.md / .cursorrules / etc.) discovered under ``TERMINAL_CWD``.
 * ``volatile`` — skills index, memory snapshot, USER.md profile, external
-  memory provider block, timestamp/session/model/provider line.
+  memory provider block, timestamp/session/model/provider line, and — last
+  of all — the session's coding-workspace snapshot.
 
 Pure helpers that read the agent's state.  AIAgent keeps thin forwarders.
 """
@@ -154,12 +154,23 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     Returns a dict with three keys:
       * ``stable``   — the cross-session-stable prefix, through the coding
-        operating brief when a workspace snapshot follows.
-      * ``context``  — the workspace snapshot followed by the remaining
-        session-stable guidance, context files, and caller-supplied
-        system_message.
+        operating brief when a workspace snapshot exists.
+      * ``context``  — the remaining session-stable guidance, the
+        caller-supplied system_message, and context files.
       * ``volatile`` — skills index, memory snapshot, user profile,
-        external memory provider block, timestamp line.
+        external memory provider block, timestamp line, and the
+        coding-workspace snapshot last.
+
+    The workspace snapshot is the single most volatile block in the whole
+    prompt: it carries the branch, the dirty-file counts, and the last
+    three commit subjects, so it changes on every commit and on every
+    edit to the working tree. Rendering it at the very end keeps every
+    byte of the scaffold in front of it reusable on an implicit
+    longest-prefix backend (llama.cpp / mlx-serve), where a divergence
+    forces a re-prefill of everything from that point on. Backends with
+    explicit ``cache_control`` breakpoints are unaffected: the stable
+    tier is what they cache, and it does not contain the snapshot either
+    way.
 
     Joined into a single string by :func:`build_system_prompt` and
     cached on ``agent._cached_system_prompt`` for the lifetime of the
@@ -349,9 +360,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # Coding posture (base Hermes, any interactive coding surface in a code
     # workspace — see agent/coding_context.py). Keep the operating brief in
-    # the cross-session-stable prefix, while placing the live git/workspace
-    # snapshot behind its own cache boundary. The post-snapshot blocks must
-    # stay in their historical position after the workspace snapshot.
+    # the cross-session-stable prefix and hold the live git/workspace snapshot
+    # aside: it is the most volatile block in the prompt, so it is rendered
+    # last of all, at the tail of the volatile tier.
     coding_workspace_parts: List[str] = []
     coding_trailing_parts: List[str] = []
     if agent.valid_tool_names:
@@ -368,9 +379,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             # Coding-context probing must never block prompt build.
             pass
 
-    # Guidance assembled after the coding posture historically followed the
-    # workspace snapshot. With no snapshot, the coding tail instead remains
-    # directly after the coding prefix in the cacheable prefix.
+    # Operator instructions and the blocks assembled after them ride the
+    # context tier whenever the coding posture produced a snapshot, and merge
+    # into the cacheable stable prefix when it did not. Their position
+    # relative to each other, and to everything else in the prompt, is
+    # identical either way — only the tier boundary (and hence the explicit
+    # cache_control breakpoint) moves.
     if coding_workspace_parts:
         post_workspace_parts: List[str] = []
     else:
@@ -476,7 +490,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     context_parts: List[str] = []
 
     if coding_workspace_parts:
-        context_parts.extend(coding_workspace_parts)
         context_parts.extend(coding_trailing_parts)
         context_parts.extend(post_workspace_parts)
 
@@ -559,6 +572,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nPlatform: {agent.platform}"
     volatile_parts.append(timestamp_line)
 
+    # The coding workspace snapshot goes last, after everything else in the
+    # prompt. Branch, dirty counts and the recent-commit list change on every
+    # commit and on every working-tree edit, which makes this the block most
+    # likely to differ between two sessions in the same repo. On an implicit
+    # longest-prefix backend the divergence point is what costs a re-prefill,
+    # so putting the snapshot at the very tail leaves the entire scaffold in
+    # front of it reusable. The brief in the stable tier already tells the
+    # model this block is a session-start snapshot to re-check with `git`, and
+    # it still says "below" — the snapshot is further down the prompt, not
+    # gone.
+    volatile_parts.extend(coding_workspace_parts)
+
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
         "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),
@@ -576,12 +601,13 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
 
     Layers are ordered cache-friendly: stable identity/guidance first,
     then session-stable context files, then per-call volatile content
-    (skills index, memory, USER profile, timestamp). For explicit
-    cache_control backends the whole string is one cached block. For
-    implicit longest-prefix backends the order is what matters: the
-    content most likely to change is rendered last, so when the prompt is
-    rebuilt (on compaction/restore) the unchanged stable scaffold ahead of
-    the change stays in the reused prefix.
+    (skills index, memory, USER profile, timestamp, and the workspace
+    snapshot last of all). For explicit cache_control backends the stable
+    tier is the cached block and the rest ships uncached. For implicit
+    longest-prefix backends the order is what matters: the content most
+    likely to change is rendered last, so a new session in the same repo
+    — or a rebuild on compaction/restore — keeps the unchanged scaffold
+    ahead of the change inside the reused prefix.
     """
     parts = build_system_prompt_parts(agent, system_message=system_message)
     joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)

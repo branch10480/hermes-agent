@@ -1232,6 +1232,14 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
         context (AGENTS.md / CLAUDE.md / .cursorrules) is embedded in the
         middle context tier, so a last-match scan lets project prose shadow
         any field emitted EARLIER — see ``host_info_value``.
+
+        The coding workspace snapshot is the one block rendered AFTER these
+        lines (``build_system_prompt_parts`` puts it last for prefix-cache
+        reuse). That stays safe only because every snapshot line is prefixed
+        (``Workspace (`` / ``- `` / four-space indent for commit subjects),
+        so no ``Model:`` / ``Provider:`` / ``Platform:`` line can appear
+        there — pinned by
+        ``test_workspace_snapshot_lines_never_shadow_runtime_identity``.
         """
         prefix = f"{label}:"
         value = ""

@@ -277,9 +277,9 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     tools_json = json.dumps(tools, ensure_ascii=False)
 
     sections: List[Tuple[str, int, int]] = [
-        ("stable (identity/guidance/skills)", len(stable), _bytes(stable)),
+        ("stable (identity/guidance)", len(stable), _bytes(stable)),
         ("context (AGENTS.md/cwd files)", len(context), _bytes(context)),
-        ("volatile (memory/profile/timestamp)", len(volatile), _bytes(volatile)),
+        ("volatile (skills/memory/profile/timestamp/workspace)", len(volatile), _bytes(volatile)),
     ]
 
     return {

@@ -13,8 +13,10 @@ is *data* — it declares the toolset to collapse to, the operating brief to
 inject, and hints for other domains (model routing, memory, subagents). Every
 domain reads the same resolved object instead of probing git/config itself:
 
-  * **System prompt** — ``RuntimeMode.system_blocks()`` → the operating brief +
-    a live git/workspace snapshot (``agent/system_prompt.py``).
+  * **System prompt** — ``RuntimeMode.system_prompt_parts()`` → the operating
+    brief, a live git/workspace snapshot, and operator instructions, placed by
+    volatility in ``agent/system_prompt.py`` (``system_blocks()`` is the flat
+    compatibility view).
   * **Toolset** — ``RuntimeMode.toolset_selection()`` → the ``coding`` toolset
     plus the user's enabled MCP servers (``cli.py`` / ``tui_gateway``). Only
     under the opt-in ``focus`` mode: the default posture is prompt-only and
@@ -30,11 +32,13 @@ domain reads the same resolved object instead of probing git/config itself:
 Cache safety
 ------------
 The mode is resolved **once** and is immutable. The workspace snapshot is built
-once at prompt-build time and baked into the *stable* system-prompt tier — never
-re-probed per turn (that would shatter the prompt cache). Branch and dirty state
-drift mid-session, so the brief tells the model to re-check with ``git`` before
-acting on the snapshot. A ``/coding`` flip therefore only takes effect next
-session (deferred), the same contract as ``/skills install`` vs ``--now``.
+once at prompt-build time and never re-probed per turn (that would shatter the
+prompt cache). Because it is the block most likely to differ between two
+sessions in the same repo, prompt assembly renders it at the very end of the
+prompt — see ``RuntimeMode.system_prompt_parts``. Branch and dirty state drift
+mid-session, so the brief tells the model to re-check with ``git`` before acting
+on the snapshot. A ``/coding`` flip therefore only takes effect next session
+(deferred), the same contract as ``/skills install`` vs ``--now``.
 
 Activation (config ``agent.coding_context``):
 
@@ -527,10 +531,14 @@ class RuntimeMode:
         to it (one cached string, not a separate block) so the model is steered
         toward the `patch` mode it handles best — see ``_edit_format_line``.
 
-        The three lists preserve the historical flat prompt order: the brief,
-        the live workspace snapshot, then configured operator instructions.
-        Prompt assembly can therefore put a cache boundary before the snapshot
-        without changing the persisted system-prompt bytes.
+        The lists are handed out separately so prompt assembly can place each
+        one by how volatile it is: the brief and the operator instructions are
+        session-stable and stay near the front, while the live workspace
+        snapshot is rendered last of all — it changes on every commit and
+        every working-tree edit, and on an implicit longest-prefix backend
+        (llama.cpp / mlx-serve) everything after the first divergent byte has
+        to be re-prefilled. ``system_blocks`` still returns the flat brief →
+        snapshot → instructions order for callers outside prompt assembly.
         """
         if not self.is_coding:
             return [], [], []
@@ -553,10 +561,12 @@ class RuntimeMode:
         return prefix, workspace_parts, trailing
 
     def system_blocks(self) -> list[str]:
-        """Return posture blocks in their historical display order.
+        """Return every posture block as one flat brief → snapshot → tail list.
 
-        ``system_prompt_parts`` is the cache-aware API. This compatibility
-        helper retains the public flat list for callers outside prompt assembly.
+        ``system_prompt_parts`` is the cache-aware API and the one prompt
+        assembly uses; it scatters these blocks across the prompt by
+        volatility, so this flat order is no longer the order they appear in.
+        Retained for callers outside prompt assembly that just want the set.
         """
         prefix, workspace, trailing = self.system_prompt_parts()
         return [*prefix, *workspace, *trailing]

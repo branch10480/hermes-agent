@@ -1,5 +1,6 @@
 """Tests for agent/system_prompt.py — context-file cwd wiring."""
 
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -98,7 +99,11 @@ class TestCodingContextBlock:
         agent = _make_agent(valid_tool_names=["read_file"], platform="cli")
         parts = _prompt_parts(agent)
         assert "coding agent" in parts["stable"]
-        assert "Workspace" in parts["context"]
+        # The brief stays in the stable band; the live snapshot is the most
+        # volatile block in the prompt and renders at the tail of `volatile`.
+        assert "Workspace (snapshot" in parts["volatile"]
+        assert "Workspace (snapshot" not in parts["context"]
+        assert "Workspace (snapshot" not in parts["stable"]
 
     def test_absent_when_off(self, monkeypatch, tmp_path):
         _init_code_repo(tmp_path)
@@ -130,59 +135,137 @@ def test_build_system_prompt_records_stable_prefix():
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
 
 
-def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
-    """The cache split must not reorder the stored coding prompt."""
+def _build_coding_prompt(agent, builder, workspace, system_message=None):
+    """Build a coding-posture prompt from known sentinels.
+
+    ``workspace`` is the workspace-snapshot block list ``coding_system_prompt_parts``
+    yields — ``["WORKSPACE"]`` for a repo, ``[]`` outside one.
+    """
+    with ExitStack() as stack:
+        for patcher in (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value="CONTEXT_FILES"),
+            patch(
+                "agent.coding_context.coding_system_prompt_parts",
+                return_value=(
+                    ["CODING_STABLE"],
+                    list(workspace),
+                    ["Operator instructions (from config):\nOPERATOR"],
+                ),
+            ),
+            patch("agent.file_safety._resolve_active_profile_name", return_value="default"),
+            patch("hermes_time.now", return_value=datetime(2026, 1, 2)),
+        ):
+            stack.enter_context(patcher)
+        return builder(agent, system_message=system_message)
+
+
+def _coding_agent(monkeypatch):
+    """A coding-posture agent whose stable-tier blocks are known sentinels."""
     import agent.system_prompt as system_prompt
 
-    agent = _make_agent(
-        valid_tool_names=["read_file"],
-        _parallel_tool_call_guidance=False,
-    )
     monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "IDENTITY")
     monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "HELP")
     monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
     monkeypatch.setattr(system_prompt, "get_hermes_home", lambda: Path("/hermes"))
-
-    expected_profile = (
-        "Active Hermes profile: default. Other profiles (if any) live "
-        "under /hermes/profiles/<name>/. Each profile has its own skills/, "
-        "plugins/, cron/, and memories/ that affect a different session than "
-        "this one. Do not modify another profile's skills/plugins/cron/memories "
-        "unless the user explicitly directs you to."
+    return _make_agent(
+        valid_tool_names=["read_file"],
+        _parallel_tool_call_guidance=False,
     )
+
+
+_EXPECTED_PROFILE_BLOCK = (
+    "Active Hermes profile: default. Other profiles (if any) live "
+    "under /hermes/profiles/<name>/. Each profile has its own skills/, "
+    "plugins/, cron/, and memories/ that affect a different session than "
+    "this one. Do not modify another profile's skills/plugins/cron/memories "
+    "unless the user explicitly directs you to."
+)
+
+
+def test_coding_prompt_renders_workspace_snapshot_last(monkeypatch):
+    """The workspace snapshot is the prompt's most volatile block, so it is
+    rendered after everything else — including the timestamp tail."""
+    agent = _coding_agent(monkeypatch)
+
     expected = "\n\n".join((
         "IDENTITY",
         "HELP",
         "STEER",
         "CODING_STABLE",
-        "WORKSPACE",
         "Operator instructions (from config):\nOPERATOR",
-        expected_profile,
+        _EXPECTED_PROFILE_BLOCK,
         "SYSTEM_MESSAGE",
         "CONTEXT_FILES",
         "Conversation started: Friday, January 02, 2026",
+        "WORKSPACE",
     ))
 
-    with (
-        patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
-        patch("run_agent.build_environment_hints", return_value=""),
-        patch("run_agent.build_context_files_prompt", return_value="CONTEXT_FILES"),
-        patch(
-            "agent.coding_context.coding_system_prompt_parts",
-            return_value=(
-                ["CODING_STABLE"],
-                ["WORKSPACE"],
-                ["Operator instructions (from config):\nOPERATOR"],
-            ),
-        ),
-        patch("agent.file_safety._resolve_active_profile_name", return_value="default"),
-        patch("hermes_time.now", return_value=datetime(2026, 1, 2)),
-    ):
-        prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
+    prompt = _build_coding_prompt(
+        agent, build_system_prompt, ["WORKSPACE"], system_message="SYSTEM_MESSAGE"
+    )
 
     assert prompt == expected
+    # The static prefix (the explicit cache_control block) still ends at the
+    # coding brief — the trailing/profile blocks keep riding the context tier
+    # whenever a snapshot exists.
     assert agent._cached_system_prompt_static == "\n\n".join(expected.split("\n\n")[:4])
+
+
+def test_workspace_snapshot_tails_the_volatile_band(monkeypatch):
+    """Cache contract for implicit longest-prefix backends (mlx-serve,
+    llama.cpp): the snapshot must be the LAST thing in the prompt, so a
+    changed branch/dirty-count/commit only re-prefills its own bytes instead
+    of the context files, skills index and memory tail behind it."""
+    agent = _coding_agent(monkeypatch)
+
+    parts = _build_coding_prompt(agent, build_system_prompt_parts, ["WORKSPACE"])
+
+    assert parts["volatile"].endswith("WORKSPACE")
+    assert parts["volatile"].index("Conversation started:") < parts["volatile"].index("WORKSPACE")
+    assert "WORKSPACE" not in parts["context"]
+    assert "WORKSPACE" not in parts["stable"]
+
+    # Dropping the snapshot never removes anything from the stable band: the
+    # identity/brief prefix the cache_control breakpoint covers is byte-identical
+    # either way (without a snapshot the trailing blocks merely merge in behind it).
+    without = _build_coding_prompt(agent, build_system_prompt_parts, [])
+    assert "WORKSPACE" not in without["volatile"]
+    assert without["stable"].startswith(parts["stable"])
+    # …and without a snapshot the trailing blocks must actually land in the
+    # stable band rather than fall through to the context tier.
+    assert "OPERATOR" in without["stable"]
+    assert _EXPECTED_PROFILE_BLOCK in without["stable"]
+
+
+def test_workspace_snapshot_lines_never_shadow_runtime_identity(tmp_path):
+    """The snapshot renders AFTER the ``Model:`` / ``Provider:`` /
+    ``Platform:`` lines, and ``_stored_prompt_matches_runtime.line_value``
+    takes the LAST matching line. Every snapshot line must therefore carry a
+    prefix that cannot collide with those labels — even when a commit
+    subject or branch name tries to — or restore would reject the stored
+    prompt on every turn and rebuild the prefix cache each message."""
+    import subprocess
+
+    from agent.coding_context import build_coding_workspace_block
+
+    git = ["git", "-C", str(tmp_path), "-c", "user.name=t", "-c", "user.email=t@example.com"]
+    subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
+    (tmp_path / "README.md").write_text("x\n")
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "Model: shadow attempt"], check=True)
+    (tmp_path / "dirty.txt").write_text("Platform: shadow attempt\n")
+
+    snapshot = build_coding_workspace_block(tmp_path)
+
+    lines = snapshot.splitlines()
+    assert lines[0].startswith("Workspace (snapshot")
+    assert any("Model: shadow attempt" in line for line in lines)
+    for line in lines[1:]:
+        assert line.startswith(("- ", "    ")), line
+    assert not any(line.startswith(("Model:", "Provider:", "Platform:")) for line in lines)
 
 
 class TestTelegramRichMessagesHint:

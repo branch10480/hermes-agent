@@ -28,16 +28,32 @@ Primary files:
 
 The cached system prompt is assembled as three ordered tiers (see `agent/system_prompt.py`):
 
-1. **stable** — identity (`SOUL.md` or fallback), tool/model guidance, skills prompt, environment hints, platform hints
-2. **context** — caller-supplied `system_message` plus project context files (`.hermes.md` / `AGENTS.md` / `CLAUDE.md` / `.cursorrules`)
-3. **volatile** — built-in memory snapshot (`MEMORY.md`), user profile snapshot (`USER.md`), external memory-provider block, timestamp/session/model/provider line
+1. **stable** — identity (`SOUL.md` or fallback), tool/model guidance, environment hints, the coding operating brief; outside a code workspace (no snapshot) the operator instructions, environment probe, profile hint and platform hint merge in here too
+2. **context** — when a workspace snapshot exists: the operator instructions, environment probe, profile hint and platform hint; then the caller-supplied `system_message` plus project context files (`.hermes.md` / `AGENTS.md` / `CLAUDE.md` / `.cursorrules`)
+3. **volatile** — skills index, built-in memory snapshot (`MEMORY.md`), user profile snapshot (`USER.md`), external memory-provider block, timestamp/session/model/provider line, and last of all the coding workspace snapshot
 
 The final system prompt is then joined as: `stable` → `context` → `volatile`.
 
 This ordering matters for precedence discussions:
-- skills are part of the **stable** tier
-- memory/profile snapshots are part of the **volatile** tier
-- both are still in the cached system prompt (they are not injected as ad-hoc mid-turn overlays)
+- the skills index and the memory/profile snapshots are both part of the **volatile** tier
+- all of them are still in the cached system prompt (they are not injected as ad-hoc mid-turn overlays)
+
+### Why the volatile tier is ordered the way it is
+
+The tiers run most-stable-first, and the volatile tier repeats that idea
+internally. Backends with explicit `cache_control` breakpoints cache the stable
+tier as one block, so order *within* the later tiers does not concern them.
+Backends that cache implicitly by longest common prefix (llama.cpp, mlx-serve)
+re-prefill everything after the first byte that differs, so what matters there
+is how deep into the prompt the first change lands.
+
+The **coding workspace snapshot** (branch, dirty-file counts, last three commit
+subjects) is therefore rendered last of all. It is the block most likely to
+differ between two sessions in the same repo — it changes on every commit and
+every edit to the working tree — so keeping it at the tail leaves the entire
+scaffold in front of it inside the reused prefix. Nothing depends on it sitting
+next to the coding brief: the brief in the stable tier already tells the model
+the Workspace block is a session-start snapshot to re-check with `git`.
 
 When `skip_context_files` is set (e.g., subagent delegation), SOUL.md is not loaded and the hardcoded `DEFAULT_AGENT_IDENTITY` is used instead.
 
