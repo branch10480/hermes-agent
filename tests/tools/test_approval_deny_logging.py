@@ -415,6 +415,41 @@ class TestBreakerIsUnaffected:
         assert mod.APPROVAL_BREAKER_METADATA_KEY not in second
         assert mod._denial_tally[mod._denial_tally_key(SESSION_KEY)] == 2
 
+    def test_lockout_refusals_are_logged_as_an_unassessed_stage(
+            self, deny_env, monkeypatch, caplog):
+        """A refusal nobody assessed must be distinguishable in the log.
+
+        ``origin`` deliberately stays ``guardian_denied`` -- the guardian's
+        standing verdict for the turn is what refuses it, and changing the
+        origin vocabulary would break consumers counting policy denials.
+        """
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.setattr(mod, "_get_approval_mode", lambda: "smart")
+        monkeypatch.setattr(mod, "_smart_approve", lambda *_: "deny")
+        monkeypatch.setattr(mod, "_smart_deny_is_final", lambda: True)
+        monkeypatch.setattr(mod, "_get_denial_breaker_threshold", lambda: 2)
+        monkeypatch.setattr(
+            mod, "_get_denial_breaker_lockout_attempts", lambda: 3)
+
+        mod.check_all_command_guards("rm -rf /tmp/a", "local")
+        mod.check_all_command_guards("rm -rf /tmp/b", "local")
+        locked_out = mod.check_all_command_guards("rm -rf /tmp/c", "local")
+
+        assert locked_out["denial_lockout"] is True
+        stages = [_fields(line)["stage"] for line in _deny_lines(caplog)]
+        assert stages == ["assessed", "assessed", "lockout"]
+        origins = {_fields(line)["origin"] for line in _deny_lines(caplog)}
+        assert origins == {"guardian_denied"}
+
+    def test_every_deny_line_carries_a_stage(self, deny_env, caplog):
+        """The field is constant-shape, not conditional -- parsers depend on it."""
+        result = mod.check_all_command_guards("rm -rf /", "local")  # hardline
+
+        assert result["approved"] is False
+        lines = _deny_lines(caplog)
+        assert len(lines) == 1
+        assert _fields(lines[0])["stage"] == "assessed"
+
     def test_observation_counter_is_bounded(self, deny_env, monkeypatch):
         monkeypatch.setattr(mod, "_DENY_EVENT_TALLY_MAX_SESSIONS", 4)
         for i in range(20):

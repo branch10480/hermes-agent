@@ -2739,22 +2739,58 @@ def _smart_deny_is_final() -> bool:
 # Nothing stops the model from retrying variants of a smart-denied command —
 # each retry burns another guardian LLM call and agent iteration. After
 # ``approvals.denial_breaker_threshold`` consecutive guardian DENY verdicts
-# in one user turn (default 3; 0 disables), the deny message returned to the
-# model escalates to a hard-stop instruction. Any approval resets the tally.
-# The blocked tool result also carries a small diagnostic marker for model and
-# gateway observability. Structural turn control uses a bounded in-process
-# side-channel keyed by session, turn, and outer tool-call ID; transformed or
-# arbitrary plugin/MCP output is never parsed as control data. No
-# message-history surgery, toolset swap, or system-prompt mutation is needed,
-# so prompt caching stays intact. Inspired by ChatGPT Work's auto-review
-# circuit breaker (3 consecutive denials).
+# in one user turn (default 3; 0 disables), the breaker fires in two stages.
+#
+#   1. LOCKOUT. The turn keeps running, but every further dangerous-operation
+#      candidate is refused immediately without asking the guardian, so no
+#      more LLM calls are burned on variants that will be refused anyway. The
+#      model is told to stop retrying and continue with safe tools. This is
+#      the common case: the refused command was usually benign work the
+#      reviewer could not prove safe, and ending the whole turn over it forced
+#      the user to type "continue" for every research task.
+#   2. HARD STOP. If the model keeps reaching for dangerous operations anyway
+#      — ``approvals.denial_breaker_lockout_attempts`` more times (default 3)
+#      — the turn ends, which is what stops an empty retry loop from burning
+#      the whole iteration budget.
+#
+# Any approval resets the tally. The blocked tool result also carries a small
+# diagnostic marker for model and gateway observability. Structural turn
+# control (hard stop only) uses a bounded in-process side-channel keyed by
+# session, turn, and outer tool-call ID; transformed or arbitrary plugin/MCP
+# output is never parsed as control data. No message-history surgery, toolset
+# swap, or system-prompt mutation is needed, so prompt caching stays intact.
+# Inspired by ChatGPT Work's auto-review circuit breaker (3 consecutive
+# denials).
 APPROVAL_BREAKER_METADATA_KEY = "approval_breaker"
-# v2 added the redacted denial detail (reason_code / effect_class /
-# safe_alternative) so the conversation loop can explain *what class* of
-# operation was refused and what to do instead, without ever seeing the
-# command. v1 carried only the tool name, count, and threshold.
-_APPROVAL_BREAKER_METADATA_VERSION = 2
+# v3 added ``mode`` (lockout | hard_stop) and ``hard_stop_threshold`` so a
+# reader can tell the turn-continuing stage from the turn-ending one. v2 added
+# the redacted denial detail (reason_code / effect_class / safe_alternative) so
+# the conversation loop can explain *what class* of operation was refused and
+# what to do instead, without ever seeing the command. v1 carried only the tool
+# name, count, and threshold.
+_APPROVAL_BREAKER_METADATA_VERSION = 3
 _APPROVAL_BREAKER_METADATA_TYPE = "consecutive_smart_denials"
+_APPROVAL_BREAKER_MODE_LOCKOUT = "lockout"
+_APPROVAL_BREAKER_MODE_HARD_STOP = "hard_stop"
+_DEFAULT_DENIAL_BREAKER_LOCKOUT_ATTEMPTS = 3
+# The one instruction every lockout message carries. It names concrete tools
+# that stay available, because "stop" on its own is what produced the retry
+# loop: the model had nothing else to reach for. The saved-script route is
+# real — a plain ``python3 /path/script.py`` matches no dangerous pattern and
+# no tirith rule, so it is approved before any guardian call.
+#
+# The closing sentence is not optional politeness. Naming a route that still
+# works is exactly the shape of hint a model will re-use to smuggle the
+# refused operation through, so the same breath has to say that a refusal
+# attaches to the EFFECT, not to the wording that expressed it.
+_DENIAL_LOCKOUT_GUIDANCE = (
+    "Dangerous-operation retries are locked out for the rest of this turn. "
+    "Do not retry blocked commands or variants. Continue with safe tools "
+    "(the native read / search / write tools, or a script saved with "
+    "write_file and run as a single file) or report your findings. Never use "
+    "these to reproduce a refused operation — a refusal applies to the "
+    "effect, not the phrasing."
+)
 _denial_tally: dict[tuple[str, str], int] = {}
 # Plain dict with a small cap so an army of short-lived session/turn keys
 # cannot grow it without bound; oldest (least recently denied) entries are
@@ -2763,6 +2799,13 @@ _denial_tally: dict[tuple[str, str], int] = {}
 _DENIAL_TALLY_MAX_SESSIONS = 256
 _approval_breaker_trips: dict[tuple[str, str, str], dict] = {}
 _APPROVAL_BREAKER_MAX_TRIPS = 256
+# Which breaker stages have already been logged for a session/turn. The
+# escalation WARNING is worth one line per *transition*, not one per refusal:
+# once locked out, every further candidate re-enters the same stage, and
+# repeating the line inflates any alerting built on warning volume by the
+# number of retries — the very thing the lockout exists to absorb quietly.
+_denial_breaker_logged_stages: dict[tuple[str, str], set[str]] = {}
+_DENIAL_BREAKER_LOGGED_STAGES_MAX = 256
 
 
 def _get_denial_breaker_threshold() -> int:
@@ -2775,6 +2818,23 @@ def _get_denial_breaker_threshold() -> int:
         return int(_get_approval_config().get("denial_breaker_threshold", 3))
     except (ValueError, TypeError):
         return 3
+
+
+def _get_denial_breaker_lockout_attempts() -> int:
+    """Extra dangerous-operation attempts tolerated after the lockout begins.
+
+    Read from ``approvals.denial_breaker_lockout_attempts`` (default 3). 0
+    restores the pre-lockout behaviour: reaching the denial threshold ends the
+    turn immediately. Negative values are clamped to 0.
+    """
+    try:
+        attempts = int(_get_approval_config().get(
+            "denial_breaker_lockout_attempts",
+            _DEFAULT_DENIAL_BREAKER_LOCKOUT_ATTEMPTS,
+        ))
+    except (ValueError, TypeError):
+        return _DEFAULT_DENIAL_BREAKER_LOCKOUT_ATTEMPTS
+    return max(0, attempts)
 
 
 def _denial_tally_key(
@@ -2815,7 +2875,30 @@ def _reset_denials(session_key: str) -> None:
     or otherwise mutate that sibling's independent sequence.
     """
     with _lock:
-        _denial_tally.pop(_denial_tally_key(session_key), None)
+        key = _denial_tally_key(session_key)
+        _denial_tally.pop(key, None)
+        # The sequence starts over, so a later re-trip is a new transition and
+        # must be logged again.
+        _denial_breaker_logged_stages.pop(key, None)
+
+
+def _claim_denial_breaker_stage_log(session_key: str, mode: str) -> bool:
+    """True the first time this turn reaches *mode* — a log-once gate.
+
+    Check and set happen under one lock hold so two concurrent denials in the
+    same turn cannot both decide they were first.
+    """
+    with _lock:
+        key = _denial_tally_key(session_key)
+        stages = _denial_breaker_logged_stages.pop(key, None) or set()
+        first_time = mode not in stages
+        stages.add(mode)
+        _denial_breaker_logged_stages[key] = stages
+        while len(_denial_breaker_logged_stages) > _DENIAL_BREAKER_LOGGED_STAGES_MAX:
+            _denial_breaker_logged_stages.pop(
+                next(iter(_denial_breaker_logged_stages))
+            )
+        return first_time
 
 
 def _approval_breaker_trip_key(
@@ -2906,12 +2989,19 @@ def _denial_breaker_metadata(session_key: str,
     threshold = _get_denial_breaker_threshold()
     if threshold <= 0 or count < threshold:
         return None
+    hard_stop_threshold = threshold + _get_denial_breaker_lockout_attempts()
     metadata = {
         "version": _APPROVAL_BREAKER_METADATA_VERSION,
         "type": _APPROVAL_BREAKER_METADATA_TYPE,
         "tripped": True,
         "count": count,
         "threshold": threshold,
+        "hard_stop_threshold": hard_stop_threshold,
+        "mode": (
+            _APPROVAL_BREAKER_MODE_HARD_STOP
+            if count >= hard_stop_threshold
+            else _APPROVAL_BREAKER_MODE_LOCKOUT
+        ),
     }
     if context:
         metadata["reason_code"] = context["reason_code"]
@@ -2920,25 +3010,48 @@ def _denial_breaker_metadata(session_key: str,
     return metadata
 
 
+def _denial_lockout_is_active(session_key: str) -> bool:
+    """Whether this turn already reached the breaker's denial threshold.
+
+    Read-only. Once true, dangerous-operation candidates are refused without
+    a guardian assessment for the rest of the turn.
+    """
+    threshold = _get_denial_breaker_threshold()
+    if threshold <= 0:
+        return False
+    with _lock:
+        return _denial_tally.get(_denial_tally_key(session_key), 0) >= threshold
+
+
 def _attach_denial_breaker_metadata(result: dict, session_key: str,
                                     context: dict | None = None) -> dict:
-    """Attach a diagnostic breaker marker to *result* when tripped."""
+    """Attach a diagnostic breaker marker to *result* when tripped.
+
+    The bounded side channel — the one the conversation loop reads to END the
+    turn — is written only for a hard stop. A lockout deliberately leaves it
+    empty: the turn keeps running, and only the model-facing marker and message
+    change.
+    """
     metadata = _denial_breaker_metadata(session_key, context)
     if metadata is not None:
         result[APPROVAL_BREAKER_METADATA_KEY] = metadata
-        _record_approval_breaker_trip(session_key, metadata)
+        if metadata["mode"] == _APPROVAL_BREAKER_MODE_HARD_STOP:
+            _record_approval_breaker_trip(session_key, metadata)
     return result
 
 
 def _denial_breaker_addendum(session_key: str,
                              context: dict | None = None) -> str:
-    """Return the escalated hard-stop text when the breaker has tripped.
+    """Return the escalated breaker text once the denial threshold is reached.
 
-    Read-only: callers increment via :func:`_record_denial` on the guardian
-    DENY verdict; this just checks the session's tally against the
-    configured threshold. Returns '' below the threshold (or when
+    Does not advance the tally: callers increment via :func:`_record_denial`
+    on the guardian DENY verdict, and this just checks that tally against the
+    configured thresholds. It does mutate one piece of bookkeeping — the
+    log-once record for the stage warning. Returns '' below the threshold (or when
     disabled), otherwise a leading-space addendum the caller appends
-    verbatim to the deny message returned to the model.
+    verbatim to the deny message returned to the model — the lockout notice
+    while the turn continues, and the hard-stop instruction once the model
+    has spent its post-lockout attempts.
 
     The text never routes the model toward a manual bypass: on the surfaces
     this breaker fires on, a guardian DENY creates no pending approval, so
@@ -2951,12 +3064,23 @@ def _denial_breaker_addendum(session_key: str,
         return ""
     count = metadata["count"]
     threshold = metadata["threshold"]
-    logger.warning(
-        "Smart-approval circuit breaker tripped for session %s: "
-        "%d consecutive denials (threshold %d, effect class %s)",
-        _log_session_key(session_key), count, threshold,
-        metadata.get("effect_class", _UNCLASSIFIED_EFFECT),
-    )
+    hard_stop_threshold = metadata["hard_stop_threshold"]
+    mode = metadata["mode"]
+    if _claim_denial_breaker_stage_log(session_key, mode):
+        logger.warning(
+            "Smart-approval circuit breaker tripped for session %s: "
+            "%d consecutive denials (threshold %d, effect class %s)",
+            _log_session_key(session_key), count, threshold,
+            metadata.get("effect_class", _UNCLASSIFIED_EFFECT),
+        )
+        # The one line that separates "the turn keeps going" from "the turn
+        # ends", so a log reader never has to infer the stage from the counts.
+        logger.warning(
+            "Smart-approval circuit breaker stage for session %s: %s "
+            "(count %d, lockout at %d, hard stop at %d)",
+            _log_session_key(session_key), mode, count, threshold,
+            hard_stop_threshold,
+        )
     detail = ""
     if context:
         detail = (
@@ -2964,12 +3088,84 @@ def _denial_breaker_addendum(session_key: str,
             f"(reason code: {context['reason_code']}). Safe alternative: "
             f"{context['safe_alternative']}."
         )
+    if mode == _APPROVAL_BREAKER_MODE_HARD_STOP:
+        return (
+            f" CIRCUIT BREAKER: {count} commands were blocked by the security "
+            "reviewer, and dangerous operations kept being attempted after the "
+            "lockout. STOP attempting variations of this "
+            f"operation.{detail} Tell the user which class of operation was "
+            "refused and continue with work that does not need it."
+        )
+    remaining = hard_stop_threshold - count
     return (
-        f" CIRCUIT BREAKER: {count} consecutive commands were blocked by "
-        "the security reviewer. STOP attempting variations of this "
-        f"operation.{detail} Tell the user which class of operation was "
-        "refused and continue with work that does not need it."
+        f" DANGEROUS-OPERATION LOCKOUT: {count} consecutive commands were "
+        f"blocked by the security reviewer. {_DENIAL_LOCKOUT_GUIDANCE} Safe "
+        f"work still runs normally; {remaining} more dangerous-operation "
+        f"attempt(s) will end the turn.{detail}"
     )
+
+
+def _lockout_deny_message(*, subject: str,
+                          breaker_addendum: str = "") -> str:
+    """Model-facing text for a candidate refused without being assessed.
+
+    Says plainly that no reviewer and no human looked at this one, so the model
+    cannot read the refusal as new evidence about *this* command and go looking
+    for a wording that passes. The reason code, effect class and safe
+    alternative are left to the breaker addendum, which always accompanies this
+    message — repeating them here is what made the refusal unreadably long.
+    """
+    return (
+        f"BLOCKED by security policy: this {subject} matched a dangerous "
+        "operation and was refused without being assessed, because this turn "
+        "already reached the automated security reviewer's denial limit. No "
+        "approval request was sent to anyone and nobody has refused it."
+        f"{breaker_addendum}"
+    )
+
+
+def _denial_lockout_deny(session_key: str, *, pattern_keys, primary_key: str,
+                         description: str, subject: str,
+                         command: str) -> dict | None:
+    """Refuse a dangerous-operation candidate while the lockout is active.
+
+    Returns None when the turn has not reached the denial threshold, in which
+    case the caller runs its normal assessment. Otherwise the candidate is
+    refused here — before the guardian LLM call, which is the cost this stage
+    exists to stop — and the refusal counts toward the hard stop.
+    """
+    if not _denial_lockout_is_active(session_key):
+        return None
+    _record_denial(session_key)
+    deny_context = _deny_context(pattern_keys)
+    # origin stays guardian_denied — the guardian's standing verdict for this
+    # turn is what refuses this one, and changing the origin vocabulary would
+    # break every consumer counting policy denials. ``stage`` is the new field
+    # that tells an unassessed refusal apart from an assessed one.
+    _log_deny_event(
+        origin=APPROVAL_OUTCOME_GUARDIAN_DENIED, context=deny_context,
+        command=command, session_key=session_key,
+        stage=_DENY_STAGE_LOCKOUT,
+    )
+    breaker_addendum = _denial_breaker_addendum(session_key, deny_context)
+    return _attach_denial_breaker_metadata({
+        "approved": False,
+        "message": _lockout_deny_message(
+            subject=subject, breaker_addendum=breaker_addendum,
+        ),
+        "smart_denied": True,
+        "denial_lockout": True,
+        "pattern_key": primary_key,
+        "description": description,
+        "outcome": _LEGACY_OUTCOME_BY_APPROVAL_OUTCOME[
+            APPROVAL_OUTCOME_GUARDIAN_DENIED],
+        "approval_outcome": APPROVAL_OUTCOME_GUARDIAN_DENIED,
+        "user_consent": None,
+        "reason_code": deny_context["reason_code"],
+        "reason_codes": deny_context["reason_codes"],
+        "effect_class": deny_context["effect_class"],
+        "safe_alternative": deny_context["safe_alternative"],
+    }, session_key, deny_context)
 
 
 # =========================================================================
@@ -3029,6 +3225,13 @@ _POLICY_BLOCK_HOOK_REDACTION_WINDOW_CHARS = 65536
 _deny_event_tally: dict[tuple[str, str], int] = {}
 _DENY_EVENT_TALLY_MAX_SESSIONS = 256
 
+# Whether the refused operation was actually assessed. Every ``approval_deny``
+# line carries this field so the shape stays constant for parsers; only the
+# breaker's lockout refusals — where the guardian was deliberately not asked —
+# report "lockout".
+_DENY_STAGE_ASSESSED = "assessed"
+_DENY_STAGE_LOCKOUT = "lockout"
+
 
 def _record_deny_event(session_key: str) -> int:
     """Increment and return this turn's observed deny count (all origins)."""
@@ -3055,21 +3258,27 @@ def _session_key_for_deny_log() -> str:
 
 
 def _log_deny_event(*, origin: str, context: dict, command,
-                    session_key: str, deny_rule_id: str | None = None) -> int:
+                    session_key: str, deny_rule_id: str | None = None,
+                    stage: str = _DENY_STAGE_ASSESSED) -> int:
     """Emit the one structured line for a denial; return this turn's count.
 
     Returns 0 if anything goes wrong, so a caller can still pass the count to
     observers. Never raises: a denial must be returned to the model whether or
     not it could be logged.
+
+    *stage* says whether the operation was assessed before being refused. It is
+    always present — a field that appears only sometimes is worse for a parser
+    than one with a constant default.
     """
     try:
         count = _record_deny_event(session_key)
         reason_code = context.get("reason_code") or "unspecified"
         logger.info(
-            "approval_deny origin=%s reason_code=%s effect_class=%s "
+            "approval_deny origin=%s stage=%s reason_code=%s effect_class=%s "
             "deny_rule_id=%s command_fingerprint=%s turn_deny_count=%d "
             "session=%s",
             origin,
+            stage,
             reason_code,
             context.get("effect_class") or _UNCLASSIFIED_EFFECT,
             deny_rule_id or reason_code,
@@ -3308,6 +3517,9 @@ def clear_session(session_key: str) -> None:
         for key in tuple(_denial_tally):
             if key[0] == session_key:
                 _denial_tally.pop(key, None)
+        for key in tuple(_denial_breaker_logged_stages):
+            if key[0] == session_key:
+                _denial_breaker_logged_stages.pop(key, None)
         for key in tuple(_approval_breaker_trips):
             if key[0] == session_key:
                 _approval_breaker_trips.pop(key, None)
@@ -4768,6 +4980,23 @@ def check_all_command_guards(command: str, env_type: str,
     if not warnings:
         return {"approved": True, "message": None}
 
+    # --- Phase 2.25: Dangerous-operation lockout ---
+    # This turn already spent the breaker's denial budget, so every remaining
+    # candidate is refused here rather than paying for another guardian call
+    # that will refuse it anyway. Deliberately AFTER the tirith scan and the
+    # dangerous-pattern check: skipping those to save time would let a command
+    # only tirith can see through as approved.
+    lockout = _denial_lockout_deny(
+        session_key,
+        pattern_keys=[key for key, _, _ in warnings],
+        primary_key=warnings[0][0],
+        description="; ".join(desc for _, desc, _ in warnings),
+        subject="command",
+        command=command,
+    )
+    if lockout is not None:
+        return lockout
+
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
@@ -5219,6 +5448,20 @@ def check_execute_code_guard(code: str, env_type: str,
     # consulted, so every execute_code call re-prompts the user (#39275).
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
+
+    # Dangerous-operation lockout — see check_all_command_guards. Placed after
+    # the session/permanent allowlist so an execute_code the user already
+    # approved keeps running while the lockout is in force.
+    lockout = _denial_lockout_deny(
+        session_key,
+        pattern_keys=[pattern_key],
+        primary_key=pattern_key,
+        description=description,
+        subject="execute_code script",
+        command=command,
+    )
+    if lockout is not None:
+        return lockout
 
     # Smart mode: ask the aux LLM about the whole script. An APPROVE here only
     # suppresses the redundant whole-script prompt; the per-call terminal()

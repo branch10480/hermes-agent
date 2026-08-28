@@ -146,6 +146,10 @@ def _record_approval_breaker_halt(
     session, turn, and outer tool-call ID. The model-facing result may be
     transformed by plugins (or contain an arbitrary JSON object), so it is
     deliberately never parsed as a control signal here.
+
+    Only a HARD STOP is recorded there. The breaker's first stage locks
+    dangerous operations out but leaves the turn running, so it writes no trip
+    and this function finds nothing to halt on.
     """
     if function_name not in _APPROVAL_BREAKER_TOOL_NAMES or getattr(
         agent, "_approval_breaker_halt", None
@@ -177,6 +181,7 @@ def _record_approval_breaker_halt(
         "tool_name": function_name,
         "count": metadata.get("count"),
         "threshold": metadata.get("threshold"),
+        "hard_stop_threshold": metadata.get("hard_stop_threshold"),
         "reason_code": metadata.get("reason_code"),
         "effect_class": metadata.get("effect_class"),
         "safe_alternative": metadata.get("safe_alternative"),

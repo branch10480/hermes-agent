@@ -76,6 +76,7 @@ def smart_deny_session(monkeypatch):
     monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
     monkeypatch.setattr(A, "_smart_approve", lambda _c, _d: "deny")
     monkeypatch.setattr(A, "_get_denial_breaker_threshold", lambda: 3)
+    monkeypatch.setattr(A, "_get_denial_breaker_lockout_attempts", lambda: 3)
     monkeypatch.setattr(A, "_smart_deny_is_final", lambda: False)
     monkeypatch.setattr(
         A, "detect_dangerous_command",
@@ -276,35 +277,68 @@ def test_unanswered_request_is_timed_out_not_denied(
 # ---------------------------------------------------------------------------
 
 def _trip_breaker(monkeypatch, session_key) -> dict:
+    """Drive the breaker to its first stage: the dangerous-operation lockout."""
     _install_policy_auto_deny(monkeypatch, session_key)
     A.check_all_command_guards("rm -rf /srv/one", "local")
     A.check_all_command_guards("rm -rf /srv/two", "local")
     return A.check_all_command_guards("rm -rf /srv/secret-three", "local")
 
 
-def test_breaker_message_offers_no_manual_bypass(
+def _hard_stop_breaker(monkeypatch, session_key) -> dict:
+    """Keep attempting dangerous work through the lockout until the turn ends."""
+    _trip_breaker(monkeypatch, session_key)
+    A.check_all_command_guards("rm -rf /srv/four", "local")
+    A.check_all_command_guards("rm -rf /srv/five", "local")
+    return A.check_all_command_guards("rm -rf /srv/secret-six", "local")
+
+
+def test_lockout_message_offers_no_manual_bypass(
     smart_deny_session, monkeypatch
 ):
     third = _trip_breaker(monkeypatch, smart_deny_session)
 
-    assert "CIRCUIT BREAKER:" in third["message"]
+    assert "DANGEROUS-OPERATION LOCKOUT:" in third["message"]
     for phrase in MANUAL_BYPASS_PHRASES:
         assert phrase not in third["message"], phrase
+
+
+def test_breaker_message_offers_no_manual_bypass(
+    smart_deny_session, monkeypatch
+):
+    sixth = _hard_stop_breaker(monkeypatch, smart_deny_session)
+
+    assert "CIRCUIT BREAKER:" in sixth["message"]
+    for phrase in MANUAL_BYPASS_PHRASES:
+        assert phrase not in sixth["message"], phrase
+
+
+def test_lockout_refusal_never_claims_a_human_refused_it(
+    smart_deny_session, monkeypatch
+):
+    """A candidate refused without assessment is nobody's decision but policy's."""
+    _trip_breaker(monkeypatch, smart_deny_session)
+    fourth = A.check_all_command_guards("rm -rf /srv/four", "local")
+
+    assert fourth["denial_lockout"] is True
+    assert fourth["user_consent"] is None
+    assert fourth["approval_outcome"] == A.APPROVAL_OUTCOME_GUARDIAN_DENIED
+    for phrase in USER_ATTRIBUTION_PHRASES:
+        assert phrase not in fourth["message"], phrase
 
 
 def test_breaker_side_channel_carries_reason_not_command(
     smart_deny_session, monkeypatch
 ):
-    third = _trip_breaker(monkeypatch, smart_deny_session)
-    metadata = third[A.APPROVAL_BREAKER_METADATA_KEY]
+    sixth = _hard_stop_breaker(monkeypatch, smart_deny_session)
+    metadata = sixth[A.APPROVAL_BREAKER_METADATA_KEY]
 
     assert metadata["reason_code"] == "recursive_delete"
     assert metadata["effect_class"] == "destructive_filesystem"
     assert metadata["safe_alternative"]
     # The blocked command never enters the side channel or the model text.
     for value in metadata.values():
-        assert "secret-three" not in str(value)
-    assert "secret-three" not in third["message"]
+        assert "secret-six" not in str(value)
+    assert "secret-six" not in sixth["message"]
 
 
 def test_final_turn_message_offers_no_manual_bypass():
@@ -345,10 +379,14 @@ def test_breaker_warning_does_not_log_the_discord_session_key(
 ):
     caplog.set_level(logging.DEBUG, logger="tools.approval")
 
-    third = _trip_breaker(monkeypatch, smart_deny_session)
-    assert "CIRCUIT BREAKER:" in third["message"]
+    sixth = _hard_stop_breaker(monkeypatch, smart_deny_session)
+    assert "CIRCUIT BREAKER:" in sixth["message"]
 
     assert "Smart-approval circuit breaker tripped" in caplog.text
+    # The stage line is what tells lockout apart from a turn-ending stop.
+    assert "Smart-approval circuit breaker stage" in caplog.text
+    assert "lockout" in caplog.text
+    assert "hard_stop" in caplog.text
     assert DISCORD_SESSION_KEY not in caplog.text
     for fragment in DISCORD_ID_FRAGMENTS:
         assert fragment not in caplog.text, fragment

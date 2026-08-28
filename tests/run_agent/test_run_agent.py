@@ -2920,11 +2920,13 @@ class TestRunConversation:
             ensure_ascii=False,
         )
         breaker_metadata = {
-            "version": 1,
+            "version": 3,
             "type": "consecutive_smart_denials",
             "tripped": True,
-            "count": 3,
+            "mode": "hard_stop",
+            "count": 6,
             "threshold": 3,
+            "hard_stop_threshold": 6,
         }
 
         def dispatch(name, *_args, **_kwargs):
@@ -2960,7 +2962,8 @@ class TestRunConversation:
         assert result["turn_exit_reason"] == "approval_denial_breaker"
         assert result["failed"] is False
         assert result["final_response"].startswith(
-            "このターンで terminal の危険操作が3回連続で拒否されたため"
+            "このターンで terminal の危険操作が6回連続で拒否され、"
+            "危険操作をロックアウトしたあとも再試行が続いたため"
         )
         assert "次のメッセージでは通常の読み取り・編集・テストをそのまま" in result[
             "final_response"
@@ -2974,6 +2977,80 @@ class TestRunConversation:
             "assistant",
         ]
         assert "approval denial circuit breaker" in result["messages"][-2]["content"]
+
+    def test_approval_breaker_lockout_lets_the_turn_finish(self, agent):
+        """Stage one refuses dangerous work but must not end the turn.
+
+        The lockout writes no side-channel trip, so the executor has nothing to
+        halt on: the sibling tool in the same batch still runs and the model
+        gets another call to report what it found.
+        """
+        self._setup_agent(agent)
+        agent.valid_tool_names = set(agent.valid_tool_names) | {
+            "terminal",
+            "web_search",
+        }
+        tool_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    name="terminal", arguments='{"command":"blocked"}', call_id="c1"
+                ),
+                _mock_tool_call(
+                    name="web_search", arguments='{"query":"must still run"}',
+                    call_id="c2",
+                ),
+            ],
+        )
+        final_turn = _mock_response(
+            content="Reported the refused class and finished the research",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [tool_turn, final_turn]
+        blocked_result = json.dumps(
+            {
+                "output": "",
+                "exit_code": -1,
+                "error": (
+                    "BLOCKED by security policy: DANGEROUS-OPERATION LOCKOUT"
+                ),
+                "status": "blocked",
+                # Diagnostic marker only — a lockout records no trip.
+                "approval_breaker": {
+                    "version": 3,
+                    "type": "consecutive_smart_denials",
+                    "tripped": True,
+                    "mode": "lockout",
+                    "count": 3,
+                    "threshold": 3,
+                    "hard_stop_threshold": 6,
+                },
+            },
+            ensure_ascii=False,
+        )
+        dispatched: list = []
+
+        def dispatch(name, *_args, **_kwargs):
+            dispatched.append(name)
+            if name == "terminal":
+                return blocked_result
+            return json.dumps({"results": []})
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=dispatch),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("research the requested topic")
+
+        assert dispatched == ["terminal", "web_search"]
+        assert result["turn_exit_reason"] != "approval_denial_breaker"
+        assert result["final_response"] == (
+            "Reported the refused class and finished the research"
+        )
+        assert result["completed"] is True
 
     def test_approval_breaker_state_does_not_leak_to_new_turn(self, agent):
         """A fresh user turn starts normally after a prior policy stop."""

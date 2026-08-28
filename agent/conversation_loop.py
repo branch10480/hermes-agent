@@ -157,6 +157,10 @@ def approval_breaker_final_message(halt: Dict[str, Any]) -> str:
     code, effect class, safe alternative) — never the blocked command, so
     this message cannot echo one back to the user.
 
+    Only a hard stop reaches here. The breaker's first stage locks dangerous
+    operations out and lets the turn finish, and the user hears about that from
+    the agent's own final answer rather than from this notice.
+
     Two things are deliberately absent. ``/approve`` is not offered: on the
     surfaces this breaker fires on, a policy denial resolves itself and
     creates no pending approval, so approving is not something the user can
@@ -186,8 +190,9 @@ def approval_breaker_final_message(halt: Dict[str, Any]) -> str:
         alternative_line = f"同じ目的を安全に進めるなら: {safe_alternative}。"
 
     return (
-        f"このターンで {tool_name} の危険操作が{denial_count}拒否されたため、"
-        "危険操作の自動再試行を止め、このターンを終了しました。"
+        f"このターンで {tool_name} の危険操作が{denial_count}拒否され、"
+        "危険操作をロックアウトしたあとも再試行が続いたため、"
+        "このターンを終了しました。"
         f"{reason_line}"
         "次のメッセージでは通常の読み取り・編集・テストをそのまま"
         f"続けられます。{alternative_line}"
@@ -7696,7 +7701,12 @@ def _run_conversation_core(
                 if isinstance(approval_breaker_halt, dict):
                     _turn_exit_reason = "approval_denial_breaker"
                     count = approval_breaker_halt.get("count")
-                    threshold = approval_breaker_halt.get("threshold")
+                    # The hard stop fires at lockout threshold + post-lockout
+                    # attempts; showing the lockout threshold here would render
+                    # a nonsense "6/3".
+                    threshold = approval_breaker_halt.get(
+                        "hard_stop_threshold"
+                    ) or approval_breaker_halt.get("threshold")
                     final_response = approval_breaker_final_message(
                         approval_breaker_halt
                     )

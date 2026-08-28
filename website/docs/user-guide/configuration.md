@@ -2285,11 +2285,22 @@ Setting `approvals.mode: off` disables all safety checks for terminal commands. 
 
 ### Denial circuit breaker
 
-`approvals.denial_breaker_threshold` (default `3`) guards against the agent retrying variations of a command the smart-approval reviewer keeps denying — each retry burns another guardian LLM call. After that many consecutive denials in a session, Hermes records a bounded internal breaker trip and ends the current turn before another model call. The result may include a diagnostic marker for observability, but transformed or arbitrary plugin output cannot trigger the stop. The user receives a concise safety-stop message; the agent must wait for a new user turn. Any approval resets the count; set `0` to disable:
+`approvals.denial_breaker_threshold` (default `3`) guards against the agent retrying variations of a command the smart-approval reviewer keeps denying — each retry burns another guardian LLM call. The breaker fires in two stages.
+
+**Stage 1 — lockout.** After that many consecutive denials in one turn, dangerous operations are locked out for the rest of the turn: every further candidate is refused immediately, without another guardian call, and the agent is told to stop retrying and continue with safe tools (the native read/search/write tools, or a script saved with `write_file` and run as a single file). The same instruction tells the agent never to use those routes to reproduce a refused operation — a refusal applies to the *effect*, not to the phrasing that expressed it, so a saved script that reaches the same outcome is refused exactly as the inline command was. The turn keeps running, so a long research task is not interrupted by one refused command.
+
+While the lockout is in force, `execute_code` is refused as a whole, even when the script itself is harmless. The guard approves a script before it runs and cannot know what it will do, so there is no way to admit a benign one without admitting every one; each of those refusals counts toward the hard stop below. An `execute_code` the user already approved for the session still runs — the allowlist is consulted first.
+
+The structured `approval_deny` log line distinguishes the two kinds of refusal with a `stage` field: `assessed` for a denial the reviewer actually looked at, `lockout` for one refused without assessment. The `origin` stays `guardian_denied` in both cases.
+
+**Stage 2 — hard stop.** If the agent keeps reaching for dangerous operations anyway, `approvals.denial_breaker_lockout_attempts` more times (default `3`), Hermes records a bounded internal breaker trip and ends the turn before another model call. The result may include a diagnostic marker for observability, but transformed or arbitrary plugin output cannot trigger the stop. The user receives a concise safety-stop message; the agent must wait for a new user turn.
+
+Any approval resets the count. Set `denial_breaker_threshold: 0` to disable the breaker entirely, or `denial_breaker_lockout_attempts: 0` to make reaching the threshold end the turn immediately:
 
 ```yaml
 approvals:
-  denial_breaker_threshold: 3   # 0 disables the breaker
+  denial_breaker_threshold: 3        # 0 disables the breaker
+  denial_breaker_lockout_attempts: 3 # 0 = end the turn at the threshold
 ```
 
 ### Deny rules

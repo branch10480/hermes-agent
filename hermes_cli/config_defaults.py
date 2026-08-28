@@ -2208,12 +2208,17 @@ DEFAULT_CONFIG = {
         # customizable auto-review guardian policy.
         "smart_policy": "",
         # Consecutive-denial circuit breaker for smart approvals: after this
-        # many guardian DENY verdicts in a row within one session, the deny
-        # message returned to the model escalates to a hard-stop instruction
-        # (report to the user / ask for manual run or /approve) instead of a
-        # plain "Do NOT retry". Any approval resets the count. 0 disables.
-        # Inspired by ChatGPT Work's auto-review circuit breaker.
+        # many guardian DENY verdicts in a row within one turn, dangerous
+        # operations are locked out for the rest of that turn — further
+        # candidates are refused immediately, without another guardian call,
+        # while safe tools keep running. Any approval resets the count.
+        # 0 disables. Inspired by ChatGPT Work's auto-review circuit breaker.
         "denial_breaker_threshold": 3,
+        # How many more dangerous-operation attempts are tolerated after the
+        # lockout begins before the turn is ended outright. This is the guard
+        # against an empty retry loop burning the whole iteration budget.
+        # 0 restores the old behaviour (reaching the threshold ends the turn).
+        "denial_breaker_lockout_attempts": 3,
         # User-defined deny rules: fnmatch globs matched against terminal
         # commands. A match blocks the command unconditionally — BEFORE the
         # --yolo / /yolo / mode=off bypass — making this the user-editable
