@@ -610,6 +610,10 @@ def init_agent(
     agent._print_fn = None
     agent.background_review_callback = None  # Optional sync callback for gateway delivery
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
+    # Review lifecycle notices (started/finished/failed). None = resolve from
+    # display.background_review_run_notifications at review time; hosts may
+    # pin True/False directly.
+    agent.background_review_run_notifications = None
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
     # Background review (memory/skill) opt-out switch. When True, skips the

@@ -292,6 +292,24 @@ display:
 > writes to your memory/skill stores, are unaffected by this setting. Set it
 > per-platform via `display.platforms.<platform>.memory_notifications`.
 
+### Run visibility (`display.background_review_run_notifications`)
+
+`memory_notifications` only speaks up when a pass actually saved something — a
+review that concluded "Nothing to save" is invisible, so you can't tell *when*
+the review ran (or that it's the reason your local model is busy). Opt in to
+lifecycle notices to make every run visible:
+
+```yaml
+display:
+  background_review_run_notifications: true   # default: false
+```
+
+When enabled, the chat gets `🧠 Self-improvement review started` when a pass
+begins, `🧠 Self-improvement review finished — nothing saved (4m12s)` when it
+ends without writes (or `cancelled by a live turn` / `failed — see logs`), and
+the usual `💾` summary gains a duration suffix. Set it per-platform via
+`display.platforms.<platform>.background_review_run_notifications`.
+
 ## Running the review on a cheaper model (`auxiliary.background_review`)
 
 The review runs on your **main chat model** by default, replaying the

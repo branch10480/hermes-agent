@@ -1269,6 +1269,13 @@ DEFAULT_CONFIG = {
         #   "verbose" — include a compact content preview of what changed
         # Per-platform overrides via display.platforms.<platform>.memory_notifications.
         "memory_notifications": "on",
+        # Post review lifecycle notices to the chat — "started", "finished —
+        # nothing saved", "cancelled", "failed" — so it's visible WHEN the
+        # background self-improvement review ran, even on passes that saved
+        # nothing. Off by default (only the action summary above is shown).
+        # Per-platform overrides via
+        # display.platforms.<platform>.background_review_run_notifications.
+        "background_review_run_notifications": False,
         "streaming": False,
         "timestamps": False,      # Show timestamp on user and assistant labels
         "timestamp_format": "%H:%M",  # strftime format for timestamps (e.g. "%b-%d %H:%M")

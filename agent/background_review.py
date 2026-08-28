@@ -22,6 +22,7 @@ import copy
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from agent import live_turn_registry
@@ -110,6 +111,53 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
     except Exception as e:
         logger.debug("background-review aux routing failed (%s); using main model", e)
         return parent
+
+
+def _run_notifications_enabled(agent: Any) -> bool:
+    """Whether review lifecycle notices (started/finished/failed) are on.
+
+    Resolution order: an explicit ``agent.background_review_run_notifications``
+    True/False pinned by the host wins; ``None`` (the default) falls back to
+    ``display.background_review_run_notifications`` in config, with the same
+    ``display.platforms.<platform>.*`` override shape as memory_notifications.
+    Off by default — this only adds run visibility, the action summary is
+    governed by memory_notifications as before.
+    """
+    override = getattr(agent, "background_review_run_notifications", None)
+    if override is not None:
+        return bool(override)
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
+    except Exception:
+        return False
+    disp = cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
+    raw = disp.get("background_review_run_notifications")
+    plats = disp.get("platforms") if isinstance(disp.get("platforms"), dict) else {}
+    pconf = plats.get(str(getattr(agent, "platform", "") or ""))
+    if isinstance(pconf, dict) and "background_review_run_notifications" in pconf:
+        raw = pconf.get("background_review_run_notifications")
+    return bool(raw)
+
+
+def _format_elapsed(seconds: float) -> str:
+    s = max(0, int(seconds))
+    m, s = divmod(s, 60)
+    return f"{m}m{s:02d}s" if m else f"{s}s"
+
+
+def _notify_review_event(agent: Any, message: str) -> None:
+    """Best-effort delivery of a review lifecycle notice to the user."""
+    try:
+        agent._safe_print(f"  {message}")
+    except Exception:
+        pass
+    _bg_cb = getattr(agent, "background_review_callback", None)
+    if _bg_cb:
+        try:
+            _bg_cb(message)
+        except Exception:
+            pass
 
 
 def _msg_text(m: Dict) -> str:
@@ -721,6 +769,16 @@ def _run_review_body(
     if gate_handle is not None and gate_handle.cancelled:
         return
 
+    # Lifecycle notices ("started" / "finished — nothing saved" / "failed")
+    # answer "when did the self-improvement review actually run?" — off by
+    # default, opt-in via display.background_review_run_notifications. The
+    # start notice fires here, after every pre-run gate, so an announced
+    # review is one that really begins.
+    run_notices = _run_notifications_enabled(agent)
+    review_started_at = time.monotonic()
+    if run_notices:
+        _notify_review_event(agent, "🧠 Self-improvement review started")
+
     # Local import to avoid a hard circular dep at module load.
     from run_agent import AIAgent
     from tools.terminal_tool import set_approval_callback as _set_approval_callback
@@ -1047,6 +1105,13 @@ def _run_review_body(
                 _register_under_parent_lifecycle()
 
             if cancelled_before_registration:
+                # A start notice already went out; close the loop instead of
+                # leaving it dangling.
+                if run_notices:
+                    _notify_review_event(
+                        agent,
+                        "🧠 Self-improvement review cancelled before it could run",
+                    )
                 return
 
             from model_tools import get_tool_definitions
@@ -1158,8 +1223,11 @@ def _run_review_body(
             )
             actions = []
 
+        elapsed = _format_elapsed(time.monotonic() - review_started_at)
         if actions:
             summary = " · ".join(dict.fromkeys(actions))
+            if run_notices:
+                summary = f"{summary} ({elapsed})"
             agent._safe_print(
                 f"  💾 Self-improvement review: {summary}"
             )
@@ -1171,10 +1239,25 @@ def _run_review_body(
                     )
                 except Exception:
                     pass
+        elif run_notices:
+            if cancellation_event is not None and cancellation_event.is_set():
+                _notify_review_event(
+                    agent,
+                    f"🧠 Self-improvement review cancelled by a live turn ({elapsed})",
+                )
+            else:
+                _notify_review_event(
+                    agent,
+                    f"🧠 Self-improvement review finished — nothing saved ({elapsed})",
+                )
 
     except Exception as e:
         logger.warning("Background memory/skill review failed: %s", e)
         agent._emit_auxiliary_failure("background review", e)
+        if run_notices:
+            _notify_review_event(
+                agent, "🧠 Self-improvement review failed — see logs"
+            )
     finally:
         # Safety-net cleanup for the exception path.  Normal completion already
         # shut down inside the thread-scoped silence above.  Re-enter the
