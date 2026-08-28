@@ -612,8 +612,39 @@ def _apply_tool_guardrail_recovery_overrides(
     api_kwargs["max_tokens"] = max_tokens
 
 
-def _apply_thinking_budget_recovery_overrides(api_kwargs: dict[str, Any]) -> None:
-    """Constrain the one-shot reasoning-exhaustion recovery request in place."""
+def _recovery_accepts_chat_template_thinking_switch(agent: Any) -> bool:
+    """Whether this route accepts ``chat_template_kwargs.enable_thinking``.
+
+    Self-hosted OpenAI-compatible servers (vLLM / SGLang / MLX / llama.cpp and
+    the proxies in front of them) are configured through ``custom_providers``
+    and resolve to ``provider == "custom"`` on the chat-completions wire; they
+    read the chat-template switch — or harmlessly ignore an unknown body field.
+    Managed vendors reject unrecognized request fields with a 400, so the
+    switch is only emitted on the custom route.
+    """
+    if getattr(agent, "api_mode", "chat_completions") != "chat_completions":
+        return False
+    return str(getattr(agent, "provider", "") or "").strip().lower() == "custom"
+
+
+def _apply_thinking_budget_recovery_overrides(
+    agent: Any, api_kwargs: dict[str, Any]
+) -> str:
+    """Constrain the one-shot reasoning-exhaustion recovery request in place.
+
+    Returns a short wire-level description of the reasoning controls applied,
+    for the request log line.
+
+    The recovery answer needs no reasoning at all: the analysis already
+    happened, the model only has to write the conclusion down. So thinking is
+    DISABLED here, not merely lowered. A ``low`` effort clamp is still a
+    thinking budget, and on a local Qwen route (custom provider behind an
+    OpenAI-compatible proxy) it spent all 4,096 recovery tokens on reasoning
+    three times in one session — each time producing the empty-answer
+    "Thinking Budget Exhausted" failure this recovery exists to prevent.
+    Routes with no wire switch for disabling reasoning keep the ``low`` clamp
+    as graceful degradation.
+    """
     _apply_answer_only_recovery_overrides(api_kwargs)
 
     for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
@@ -621,18 +652,44 @@ def _apply_thinking_budget_recovery_overrides(api_kwargs: dict[str, Any]) -> Non
         if isinstance(value, int) and not isinstance(value, bool):
             api_kwargs[key] = min(value, _THINKING_BUDGET_RECOVERY_MAX_TOKENS)
 
-    if "reasoning_effort" in api_kwargs:
-        api_kwargs["reasoning_effort"] = "low"
-
+    applied: list[str] = []
     extra_body = api_kwargs.get("extra_body")
-    if isinstance(extra_body, dict):
-        extra_body = dict(extra_body)
+    extra_body = dict(extra_body) if isinstance(extra_body, dict) else None
+
+    if _recovery_accepts_chat_template_thinking_switch(agent):
+        if extra_body is None:
+            extra_body = {}
+        template_kwargs = extra_body.get("chat_template_kwargs")
+        template_kwargs = dict(template_kwargs) if isinstance(template_kwargs, dict) else {}
+        template_kwargs["enable_thinking"] = False
+        extra_body["chat_template_kwargs"] = template_kwargs
+        applied.append("chat_template_kwargs.enable_thinking=false")
+
+    # Kimi-style switch (``extra_body.thinking.type``) — the transport already
+    # emits "enabled"/"disabled" here, so flipping it is the route's own way
+    # of turning reasoning off, and it drops the paired reasoning_effort the
+    # same way the transport does when thinking is disabled.
+    thinking = extra_body.get("thinking") if extra_body else None
+    if isinstance(thinking, dict) and "type" in thinking:
+        thinking = dict(thinking)
+        thinking["type"] = "disabled"
+        extra_body["thinking"] = thinking
+        api_kwargs.pop("reasoning_effort", None)
+        applied.append("thinking.type=disabled")
+    elif "reasoning_effort" in api_kwargs:
+        api_kwargs["reasoning_effort"] = "low"
+        applied.append("reasoning_effort=low")
+
+    if extra_body is not None:
         reasoning = extra_body.get("reasoning")
         if isinstance(reasoning, dict):
             reasoning = dict(reasoning)
             reasoning["effort"] = "low"
             extra_body["reasoning"] = reasoning
+            applied.append("reasoning.effort=low")
         api_kwargs["extra_body"] = extra_body
+
+    return "+".join(applied) if applied else "unchanged/unspecified"
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -2067,6 +2124,7 @@ def _run_conversation_core(
     truncated_response_parts: List[str] = []
     thinking_budget_recovery_attempted = False
     thinking_budget_recovery_active = False
+    thinking_budget_recovery_request_logged = False
     tool_guardrail_recovery_attempted = False
     tool_guardrail_recovery_active = False
     tool_guardrail_recovery_request_stats: Optional[tuple[int, int, int]] = None
@@ -3141,7 +3199,7 @@ def _run_conversation_core(
                         tools_for_api=tools_for_api,
                     )
                 if thinking_budget_recovery_active:
-                    _apply_thinking_budget_recovery_overrides(api_kwargs)
+                    _apply_thinking_budget_recovery_overrides(agent, api_kwargs)
                 elif tool_guardrail_recovery_active:
                     _apply_tool_guardrail_recovery_overrides(agent, api_kwargs)
                 # Outbound-request surrogate chokepoint (#50959): the messages
@@ -3197,10 +3255,20 @@ def _run_conversation_core(
                 # Middleware is extensible and may restore request fields.
                 # Reassert the answer-only boundary immediately before hooks
                 # and provider execution. Thinking-budget recovery also keeps
-                # its reduced reasoning override; guardrail recovery preserves
+                # its thinking-disabled override; guardrail recovery preserves
                 # the normal requested effort while removing every tool field.
                 if thinking_budget_recovery_active:
-                    _apply_thinking_budget_recovery_overrides(api_kwargs)
+                    _thinking_recovery_controls = (
+                        _apply_thinking_budget_recovery_overrides(agent, api_kwargs)
+                    )
+                    if not thinking_budget_recovery_request_logged:
+                        logger.info(
+                            "Thinking-budget answer-only request prepared: "
+                            "max_output_tokens=%s reasoning=%s",
+                            agent._requested_output_cap_from_api_kwargs(api_kwargs),
+                            _thinking_recovery_controls,
+                        )
+                        thinking_budget_recovery_request_logged = True
                 elif tool_guardrail_recovery_active:
                     _apply_tool_guardrail_recovery_overrides(agent, api_kwargs)
 
