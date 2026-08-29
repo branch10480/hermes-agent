@@ -601,6 +601,16 @@ def detect_hardline_command(command: str) -> tuple:
     normalized = _normalize_command_for_detection(command)
     _, malformed_grep = _grep_safe_detection_variant(normalized)
     if malformed_grep:
+        # Normalization dissolves backslash-escapes, which unbalances quoting
+        # the shell accepts: `grep -io "brand[^\"']*" page.html` becomes
+        # `grep -io "brand[^"']*" page.html`, whose stray `'` swallows the
+        # rest of the line. Re-decide on quote-faithful text before blocking.
+        # Genuinely broken quoting (an unterminated string, a truncated
+        # heredoc) is still malformed there, so the fail-closed floor holds.
+        _, malformed_grep = _grep_safe_detection_variant(
+            _normalize_command_structure_for_detection(command)
+        )
+    if malformed_grep:
         return (True, _MALFORMED_EXEC_DESCRIPTION)
     for command_variant in _command_detection_variants(command):
         variant_lower = command_variant.lower()
@@ -1159,12 +1169,24 @@ def _approval_key_aliases(pattern_key: str) -> set[str]:
 # Detection
 # =========================================================================
 
-def _normalize_command_for_detection(command: str) -> str:
-    """Normalize a command string before dangerous-pattern matching.
+def _normalize_command_structure_for_detection(command: str) -> str:
+    """De-obfuscate a command WITHOUT disturbing its shell quote structure.
 
-    Strips ANSI escape sequences (full ECMA-48 via tools.ansi_strip),
-    null bytes, and normalizes Unicode fullwidth characters so that
-    obfuscation techniques cannot bypass the pattern-based detection.
+    This is the prefix of ``_normalize_command_for_detection`` that a
+    *structural* (quote-aware) parse can safely consume: it removes
+    non-printing and Unicode-obfuscated spellings, collapses line
+    continuations, and folds home prefixes — but it never rewrites a quote
+    character nor a backslash that protects one.
+
+    The escape/empty-quote strips that follow in the full normalization are
+    deliberately excluded. They are correct for *regex* matching but destroy
+    quoting the shell accepts: ``grep -o "a[^\\"']*" f`` becomes
+    ``grep -o "a[^"']*" f``, whose second quote now closes the operand and
+    leaves the trailing ``'`` opening a region that never terminates. Every
+    lexer downstream then reports a malformed payload for a command
+    ``bash -n`` parses without complaint. Structural decisions ("can we parse
+    this at all?") must therefore run on this text, not on the fully
+    normalized text.
     """
     from tools.ansi_strip import strip_ansi
 
@@ -1201,6 +1223,22 @@ def _normalize_command_for_detection(command: str) -> str:
     # first would eat the prefix the Hermes-home fold needs.
     command = _rewrite_resolved_hermes_home(command)
     command = _rewrite_resolved_user_home(command)
+    return command
+
+
+def _normalize_command_for_detection(command: str) -> str:
+    """Normalize a command string before dangerous-pattern matching.
+
+    Strips ANSI escape sequences (full ECMA-48 via tools.ansi_strip),
+    null bytes, and normalizes Unicode fullwidth characters so that
+    obfuscation techniques cannot bypass the pattern-based detection.
+
+    The tail below dissolves backslash-escapes and empty quote pairs. That is
+    what the pattern matchers need, but it can unbalance otherwise-valid
+    quoting — use ``_normalize_command_structure_for_detection`` for anything
+    that then parses the result as shell.
+    """
+    command = _normalize_command_structure_for_detection(command)
     # Strip shell backslash-escapes: r\m → rm. Prevents \-injection bypass.
     command = re.sub(r'\\([^\n])', r'\1', command)
     # Strip empty-string literals that split tokens: r''m → rm, r"\"m → rm.
@@ -1416,6 +1454,10 @@ _MAX_SEPARATOR_FREE_COMMAND_CHARS = 4_096
 _MAX_DETECTION_SEGMENTS = 25_000
 _PARSER_LIMIT_DESCRIPTION = "command parser limit exceeded"
 _MALFORMED_EXEC_DESCRIPTION = "command parser limit or malformed executable payload"
+# The only spellings `_normalize_command_for_detection`'s escape and
+# empty-quote strips can rewrite. Absent all of them, the normalized text has
+# exactly the quote structure of the original and no re-parse is warranted.
+_ESCAPE_STRIP_TRIGGERS_RE = re.compile(r"\\|''|\"\"")
 
 
 
@@ -1795,6 +1837,13 @@ def _read_tool_exec_flag(tool: str, args: list[str]) -> tuple[str, str] | None:
                 index += 1
             continue
         index += 1
+    return None
+
+
+def _first_execution_flag_finding(command: str) -> str | None:
+    """Return the first execution mechanism found in *command*, if any."""
+    for description, _ in _execution_flag_findings(command):
+        return description
     return None
 
 
@@ -2257,12 +2306,41 @@ def _command_detection_variants(command: str):
     # unterminated quote), so masking the normalized text could swallow a
     # REAL unquoted newline separator that follows. The raw command carries
     # faithful shell quote state.
-    normalized = _normalize_command_for_detection(_mask_quoted_newlines(command))
+    masked = _mask_quoted_newlines(command)
+    normalized = _normalize_command_for_detection(masked)
+    seen: set[str] = set()
+    yield from _detection_variants_for_text(normalized, seen)
+    # That same escape strip can leave the normalized text unbalanced even
+    # though the shell parses the original fine (`grep -io "a[^\"']*" f`).
+    # Every quote-aware step above then goes blind from the corruption
+    # onward: no command start is marked after it, so `grep -io "a[^\"']*" f
+    # && rm -rf /` would offer the hardline floor no anchored variant at all.
+    # Re-run the pipeline on quote-faithful text whenever normalization broke
+    # the quoting, so the floor keeps seeing the real command positions.
+    # The substring test is the cheap gate: only a backslash or an empty quote
+    # pair can make the strips rewrite quoting at all, so ordinary commands
+    # never pay for the extra tokenization pass. Do NOT additionally require
+    # the normalized text to be unbalanced: an even number of dissolved
+    # escapes (`echo "x\"" && rm -rf / && echo "y\""`) leaves it balanced
+    # with the quote regions shifted, so the real `&&` reads as quoted and
+    # no command start is marked — the floor would be blind either way.
+    if _ESCAPE_STRIP_TRIGGERS_RE.search(masked):
+        structural = _normalize_command_structure_for_detection(masked)
+        if (
+            structural != normalized
+            and _shell_tokens_with_spans(structural, 0) is not None
+        ):
+            yield from _detection_variants_for_text(structural, seen)
+
+
+def _detection_variants_for_text(normalized: str, seen: set[str]):
+    """Yield every detection variant derived from one normalized text."""
     # Quote-aware grep parsing hides only structurally identified pattern
     # operands. Malformed/ambiguous input remains byte-for-byte intact.
     grep_safe, _ = _grep_safe_detection_variant(normalized)
-    seen = {grep_safe}
-    yield grep_safe
+    if grep_safe not in seen:
+        seen.add(grep_safe)
+        yield grep_safe
     # Program-bearing options are parsed in their owning command's context.
     # Surfacing only their payload lets the hardline floor inspect the command
     # that will actually run without promoting similar flags or quoted prose.
@@ -2349,7 +2427,17 @@ def detect_dangerous_command(command: str) -> tuple:
                 pattern_key = description
                 return (True, pattern_key, description)
     normalized = _normalize_command_for_detection(command)
-    for description, _ in _execution_flag_findings(normalized):
+    description = _first_execution_flag_finding(normalized)
+    if description == _MALFORMED_EXEC_DESCRIPTION:
+        # Same correction as the hardline gate: the escape strip can unbalance
+        # quoting bash accepts (`rg --pre "x\"y" .`), which hides the real
+        # finding behind a bogus malformed verdict. Re-read the mechanism off
+        # quote-faithful text — a genuinely untokenizable payload stays
+        # malformed there and is still reported.
+        description = _first_execution_flag_finding(
+            _normalize_command_structure_for_detection(command)
+        )
+    if description:
         return (True, description, description)
     return (False, None, None)
 

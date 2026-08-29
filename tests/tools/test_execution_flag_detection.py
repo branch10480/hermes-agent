@@ -266,6 +266,144 @@ def test_malformed_quoted_executable_payloads_fail_closed(command):
     assert description == "command parser limit or malformed executable payload"
 
 
+# A backslash-escaped double quote inside a double-quoted word is ordinary
+# shell: `"a[^\"']*"` is the single word `a[^"']*`. Detection normalization
+# dissolves backslash-escapes before pattern matching, which rewrites that to
+# `"a[^"']*"` — the second quote now CLOSES the operand and the bare `'`
+# opens a region that runs to end of line. Every quote-aware lexer downstream
+# then reported a malformed payload, so Smart Approval unconditionally blocked
+# commands bash parses without complaint.
+ESCAPED_INNER_QUOTE_COMMANDS = [
+    # The reported production block (2026-08-29): scrape a page, then count
+    # and grep it. Nothing here is a payload, a heredoc, or oversized.
+    (
+        'cd ~/vb_research && curl -sS --compressed --max-time 45 '
+        '-A "Mozilla/5.0" -o sp.html "https://example.invalid/sp/game/31513" ; '
+        'wc -c sp.html; grep -io "brand[^\\"\']*" sp.html | head -5'
+    ),
+    'grep -io "brand[^\\"\']*" page.html',
+    'echo "he said \\"hi\\""',
+    "echo it\\'s fine",
+    'jq -r \'.a\' f.json && grep -o "b[^\\"\']*" g.txt',
+    # A program-bearing option whose value carries the same escaping. The
+    # mechanism must still be reported — just not as "malformed".
+    'rg --pre "x\\"y" .',
+]
+
+
+@pytest.mark.parametrize("command", ESCAPED_INNER_QUOTE_COMMANDS)
+def test_bash_accepts_escaped_inner_quote_commands(command):
+    """Pin the premise: these are valid shell, so a parse failure is ours."""
+    if shutil.which("bash") is None:
+        pytest.skip("bash is not installed")
+
+    completed = subprocess.run(
+        ["bash", "-n", "-c", command], text=True, capture_output=True
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("command", ESCAPED_INNER_QUOTE_COMMANDS)
+def test_escaped_inner_quote_is_not_a_malformed_payload(command):
+    hardline, description = detect_hardline_command(command)
+
+    assert hardline is False, description
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'grep -io "brand[^\\"\']*" page.html',
+        'echo "he said \\"hi\\""',
+        "echo it\\'s fine",
+    ],
+)
+def test_escaped_inner_quote_is_not_dangerous(command):
+    assert detect_dangerous_command(command) == (False, None, None)
+
+
+def test_escaped_inner_quote_reports_the_real_execution_mechanism():
+    """The corrupted parse used to mask `--pre` behind a malformed verdict."""
+    dangerous, _, description = detect_dangerous_command('rg --pre "x\\"y" .')
+
+    assert dangerous is True
+    assert description == "arbitrary program execution via rg --pre"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (
+            'grep -io "a[^\\"\']*" f && rm -rf /',
+            "recursive delete of root filesystem",
+        ),
+        ('grep -io "a[^\\"\']*" f; rm -rf /', "recursive delete of root filesystem"),
+        ('echo "x\\"" && rm -rf ~', "recursive delete of home directory"),
+        ('echo "x\\"" && shutdown -h now', "system shutdown/reboot"),
+        ('echo "x\\"" && (reboot)', "system shutdown/reboot"),
+        ('echo "x\\"" && mkfs.ext4 /dev/sda1', "format filesystem (mkfs)"),
+        (
+            'echo "x\\"" && dd if=/dev/zero of=/dev/sda',
+            "dd to raw block device",
+        ),
+        ("echo it\\'s && sudo rm -rf /", "recursive delete of root filesystem"),
+        # An EVEN number of dissolved escapes keeps the normalized text
+        # balanced but shifts every quote region, so the real `&&` reads as
+        # quoted. The structural re-run must not be gated on "unbalanced".
+        (
+            'echo "x\\"" && rm -rf / && echo "y\\""',
+            "recursive delete of root filesystem",
+        ),
+        (
+            'echo "a\\\\" && rm -rf / && echo "b\\\\" "c"',
+            "recursive delete of root filesystem",
+        ),
+        (
+            'echo "x\\"" && shutdown -h now && echo "y\\""',
+            "system shutdown/reboot",
+        ),
+        # `\\"` (escaped backslash, then a real closing quote) used to slip
+        # past the floor entirely; the re-run catches it.
+        ('echo "a\\\\" && rm -rf /', "recursive delete of root filesystem"),
+    ],
+)
+def test_escaped_inner_quote_cannot_hide_a_hardline_command(command, expected):
+    """The floor must survive the fix, not just the false positive.
+
+    Skipping the malformed block is only safe because the variant pipeline is
+    re-run on quote-faithful text: the corrupted text marks no command start
+    after the escaped quote, so without that re-run these would all pass.
+    """
+    hardline, description = detect_hardline_command(command)
+
+    assert hardline is True
+    assert description == expected
+
+
+def test_structural_rerun_does_not_promote_quoted_data():
+    """A hardline spelling inside a quoted grep pattern is data, not a command."""
+    hardline, description = detect_hardline_command(
+        'grep -P "a[^\\"\']*\\"; rm -rf /" f'
+    )
+
+    assert hardline is False, description
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'grep "unterminated',
+        'grep -io "a[^\\"\']*" f && grep "still unterminated',
+    ],
+)
+def test_genuinely_unbalanced_quoting_still_fails_closed(command):
+    hardline, description = detect_hardline_command(command)
+
+    assert hardline is True
+    assert description == "command parser limit or malformed executable payload"
+
+
 def _time_benign_segments(count):
     command = ";".join(f"printf segment-{index}" for index in range(count))
     started = time.perf_counter()
