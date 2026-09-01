@@ -28,6 +28,15 @@ def mutation_tripwires(monkeypatch):
 
     Returns the list that records which one fired, so a test can assert both
     "nothing ran" and "the first thing that would have run is X".
+
+    ``subprocess.run`` is wired too, but on its own it is not proof of a tree
+    mutation. Since v2026.8.31 the apply path runs a read-only "plan phase"
+    before the first mutating step: ``update_inventory.collect_runtime_inventory``
+    shells out (on macOS, ``launchctl print``) to survey the running fleet,
+    and upstream wraps the whole phase in ``except Exception``, so the
+    tripwire's ``_Sentinel`` merely makes the survey come back empty. Ordering
+    assertions therefore go through :func:`_mutating_only`; the "nothing ran
+    at all" assertions keep ``subprocess.run`` and stay exact.
     """
     fired = []
 
@@ -47,6 +56,23 @@ def mutation_tripwires(monkeypatch):
     monkeypatch.setattr(hermes_main.subprocess, "run", _trip("subprocess.run"))
     monkeypatch.setattr(hermes_main.subprocess, "Popen", _trip("subprocess.Popen"))
     return fired
+
+
+def _mutating_only(fired):
+    """Drop the read-only pre-update probe from a tripwire sequence.
+
+    Verified caller as of v2026.8.31: ``_cmd_update_impl`` -> plan phase ->
+    ``update_inventory.collect_runtime_inventory`` -> ``gateway._get_service_pids``
+    -> ``_launchd_print_service_pid`` -> ``subprocess.run(["launchctl", ...])``.
+    That path only surveys the running fleet; it never touches the checkout.
+
+    Residual gap this accepts: a *mutating* ``subprocess.run`` slipping in
+    ahead of ``_run_pre_update_backup`` would no longer show up in the two
+    "guard is fail-open" assertions. The refusal contract itself — the thing
+    this module exists to pin — is unaffected: the tests that carry it assert
+    ``mutation_tripwires == []`` with ``subprocess.run`` still armed.
+    """
+    return [name for name in fired if name != "subprocess.run"]
 
 
 def _set_updates_config(monkeypatch, updates):
@@ -156,7 +182,7 @@ def test_update_proceeds_when_key_absent(monkeypatch, mutation_tripwires):
     with pytest.raises(_Sentinel):
         hermes_main._cmd_update_impl(SimpleNamespace(), gateway_mode=False)
 
-    assert mutation_tripwires == ["pre_update_backup"]
+    assert _mutating_only(mutation_tripwires) == ["pre_update_backup"]
 
 
 def test_update_proceeds_when_config_read_fails(monkeypatch, mutation_tripwires):
@@ -171,7 +197,7 @@ def test_update_proceeds_when_config_read_fails(monkeypatch, mutation_tripwires)
     with pytest.raises(_Sentinel):
         hermes_main._cmd_update_impl(SimpleNamespace(), gateway_mode=False)
 
-    assert mutation_tripwires == ["pre_update_backup"]
+    assert _mutating_only(mutation_tripwires) == ["pre_update_backup"]
 
 
 def test_check_path_is_unaffected_by_the_guard(monkeypatch, mutation_tripwires):

@@ -172,6 +172,10 @@ def _install_fake_tools_package():
         check_all_command_guards=lambda *args, **kwargs: {"approved": True},
         load_permanent_allowlist=lambda *args, **kwargs: [],
         DANGEROUS_PATTERNS=[],
+        # terminal_tool imports this at module scope for the approval denial
+        # circuit breaker; mirror the real value in tools/approval.py so the
+        # stub stays behaviourally faithful, not just import-satisfying.
+        APPROVAL_BREAKER_METADATA_KEY="approval_breaker",
     )
 
     class _Registry:

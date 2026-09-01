@@ -209,6 +209,58 @@ def test_only_explicit_human_submit_carries_direct_text_authority(
     )
     assert captured[-1]["direct_user_message"] == direct_text
     assert captured[-1]["direct_user_message_provenance"] == "direct_text"
+def test_hosted_terminal_receipt_commits_before_marker_retire(
+    emits, turn_env, marker_home
+):
+    observed = []
+
+    def _run(message, **kwargs):
+        return {"final_response": "done"}
+
+    def _terminal(receipt):
+        observed.append((receipt, read_turn_marker(marker_home, "session-key")))
+
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(agent=agent, running=True, source="bot_room")
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "do the thing",
+        terminal_callback=_terminal,
+    )
+
+    assert observed[0][0]["status"] == "settled"
+    assert observed[0][1] is not None
+    assert read_turn_marker(marker_home, "session-key") is None
+
+
+def test_hosted_terminal_receipt_failure_keeps_crash_marker(
+    emits, turn_env, marker_home
+):
+    def _run(message, **kwargs):
+        return {"final_response": "done"}
+
+    def _terminal(_receipt):
+        raise RuntimeError("state store unavailable")
+
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    session = _session(agent=agent, running=True, source="bot_room")
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "do the thing",
+        terminal_callback=_terminal,
+    )
+
+    assert read_turn_marker(marker_home, "session-key") is not None
 
 
 def test_continuation_turn_records_attempt_and_original_prompt(
@@ -303,6 +355,20 @@ def test_fresh_marker_schedules_continuation(emits, schedule_env, marker_home):
     assert "fix the flaky test" in text
     assert kwargs["display_kind"] == "auto_continue"
     assert ("message.start", "sid", None) in [(e, s, p) for e, s, p in emits]
+
+
+def test_hosted_room_marker_is_left_to_the_driver(schedule_env, marker_home):
+    record_turn_start(marker_home, "session-key", "hosted prompt")
+
+    result = server._maybe_schedule_auto_continue(
+        "sid",
+        _session(source="bot_room"),
+        "session-key",
+    )
+
+    assert result is None
+    assert not schedule_env
+    assert read_turn_marker(marker_home, "session-key") is not None
 
 
 def test_stale_marker_is_cleared_not_continued(schedule_env, marker_home, monkeypatch):

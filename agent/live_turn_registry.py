@@ -276,6 +276,17 @@ class BackgroundReviewHandle:
             return True
 
     def cancel(self, reason: str) -> None:
+        """Flag the review cancelled and request its abort off-thread.
+
+        The cancelled flag and the cancellation event are set synchronously —
+        they are what every gate in the review's startup path reads, and the
+        registry contract is that they hold the moment ``cancel`` returns. The
+        ``interrupt()`` itself is dispatched to a daemon thread: this runs on a
+        LIVE TURN's thread, and a review whose abort hook is slow or wedged
+        must never hold up the foreground (#84423, the same reason
+        ``agent/background_review.py`` offloads its own interrupt in
+        ``_interrupt_background_review``).
+        """
         with self._lock:
             self._cancelled = True
             review_agent = self._agent
@@ -285,13 +296,33 @@ class BackgroundReviewHandle:
                 event.set()
             except Exception:
                 logger.debug("background-review cancel event set failed", exc_info=True)
-        if review_agent is not None:
+        if review_agent is None:
+            return
+
+        session = self.session
+
+        def _interrupt() -> None:
             try:
                 review_agent.interrupt(reason)
             except Exception:
                 logger.debug(
-                    "background-review interrupt failed for %s", self.session, exc_info=True
+                    "background-review interrupt failed for %s", session, exc_info=True
                 )
+
+        try:
+            threading.Thread(
+                target=_interrupt,
+                daemon=True,
+                name="bg-review-cancel",
+            ).start()
+        except Exception:
+            logger.debug(
+                "background-review cancellation thread failed for %s; "
+                "interrupting inline",
+                session,
+                exc_info=True,
+            )
+            _interrupt()
 
 
 def register_background_review(

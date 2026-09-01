@@ -210,8 +210,18 @@ def _run(agent, *, tool_iterations: int, checkpoint_on: set[int] | None = None):
         ),
         patch(
             "run_agent.handle_function_call",
+            # Distinct payload per iteration, for the same reason
+            # ``_seeded_history`` uses distinct results: the tool-loop
+            # guardrail collapses a byte-identical repeat into a short
+            # "refer to the earlier result" note. With a constant blob every
+            # iteration after the first adds ~250 tokens instead of ~3,000,
+            # and the tool loop this file exists to measure never grows.
             lambda name, args, task_id=None, **kwargs: json.dumps(
-                {"ok": True, "blob": "y" * _TOOL_RESULT_CHARS}
+                {
+                    "ok": True,
+                    "call": call_index["n"],
+                    "blob": f"{call_index['n']:04d}" * (_TOOL_RESULT_CHARS // 4),
+                }
             ),
         ),
     ):

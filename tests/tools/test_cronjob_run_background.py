@@ -67,7 +67,7 @@ class TestBackgroundDispatch:
             return True
 
         with _bound_session_key():
-            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True) as m_claim, \
+            with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}) as m_claim, \
                  patch("cron.scheduler.run_one_job", side_effect=slow_run_one_job), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None}):
@@ -81,7 +81,7 @@ class TestBackgroundDispatch:
             assert res["claimed"] is True
             assert res["dispatched"] is True
             assert res["delegation_id"]
-            m_claim.assert_called_once_with("job-bg-01")
+            m_claim.assert_called_once_with("job-bg-01", return_job=True)
             # The job actually starts on the daemon executor.
             assert run_started.wait(timeout=5.0), "job never started in background"
         finally:
@@ -97,7 +97,7 @@ class TestBackgroundDispatch:
         # The runner executes on a daemon thread — the patches must stay
         # active until the completion event lands, so poll INSIDE the blocks.
         with _bound_session_key("agent:main:telegram:dm:777"):
-            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+            with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
                  patch("cron.scheduler.run_one_job", return_value=True), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None,
@@ -132,7 +132,7 @@ class TestBackgroundDispatch:
         from tools.process_registry import process_registry
 
         with _bound_session_key("agent:main:telegram:dm:778"):
-            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+            with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
                  patch("cron.scheduler.run_one_job", return_value=True), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "error",
@@ -203,7 +203,7 @@ class TestSyncFallbacks:
     def test_pool_at_capacity_runs_inline(self):
         """A rejected dispatch must not strand the already-taken claim."""
         with _bound_session_key():
-            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+            with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
                  patch("tools.async_delegation.dispatch_async_delegation",
                        return_value={"status": "rejected", "error": "capacity"}), \
                  patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
@@ -302,7 +302,7 @@ class TestCronjobRunToolIntegration:
         """cronjob(action='run') surfaces the handle + do-not-wait note."""
         with _bound_session_key():
             with patch("tools.cronjob_tools.resolve_job_ref", return_value=_job('job-bg-12')), \
-                 patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+                 patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
                  patch("cron.scheduler.run_one_job", return_value=True), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"id": "job-bg-12", "name": "bg run",
@@ -328,7 +328,7 @@ class TestCronjobRunToolIntegration:
         monkeypatch.setenv("HERMES_SESSION_ASYNC_DELIVERY", "1")
         ran = {"job": "after-run", "last_status": "ok", "last_error": None}
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=_job('job-bg-13')), \
-             patch("tools.cronjob_tools.claim_job_for_fire", return_value=True) as m_claim, \
+             patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}) as m_claim, \
              patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
              patch("tools.cronjob_tools.get_job", return_value=ran):
             out = json.loads(cronjob(action="run", job_id="job-bg-13"))
@@ -336,5 +336,5 @@ class TestCronjobRunToolIntegration:
         assert out["success"] is True
         assert out["job"]["executed"] is True
         assert out["job"]["execution_success"] is True
-        m_claim.assert_called_once_with("job-bg-13")
+        m_claim.assert_called_once_with("job-bg-13", return_job=True)
         m_run.assert_called_once()
