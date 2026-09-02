@@ -1371,6 +1371,52 @@ class TestResolvePreToolBlock:
         msg = resolve_pre_tool_block("terminal", {})
         assert msg is not None and "gate failed" in msg  # fail-closed
 
+    def test_castle_call_shape_blocks_via_registered_hook(
+        self, tmp_path, monkeypatch
+    ):
+        """Pin castle's exact ``resolve_pre_tool_block`` call shape.
+
+        castle's local-coder-enforcer can only stop a tool through this
+        chokepoint, and every dispatch site passes the fork's provenance
+        kwargs from inside a bare ``except Exception``. When the
+        v2026.8.31 merge landed those kwargs on a signature that no
+        longer accepted them, the TypeError was swallowed and *every*
+        ``pre_tool_call`` hook stopped blocking without a single log line.
+
+        ``TestPreToolCallModify.test_dispatch_forwards_direct_user_authority``
+        already guards the kwarg forwarding, but it monkeypatches
+        ``invoke_hook`` — so it stays green even if hook registration or
+        ``VALID_HOOKS`` breaks. This one loads a real plugin from a real
+        HERMES_HOME and spells castle's keyword list out verbatim, so the
+        whole chain (register -> discover -> invoke -> block) is covered.
+        """
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(
+            plugins_dir, "castle_enforcer_probe",
+            register_body=(
+                'ctx.register_hook("pre_tool_call", lambda **kw: '
+                '{"action": "block", "message": '
+                '"castle-block:{}:{}".format('
+                'kw["direct_user_authority_revision"], '
+                'kw["direct_user_authority_kind"])})'
+            ),
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        assert resolve_pre_tool_block(
+            "terminal",
+            {"command": "git push"},
+            task_id="task-1",
+            session_id="session-1",
+            tool_call_id="call-1",
+            turn_id="turn-1",
+            api_request_id="req-1",
+            direct_user_authority_revision=3,
+            direct_user_authority_kind="direct_text",
+        ) == "castle-block:3:direct_text"
+
 
 class TestPreToolCallModify:
     """Tests for the modify action — transforming tool args before dispatch."""
