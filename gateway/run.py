@@ -3018,6 +3018,7 @@ from gateway.platforms.base import (
     _reply_anchor_for_event,
     build_auto_tts_output_path,
     merge_pending_message_event,
+    safe_url_for_log,
     utf16_len,
 )
 from gateway.shutdown_watchdog import (
@@ -3510,6 +3511,146 @@ def _event_media_is_video(event, index: int) -> bool:
     if mtype:
         return mtype.startswith("video/")
     return getattr(event, "message_type", None) == MessageType.VIDEO
+
+
+# ---------------------------------------------------------------------------
+# Native image attachment: remote refs -> local cache files
+#
+# ``agent.image_routing.build_native_content_parts`` reads its ``image_paths``
+# argument *from disk*.  Adapters normally hand us a local cache path, but they
+# fall back to the platform CDN link when caching fails -- the Discord adapter
+# does exactly that (``plugins/platforms/discord/adapter.py``, "Fall back to
+# the CDN URL if caching fails"), and an AVIF screenshot triggers it today
+# because ``gateway.platforms.base._looks_like_image`` doesn't know AVIF magic
+# bytes, so ``cache_image_from_bytes`` refuses the payload.  A URL that reaches
+# the native path is then reported as an unreadable path and the picture
+# silently drops out of the turn.
+#
+# We materialise those URLs ourselves rather than routing them to
+# ``build_native_content_parts(image_urls=...)``: that argument hands the raw
+# link to the provider and depends on a *server-side* fetch, which a local
+# backend (mlx-serve) does not perform, and the signed CDN link expires
+# (Discord stamps an ``?ex=`` deadline on it).  Downloading also lets the
+# format normalisation in ``image_routing`` run, so an AVIF/HEIC attachment is
+# transcoded to PNG before it reaches the provider.
+#
+# Destination is the ordinary image cache, not a private temp dir, for two
+# reasons: the hourly janitor (``cleanup_image_cache``) already prunes it, and
+# ``tools/image_source.py::_media_cache_roots`` whitelists it for host reads
+# under a sandboxed terminal backend -- a ``/tmp`` file would be unreadable
+# there, so the ``[Image attached at: ...]`` hint would point at nothing the
+# agent's own vision tools could open.
+# ---------------------------------------------------------------------------
+
+_REMOTE_NATIVE_IMAGE_SCHEMES = ("http://", "https://")
+
+
+def _is_remote_native_image_ref(value: Any) -> bool:
+    """True when *value* is an ``http(s)`` URL rather than a local path."""
+    return (
+        isinstance(value, str)
+        and value.strip().lower().startswith(_REMOTE_NATIVE_IMAGE_SCHEMES)
+    )
+
+
+def _native_image_download_max_bytes() -> int:
+    """Streaming byte cap for one remote native-image download.
+
+    Starts at the provider payload ceiling (``vision_tools._MAX_BASE64_BYTES``,
+    20 MiB): past it no major vision provider accepts the image, so pulling
+    more bytes only wastes bandwidth and disk.  An operator who configured a
+    *tighter* ``gateway.max_inbound_media_bytes`` wins -- this is inbound
+    platform media and that cap governs every other inbound path.
+    """
+    from tools.vision_tools import _MAX_BASE64_BYTES
+
+    cap = _MAX_BASE64_BYTES
+    try:
+        from gateway.platforms.base import get_inbound_media_max_bytes
+
+        inbound = get_inbound_media_max_bytes()
+    except Exception:
+        inbound = 0
+    if inbound and 0 < inbound < cap:
+        cap = inbound
+    return cap
+
+
+def _native_image_cache_suffix(url: str) -> str:
+    """Cosmetic file suffix for a downloaded native image.
+
+    ``image_routing`` sniffs magic bytes, so the extension never decides how
+    the image is typed; it only keeps cache files browsable.  Anything that
+    isn't a short alphanumeric extension is discarded so a hostile URL can't
+    steer the on-disk filename.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        suffix = Path(urlsplit(url).path).suffix.lower()
+    except Exception:
+        return ".img"
+    return suffix if re.fullmatch(r"\.[a-z0-9]{1,8}", suffix or "") else ".img"
+
+
+async def _materialize_remote_native_image_paths(
+    paths: List[str],
+) -> Tuple[List[str], List[str]]:
+    """Download ``http(s)`` entries in *paths* into the local image cache.
+
+    Local paths are returned untouched and in their original order, so the
+    behaviour of an all-local turn is bit-for-bit what it was before.  A URL
+    whose download fails is *also* returned untouched: the native attachment
+    path then reports it as an unreadable path exactly as it does today, so a
+    failure degrades to the pre-existing "skipped" behaviour instead of
+    inventing a new one.
+
+    Returns ``(resolved_paths, failed_urls)``; ``failed_urls`` is for logging.
+    """
+    if not any(_is_remote_native_image_ref(p) for p in paths):
+        return list(paths), []
+
+    import uuid as _uuid
+
+    from gateway.platforms.base import get_image_cache_dir
+    from tools.vision_tools import _download_image
+
+    max_bytes = _native_image_download_max_bytes()
+    cache_dir = get_image_cache_dir()
+    resolved: List[str] = []
+    failed: List[str] = []
+    for raw in paths:
+        if not _is_remote_native_image_ref(raw):
+            resolved.append(raw)
+            continue
+        url = raw.strip()
+        destination = cache_dir / f"img_{_uuid.uuid4().hex[:12]}{_native_image_cache_suffix(url)}"
+        try:
+            # ``_download_image`` owns the SSRF-safe client, the per-redirect
+            # SSRF re-check, the website-policy gate and the streaming size
+            # cap.  One retry only: a turn is latency-sensitive and a signed
+            # CDN link that 403s will not start working on attempt three.
+            await _download_image(
+                url, destination, max_retries=2, max_bytes=max_bytes,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Native image attachment: could not download %s -- %s",
+                safe_url_for_log(url), exc,
+            )
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+            failed.append(raw)
+            resolved.append(raw)
+            continue
+        logger.info(
+            "Native image attachment: downloaded %s -> %s",
+            safe_url_for_log(url), destination,
+        )
+        resolved.append(str(destination))
+    return resolved, failed
 
 
 def _build_media_placeholder(event) -> str:
@@ -19821,6 +19962,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key=session_key,
                 )
                 if _img_mode == "native":
+                    # Any attachment the adapter could not cache locally is
+                    # still a platform CDN URL here, and the native path reads
+                    # its inputs from disk. Pull those down now (see
+                    # ``_materialize_remote_native_image_paths``) — we are on
+                    # the event loop and can await, unlike the consuming
+                    # ``TurnRunner.run_sync``, which runs off-loop.
+                    image_paths, _remote_failed = (
+                        await _materialize_remote_native_image_paths(image_paths)
+                    )
+                    if _remote_failed:
+                        logger.warning(
+                            "Image routing: %d remote image(s) could not be "
+                            "downloaded and will be skipped: %s",
+                            len(_remote_failed),
+                            [safe_url_for_log(u) for u in _remote_failed],
+                        )
                     # Defer attachment to the run_conversation call site.
                     self._session_state(
                         session_key

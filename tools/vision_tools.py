@@ -550,23 +550,41 @@ async def _stream_download_to_file(
     return destination
 
 
-async def _download_image(image_url: str, destination: Path, max_retries: int = 3) -> Path:
+async def _download_image(
+    image_url: str,
+    destination: Path,
+    max_retries: int = 3,
+    *,
+    max_bytes: Optional[int] = None,
+) -> Path:
     """
     Download an image from a URL to a local destination (async) with retry logic.
-    
+
     Args:
         image_url (str): The URL of the image to download
         destination (Path): The path where the image should be saved
         max_retries (int): Maximum number of retry attempts (default: 3)
-        
+        max_bytes (Optional[int]): Streaming size cap for this download.
+            Defaults to the module's 50 MB ingest ceiling.  Callers with a
+            tighter budget (e.g. the gateway attaching an inbound image
+            straight to a provider payload) pass their own so oversized
+            bytes are refused mid-stream instead of after 50 MB has landed
+            on disk.  Non-positive values fall back to the default.
+
     Returns:
         Path: The path to the downloaded image
-        
+
     Raises:
         Exception: If download fails after all retries
     """
     import asyncio
-    
+
+    size_cap = (
+        max_bytes
+        if max_bytes is not None and max_bytes > 0
+        else _VISION_MAX_DOWNLOAD_BYTES
+    )
+
     # Create parent directories if they don't exist
     destination.parent.mkdir(parents=True, exist_ok=True)
     
@@ -609,7 +627,7 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
                     client,
                     image_url,
                     destination,
-                    _VISION_MAX_DOWNLOAD_BYTES,
+                    size_cap,
                     headers={
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                         "Accept": "image/*,*/*;q=0.8",
