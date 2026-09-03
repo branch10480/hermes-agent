@@ -276,6 +276,15 @@ def _detect_image_mime_type_from_bytes(data: bytes) -> Optional[str]:
         return "image/bmp"
     if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
         return "image/webp"
+    # AVIF / HEIC. Same shared brand table the inbound cache gate uses, so a
+    # photo that reached the cache is never rejected as "not a recognized
+    # image" here. ISO-BMFF *video* keeps returning None and falls through to
+    # the video sniffers in tools.image_source.
+    from agent.image_routing import sniff_iso_bmff_image_mime
+
+    iso_bmff = sniff_iso_bmff_image_mime(header)
+    if iso_bmff is not None:
+        return iso_bmff
     return None
 
 
@@ -349,9 +358,9 @@ def _normalize_to_supported_image(
       - If conversion is impossible: ``(None, None, <error message>)``.
 
     SVG is rasterized to PNG (best-effort, soft deps).  Other raster formats
-    Pillow can read (BMP, TIFF, etc.) are re-encoded to PNG.  This runs BEFORE
-    the image is base64-embedded into conversation history, so an unsupported
-    media_type can never reach the provider and wedge the session.
+    Pillow can read (BMP, TIFF, AVIF, HEIC, ...) are re-encoded to PNG.  This
+    runs BEFORE the image is base64-embedded into conversation history, so an
+    unsupported media_type can never reach the provider and wedge the session.
     """
     if detected_mime in _ANTHROPIC_SUPPORTED_MEDIA_TYPES:
         return image_path, detected_mime, None
@@ -374,15 +383,19 @@ def _normalize_to_supported_image(
             "(`pip install cairosvg`) — then re-run vision_analyze on the PNG.",
         )
 
-    # Other non-supported raster formats (BMP, TIFF, ...): re-encode via Pillow.
+    # Other non-supported raster formats (BMP, TIFF, AVIF, HEIC, ...):
+    # re-encode via the shared Pillow transcoder.  Reused rather than
+    # re-implemented because HEIC/HEIF needs ``pillow_heif`` registered as an
+    # opener before ``Image.open`` recognises it -- a bare ``Image.open`` here
+    # would reject every iPhone photo the inbound cache now accepts.
     try:
-        from PIL import Image as _PILImage
-        with _PILImage.open(image_path) as _img:
-            if _img.mode not in ("RGB", "RGBA", "L"):
-                _img = _img.convert("RGBA")
-            _img.save(out_path, format="PNG")
-        if out_path.exists() and out_path.stat().st_size > 0:
-            return out_path, "image/png", None
+        from agent.image_routing import _transcode_to_png
+
+        png_bytes = _transcode_to_png(image_path.read_bytes())
+        if png_bytes:
+            out_path.write_bytes(png_bytes)
+            if out_path.exists() and out_path.stat().st_size > 0:
+                return out_path, "image/png", None
     except Exception as _exc:
         logger.warning("Failed to normalize %s image to PNG: %s",
                        detected_mime, _exc)

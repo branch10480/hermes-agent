@@ -59,7 +59,8 @@ _VALID_MODES = frozenset({"auto", "native", "text"})
 # them differently (send_document), and we don't want to attach a PDF as a
 # vision part.
 _IMAGE_EXTS = (
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".heic",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif",
+    ".heic", ".heif", ".avif",
 )
 _IMAGE_EXT_PATTERN = "|".join(e.lstrip(".") for e in _IMAGE_EXTS)
 
@@ -629,6 +630,41 @@ def decide_image_input_mode(
 # it fires, which is cheaper than permanent quality loss.
 
 
+# ISO base media file format (ISO-BMFF) brands that mean "this box holds a
+# still image", split by the MIME we report for them.  The container is shared
+# with video (MP4/MOV), so ONLY the brand separates a HEIC photo from an
+# ``.mp4`` clip: ``isom`` / ``mp42`` / ``qt  `` / ``M4V `` stay unrecognised
+# here and fall through to the video sniffers.
+_ISO_BMFF_AVIF_BRANDS = frozenset({b"avif", b"avis"})
+_ISO_BMFF_HEIC_BRANDS = frozenset({
+    b"heic", b"heix", b"hevc", b"hevx",
+    b"mif1", b"msf1", b"heim", b"heis",
+})
+
+
+def sniff_iso_bmff_image_mime(raw: bytes) -> Optional[str]:
+    """Return ``image/avif`` / ``image/heic`` for ISO-BMFF still-image bytes.
+
+    Returns ``None`` for anything else, including ISO-BMFF *video* files —
+    the ``ftyp`` box is common to both families and only the major brand
+    tells them apart.
+
+    Single source of truth for the brand table.  ``gateway.platforms.base``
+    (`_looks_like_image`, the inbound cache gate) and ``tools.vision_tools``
+    (`_detect_image_mime_type_from_bytes`, the vision resolver) both call
+    this, so an AVIF screenshot or an iPhone HEIC is recognised identically
+    at every hop instead of being rejected as "not an image" at one of them.
+    """
+    if len(raw) < 12 or raw[4:8] != b"ftyp":
+        return None
+    brand = raw[8:12]
+    if brand in _ISO_BMFF_AVIF_BRANDS:
+        return "image/avif"
+    if brand in _ISO_BMFF_HEIC_BRANDS:
+        return "image/heic"
+    return None
+
+
 def _sniff_mime_from_bytes(raw: bytes) -> Optional[str]:
     """Detect image MIME from magic bytes. Returns None if unrecognised.
 
@@ -657,15 +693,9 @@ def _sniff_mime_from_bytes(raw: bytes) -> Optional[str]:
     if raw.startswith(b"BM"):
         return "image/bmp"
     # ISO-BMFF family (HEIC/HEIF/AVIF): bytes 4..8 == 'ftyp', major brand at 8..12
-    if len(raw) >= 12 and raw[4:8] == b"ftyp":
-        brand = raw[8:12]
-        if brand in {b"avif", b"avis"}:
-            return "image/avif"
-        if brand in {
-            b"heic", b"heix", b"hevc", b"hevx",
-            b"mif1", b"msf1", b"heim", b"heis",
-        }:
-            return "image/heic"
+    iso_bmff = sniff_iso_bmff_image_mime(raw)
+    if iso_bmff is not None:
+        return iso_bmff
     # TIFF: II*\0 (little-endian) or MM\0* (big-endian)
     if raw[:4] in {b"II*\x00", b"MM\x00*"}:
         return "image/tiff"

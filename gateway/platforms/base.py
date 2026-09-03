@@ -880,7 +880,16 @@ def get_image_cache_dir() -> Path:
 
 
 def _looks_like_image(data: bytes) -> bool:
-    """Return True if *data* starts with a known image magic-byte sequence."""
+    """Return True if *data* starts with a known image magic-byte sequence.
+
+    Gate in front of the inbound image cache: a platform that hands us an
+    HTML error page instead of the picture must not get it saved as
+    ``img_xxx.png``.  Every format a platform can legitimately deliver has to
+    be listed here, because a false negative is not a cosmetic miss --
+    ``cache_image_from_bytes`` raises, the adapter falls back to the platform
+    CDN link, and the picture drops out of the turn once that link expires or
+    refuses an unauthenticated fetch.
+    """
     if len(data) < 4:
         return False
     if data[:8] == b"\x89PNG\r\n\x1a\n":
@@ -892,6 +901,14 @@ def _looks_like_image(data: bytes) -> bool:
     if data[:2] == b"BM":
         return True
     if data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP":
+        return True
+    # AVIF (Chromium screenshots, Discord re-encodes) and HEIC/HEIF (iPhone
+    # photos) ride the ISO-BMFF container that MP4/MOV video also uses, so the
+    # major brand -- not the ``ftyp`` box -- decides.  Delegated to the shared
+    # brand table so this cache gate and the vision resolver cannot drift.
+    from agent.image_routing import sniff_iso_bmff_image_mime
+
+    if sniff_iso_bmff_image_mime(data) is not None:
         return True
     return False
 

@@ -8463,9 +8463,16 @@ class DiscordAdapter(BasePlatformAdapter):
             content_type = att.content_type or "unknown"
             if content_type.startswith("image/"):
                 try:
-                    # Determine extension from content type (image/png -> .png)
+                    # Determine extension from content type (image/png -> .png).
+                    # ``.avif`` / ``.heic`` / ``.heif`` are on the list because
+                    # Discord serves both (AVIF from Chromium screenshots, HEIC
+                    # from iPhone uploads) and mislabelling one ``.jpg`` leaves
+                    # a cache file whose name contradicts its bytes.
                     ext = "." + content_type.split("/")[-1].split(";")[0]
-                    if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+                    if ext not in {
+                        ".jpg", ".jpeg", ".png", ".gif", ".webp",
+                        ".avif", ".heic", ".heif",
+                    }:
                         ext = ".jpg"
                     cached_path = await self._cache_discord_image(att, ext)
                     media_urls.append(cached_path)
