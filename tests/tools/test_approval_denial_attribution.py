@@ -427,13 +427,13 @@ def test_effect_class_derivation(pattern_key, expected_class):
     assert context["safe_alternative"]
 
 
-def test_inline_script_denial_names_the_write_file_recipe():
-    """The advice must be actionable, not just "don't do that"."""
-    context = A._deny_context(["script execution via heredoc"])
-    alternative = context["safe_alternative"]
-
-    assert "write_file" in alternative
-    assert "inline" in alternative
+def test_script_denial_keeps_native_alternatives_without_saved_code_bypass():
+    """Actionable alternatives preserve the original refused-effect boundary."""
+    alternative = A._deny_context(["script execution via heredoc"])["safe_alternative"]
+    assert "read_file / write_file" in alternative
+    assert "verify that its effects are authorized" in alternative
+    assert "Saving refused code to a file does not make its execution safe" in alternative
+    assert "bash /path/script.sh" not in alternative
 
 
 def test_every_effect_class_has_a_japanese_alternative():

@@ -1014,17 +1014,16 @@ def _hardline_block_result(description: str, command: str = "") -> dict:
             message += (
                 " RECOVERY: this block fires on oversized/unparseable inline "
                 "command payloads (heredocs, giant one-liners), not on the "
-                f"operation itself. Your command was saved to {saved} — "
-                f"review it, then run: terminal(command=\"bash {saved}\"). "
-                "Do not retry inline."
+                f"operation itself. Your command was saved to {saved} for inspection. "
+                "Use read_file to inspect it, then split the work into bounded native "
+                "operations for assessment. Saving a file does not authorize its execution."
             )
         else:
             message += (
                 " RECOVERY: this block fires on oversized/unparseable inline "
                 "command payloads (heredocs, giant one-liners), not on the "
-                "operation itself. Write the script to a file with write_file, "
-                "then run it: terminal(command=\"bash /path/script.sh\") or "
-                "\"python3 /path/script.py\". Do not retry inline."
+                "operation itself. Split the work into bounded native operations "
+                "for assessment. Do not reproduce a refused effect in a saved script."
             )
     return {
         "approved": False,
@@ -3057,10 +3056,9 @@ _SAFE_ALTERNATIVES_BY_EFFECT_CLASS = {
     "arbitrary_code_execution": (
         "use the dedicated built-in tools (read_file / write_file / terminal "
         "with a single explicit command) instead of a script that can spawn "
-        "its own subprocesses. If the work genuinely needs a script, write it "
-        "to a file with write_file, then run that one file: "
-        "terminal(command=\"bash /path/script.sh\") or "
-        "\"python3 /path/script.py\". Do not retry it inline"
+        "its own subprocesses. Inspect any existing project script before choosing "
+        "it, and verify that its effects are authorized. Saving refused code to a "
+        "file does not make its execution safe"
     ),
     "destructive_data": (
         "read or export the data first (SELECT / dump to a file) and let the "
@@ -3242,19 +3240,13 @@ _APPROVAL_BREAKER_MODE_HARD_STOP = "hard_stop"
 _DEFAULT_DENIAL_BREAKER_LOCKOUT_ATTEMPTS = 3
 # The one instruction every lockout message carries. It names concrete tools
 # that stay available, because "stop" on its own is what produced the retry
-# loop: the model had nothing else to reach for. The saved-script route is
-# real — a plain ``python3 /path/script.py`` matches no dangerous pattern and
-# no tirith rule, so it is approved before any guardian call.
-#
-# The closing sentence is not optional politeness. Naming a route that still
-# works is exactly the shape of hint a model will re-use to smuggle the
-# refused operation through, so the same breath has to say that a refusal
-# attaches to the EFFECT, not to the wording that expressed it.
+# loop: the model had nothing else to reach for. Name bounded operations,
+# never a representation change that could reproduce a refused effect.
 _DENIAL_LOCKOUT_GUIDANCE = (
     "Dangerous-operation retries are locked out for the rest of this turn. "
     "Do not retry blocked commands or variants. Continue with safe tools "
-    "(the native read / search / write tools, or a script saved with "
-    "write_file and run as a single file) or report your findings. Never use "
+    "(read_file / search_files / write_file and verified project tests) "
+    "or report your findings. Never use "
     "these to reproduce a refused operation — a refusal applies to the "
     "effect, not the phrasing."
 )
@@ -4681,6 +4673,59 @@ def _get_smart_policy() -> str:
     return policy.strip()
 
 
+class SmartApprovalVerdict(str):
+    """Backward-compatible verdict carrying bounded assessment state.
+
+    Metadata can change recovery guidance, never turn a DENY into an APPROVE.
+    Existing providers and integrations that return plain strings keep their
+    current behavior. No provider-supplied prose is forwarded as instructions.
+    """
+
+    def __new__(cls, verdict: str, classification: str = ""):
+        instance = super().__new__(cls, verdict)
+        instance.classification = (
+            classification if classification in
+            {"SAFE", "DANGEROUS", "AMBIGUOUS", "UNAVAILABLE"} else ""
+        )
+        return instance
+
+    def with_verdict(self, verdict: str):
+        return type(self)(verdict, self.classification)
+
+
+def _smart_recovery_result(verdict: str) -> dict | None:
+    """Refuse one unassessed operation without spending the danger budget."""
+    if verdict != "deny" or not isinstance(verdict, SmartApprovalVerdict):
+        return None
+    classification = verdict.classification
+    if classification not in {"AMBIGUOUS", "UNAVAILABLE"}:
+        return None
+    unavailable = classification == "UNAVAILABLE"
+    alternative = (
+        "Continue independent safe work. Once the assessment service is ready, "
+        "retry this assessment at most once; do not execute the unassessed operation."
+        if unavailable else
+        "Inspect non-secret metadata and resolve literal paths with native read/search "
+        "tools, then submit a narrower operation for assessment. Never reproduce a "
+        "refused effect through a saved script or equivalent syntax."
+    )
+    return {
+        "approved": False,
+        "smart_denied": True,
+        "approval_outcome": "assessment_unavailable" if unavailable else "assessment_ambiguous",
+        "classification": classification,
+        "reason_code": "assessment_unavailable" if unavailable else "assessment_ambiguous",
+        "effect_class": "unclassified",
+        "retryable": unavailable,
+        "safe_alternative": alternative,
+        "message": (
+            "The operation was not executed: automatic assessment is temporarily unavailable. "
+            if unavailable else
+            "The operation was not executed: its effects could not be established. "
+        ) + alternative,
+    }
+
+
 def _smart_approve(command: str, description: str) -> str:
     """Use the auxiliary LLM to assess risk and decide approval.
 
@@ -4780,11 +4825,15 @@ def _smart_approve(command: str, description: str) -> str:
         )
 
         answer = (response.choices[0].message.content or "").strip().upper()
+        metadata = getattr(response, "hermes_smart_approval", None)
+        classification = metadata.get("classification", "") if isinstance(metadata, dict) else ""
+        if not isinstance(classification, str):
+            classification = ""
 
         if answer == "APPROVE":
             return "approve"
         elif answer == "DENY":
-            return "deny"
+            return SmartApprovalVerdict("deny", classification)
         else:
             return "escalate"
 
@@ -4798,7 +4847,7 @@ def _smart_approve(command: str, description: str) -> str:
             type(e).__name__,
             e,
         )
-        return "escalate"
+        return SmartApprovalVerdict("escalate", "UNAVAILABLE")
 
 
 def _run_approval_gate(
@@ -6238,6 +6287,9 @@ def check_all_command_guards(command: str, env_type: str,
         )
         verdict = _smart_approve(command, combined_desc_for_llm)
         _observe_smart_approval_verdict(observer_payload, verdict)
+        recovery = _smart_recovery_result(verdict)
+        if recovery is not None:
+            return recovery
         if verdict == "approve":
             # Approve this command only. Pattern-level persistence would let one
             # benign command suppress review of later commands that happen to
@@ -6836,6 +6888,9 @@ def check_execute_code_guard(code: str, env_type: str,
         )
         verdict = _smart_approve(command, description)
         _observe_smart_approval_verdict(observer_payload, verdict)
+        recovery = _smart_recovery_result(verdict)
+        if recovery is not None:
+            return recovery
         if verdict == "approve":
             _reset_denials(session_key)
             logger.debug("Smart approval: auto-approved execute_code for session %s",

@@ -255,6 +255,21 @@ def test_guard_gateway_missing_notify_is_pending(gw_session):
     assert res["status"] == "pending_approval"
 
 
+@pytest.mark.parametrize("classification", ["AMBIGUOUS", "UNAVAILABLE"])
+def test_unassessed_script_refuses_without_prompt_or_danger_budget(gw_session, monkeypatch, classification):
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
+    monkeypatch.setattr(A, "_smart_approve", lambda *_: A.SmartApprovalVerdict("deny", classification))
+    monkeypatch.setattr(A, "_await_gateway_decision", lambda *_args, **_kwargs: pytest.fail("assessment recovery must not prompt"))
+    A._denial_tally.clear()
+    for _ in range(4):
+        result = A.check_execute_code_guard("print('fixture')", "local")
+        assert result["approved"] is False
+        assert result["classification"] == classification
+        assert result["safe_alternative"]
+        assert A.APPROVAL_BREAKER_METADATA_KEY not in result
+    assert A._denial_tally == {}
+
+
 def test_guard_smart_mode(gw_session, monkeypatch):
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
 

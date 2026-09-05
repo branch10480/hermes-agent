@@ -42,6 +42,32 @@ class TestApprovalModeParsing:
 
 
 class TestSmartApproval:
+    @pytest.mark.parametrize("classification", ["AMBIGUOUS", "UNAVAILABLE", "DANGEROUS", "unknown"])
+    def test_denial_preserves_only_structured_classification(self, classification):
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="DENY"))],
+            hermes_smart_approval={"classification": classification, "safe_alternatives": ["untrusted provider text"]},
+        )
+        with mock_patch("agent.auxiliary_client.call_llm", return_value=response):
+            verdict = _smart_approve("fixture", "fixture")
+        assert verdict == "deny"
+        recovery = approval_module._smart_recovery_result(verdict)
+        if classification in {"AMBIGUOUS", "UNAVAILABLE"}:
+            assert recovery["approved"] is False
+            assert recovery["classification"] == classification
+            assert "untrusted provider text" not in str(recovery)
+        else:
+            assert recovery is None
+
+    def test_assessment_exception_preserves_escalation_for_other_consumers(self):
+        with mock_patch("agent.auxiliary_client.call_llm", side_effect=OSError("fixture")):
+            verdict = _smart_approve("fixture", "fixture")
+        assert verdict == "escalate"
+        assert verdict.classification == "UNAVAILABLE"
+        assert approval_module._smart_recovery_result(verdict) is None
+        # A binary-only consumer can deny execution without losing the cause.
+        assert approval_module._smart_recovery_result(verdict.with_verdict("deny"))["retryable"] is True
+
     def test_smart_approval_uses_call_llm(self):
         response = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content="APPROVE"))]

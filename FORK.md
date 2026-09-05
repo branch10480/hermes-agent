@@ -103,6 +103,12 @@ castle は 40 桁の revision を 2 箇所に焼いている:
 
 ---
 
+### Smart Approval の復旧用メタデータ
+
+`tools.approval.SmartApprovalVerdict` は既存の文字列 verdict と互換にし、proxy の `hermes_smart_approval.classification` だけを保持する。castle の binary wrapper が `escalate` を `deny` にしても、`AMBIGUOUS` / `UNAVAILABLE` は実行拒否を保ちつつ危険操作の連続拒否回数から外れる。未知の分類や通常の文字列 `deny` は従来の拒否処理を通る。provider の自由文は復旧指示に使わない。
+
+コマンドと `execute_code` の両経路でこの詳細を受け取り、安全な別操作を提示する。拒否されたコードを保存し直すことは許可の根拠にしない。castle の `scripts/test-hermes-smart-approval-integration.py` が実 proxy → core → plugin → breaker を通して、サービス不調と危険操作を分ける契約を検証する。
+
 ## 2. 次の upstream merge で先に取り込む commit
 
 2026-09-02 時点で `HEAD..upstream/main` は 297 commit。全部を一度に入れる前に、

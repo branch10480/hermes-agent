@@ -131,9 +131,9 @@ logger = logging.getLogger(__name__)
 # by an older build still renders.
 _SAFE_ALTERNATIVE_JA_BY_EFFECT_CLASS = {
     "arbitrary_code_execution": (
-        "スクリプトをインラインで実行せず、write_file で一度ファイルに書き出し、"
-        "そのファイルだけを単一の明示コマンド（bash /path/script.sh、"
-        "python3 /path/script.py など）として実行する"
+        "read_file / write_file などの専用ツールで必要な操作に絞る。"
+        "既存のプロジェクトスクリプトを使う場合は内容と許可された作用を確かめる。"
+        "拒否されたコードを保存し直しても、実行が安全になったことにはならない"
     ),
     "destructive_data": (
         "先に SELECT やダンプでデータを読み出しておき、破壊的な文の実行は"
