@@ -16,6 +16,8 @@
 # Usage:
 #   scripts/run_tests.sh                            # full suite
 #   scripts/run_tests.sh -j 4                       # cap parallelism
+#   scripts/run_tests.sh --python /path/to/venv/bin/python tests/agent/
+#                                                  # explicit Python; flag must be first
 #   scripts/run_tests.sh tests/agent/               # discover only here
 #   scripts/run_tests.sh tests/agent/ tests/acp/    # multiple roots
 #   scripts/run_tests.sh tests/foo.py               # single file
@@ -38,6 +40,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Locate python ───────────────────────────────────────────────────────────
+# Automated runtime validation must use exactly the requested environment,
+# even when the checkout also contains a separate development .venv.
+EXPLICIT_PYTHON=""
+if [ "${1:-}" = --python ]; then
+  if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+    echo "error: --python requires an executable path" >&2
+    exit 2
+  fi
+  EXPLICIT_PYTHON="$2"
+  shift 2
+  # Preserve relative paths after the runner changes into REPO_ROOT below.
+  case "$EXPLICIT_PYTHON" in
+    /*) ;;
+    *) EXPLICIT_PYTHON="$PWD/$EXPLICIT_PYTHON" ;;
+  esac
+  if [ ! -x "$EXPLICIT_PYTHON" ] \
+      || ! "$EXPLICIT_PYTHON" -I -c 'import pytest' 2>/dev/null; then
+    echo "error: --python must name an executable with pytest installed; refusing fallback" >&2
+    exit 1
+  fi
+fi
+
 # Probe local venvs first; fall back to the Nix devShell's editable venv
 # (HERMES_PYTHON is exported by the devShell hook and ships [dev] extras:
 # pytest, pytest-asyncio, pytest-timeout, ruff, ty).
@@ -52,6 +76,7 @@ VENV=""
 VENV_PYTHON=""
 SKIPPED_VENVS=""
 for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
+  [ -z "$EXPLICIT_PYTHON" ] || break
   if [ -f "$candidate/bin/activate" ]; then
     if "$candidate/bin/python" -c 'import pytest' 2>/dev/null; then
       VENV="$candidate"
@@ -80,7 +105,9 @@ if [ -n "$SKIPPED_VENVS" ]; then
   done
 fi
 
-if [ -n "$VENV" ]; then
+if [ -n "$EXPLICIT_PYTHON" ]; then
+  PYTHON="$EXPLICIT_PYTHON"
+elif [ -n "$VENV" ]; then
   PYTHON="$VENV_PYTHON"
 elif [ -n "${HERMES_PYTHON:-}" ] && [ -x "$HERMES_PYTHON" ] \
     && "$HERMES_PYTHON" -c 'import pytest' 2>/dev/null; then

@@ -100,6 +100,10 @@ castle は 40 桁の revision を 2 箇所に焼いている:
 同期は checkout が clean で、HEAD が対象 branch の remote OID と一致し、従来 pin から
 fast-forward できる場合だけ成功する。未公開 commit を先に pin しない。
 
+テスト用 `.venv` と実行用 `venv` は共存できる。castle の更新検証は
+`scripts/run_tests.sh --python <実行用venvのPython>` で対象環境を明示し、指定先が
+使えなければ他の環境へ切り替えず停止する。通常のテスト実行は従来の選択順を保つ。
+
 ---
 
 ### Smart Approval の復旧用メタデータ
