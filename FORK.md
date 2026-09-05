@@ -87,7 +87,7 @@ castle は 40 桁の revision を 2 箇所に焼いている:
 - `scripts/setup-hermes-local-llm-safety.sh` の `expected_hermes_revision`
 - `scripts/test-hermes-local-coder-enforcer.py` の `VERIFIED_HERMES_REVISION`
 
-現在の pin: `10ff3cda893bfbf6638c71a00fb72a26303806b1`
+現在の pin は上記 2 ファイルを参照する。この文書には可変の revision を重複させない。
 
 ⚠️ **この checkout の working tree が完全に clean でないと `nrs` が落ちる。**
 `verify_hermes_core_contract()` は
@@ -95,11 +95,10 @@ castle は 40 桁の revision を 2 箇所に焼いている:
 `~/.hermes/hermes-agent` はこの checkout への symlink なので、
 **untracked ファイルを 1 つ置くだけで darwin-rebuild が止まる**。
 
-> ⚠️ **この FORK.md 自体がその罠に該当する。** 作成時点では commit していないため、
-> 暫定で `.git/info/exclude` に `/FORK.md` を足して `git status` から隠してある。
-> 正しく片付けるには `git add -f FORK.md` → fork branch へ commit → castle 側を
-> `hermesup --pin-current`（`scripts/update-hermes-core.sh --pin-current`）で再 pin →
-> `.git/info/exclude` の行を削除、の順。
+`FORK.md` は追跡済み。新しい変更は fork branch へ commit・push してから、castle 側の
+`hermesup --pin-current`（`scripts/update-hermes-core.sh --pin-current`）で再 pin する。
+同期は checkout が clean で、HEAD が対象 branch の remote OID と一致し、従来 pin から
+fast-forward できる場合だけ成功する。未公開 commit を先に pin しない。
 
 ---
 
