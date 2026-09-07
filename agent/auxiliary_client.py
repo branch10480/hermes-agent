@@ -3574,18 +3574,31 @@ def _relay_sync_completion(
     create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
     callback = create or (lambda request: client.chat.completions.create(**request))
+    from agent import external_pause
+    pause_cancel_check = _capture_aux_cancel_check()
+
+    def protected_call(request):
+        try:
+            return external_pause.call(
+                lambda: _run_protected_sync_provider_call(callback, request),
+                str(getattr(client, "base_url", "")),
+                should_abort=pause_cancel_check,
+            )
+        except InterruptedError:
+            raise AuxiliaryExplicitCancellation()
+
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     # Protected compression calls isolate only the provider callback and stream
     # aggregation.  The owning thread remains free to unwind its lease/DB
     # transaction on hard cancel without touching the process-shared client.
     if route is None:
-        return _run_protected_sync_provider_call(callback, kwargs)
+        return protected_call(kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
 
     return relay_llm.execute_current(
         kwargs,
-        lambda request: _run_protected_sync_provider_call(callback, request),
+        protected_call,
         name=provider_name,
         model_name=str(kwargs.get("model") or fallback_model),
         metadata=metadata,

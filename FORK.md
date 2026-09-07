@@ -45,6 +45,7 @@ castle の plugin は upstream 由来の hook も使う。こちらは rename �
 - `agent/direct_user_authority.py` — `claim_cloud_egress` / `claim_publication` /
   `issue_bound_capability` / `current_revision`
 - `agent/turn_control.py` — `current_tool_execution_context` / `request_current_turn_defer`
+- `agent/external_pause.py` — 外部処理の予約中に同じリクエストを保留する provider 境界と待機時計
 
 **upstream のファイルに fork が足した口**（シンボル名で upstream 0 hit）:
 
@@ -79,6 +80,28 @@ castle の plugin は upstream 由来の hook も使う。こちらは rename �
 見張っているのは castle の `scripts/check-hermes-tool-surface.py`
 （`--mode preflight | check | apply | verify-runtime`）と
 `scripts/setup-hermes-discord.sh`。
+
+### H3 実行中のローカル推論の保留
+
+fork 固有の `agent.backend_scheduler.external_pause_file` と
+`external_pause_base_url` は、castle が default / Discord の両 profile に設定する。
+既定値は未設定で、指定した base URL と一致する推論だけが対象になる。
+環境変数による動作切り替えは追加していない。
+
+予約中は次の provider 呼び出しの前で待ち、scheduler の使用権を返す。
+改善処理の fork、実行済みツールの結果、prompt / tool schema / 履歴を維持するため、
+終了後は同じリクエストから続ける。proxy が返す専用の 503 理由だけを同じ引数で
+再試行し、通常エラーの retry / fallback 予算は消費しない。
+
+改善開始の待機期限は予約中に進めない。圧縮処理では、その試行が実際に保留された
+時間だけを期限から除外する。送信済み provider と DB commit の監視期限、
+ユーザーの中断、セッションの終了によるキャンセルは維持する。
+再起動をまたぐ実行中 fork の復元は対象外。
+
+予約作成、proxy 全経路の受付停止、実行中リクエストの完了待ち、親モデルの
+実プロセス終了確認、H3 の終了確認と予約解除は castle の `h3-exclusive` が担当する。
+予約ファイルは controller の終了や時刻だけでは解除しない。詳細は castle の
+`docs/local-llm-operations.md`、回帰テストは `tests/agent/test_external_pause.py`。
 
 ### 1.4 revision pin と「working tree は常に clean」制約
 

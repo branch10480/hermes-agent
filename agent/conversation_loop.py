@@ -5470,6 +5470,12 @@ def _run_conversation_core(
                 break
 
             except Exception as api_error:
+                from agent import external_pause
+                if (external_pause.configured_path(agent.base_url) is not None
+                        and external_pause.rejected(api_error)):
+                    # No inference was admitted. Preserve this fork and request,
+                    # and do not charge a model retry or try a fallback provider.
+                    continue
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:

@@ -1601,6 +1601,19 @@ def _run_review_body(
     acknowledge or the next live turn pays the full cancellation timeout.
     """
     if idle_gated:
+        from agent import external_pause
+        try:
+            external_pause.wait(
+                getattr(agent, "base_url", ""),
+                should_abort=lambda: (
+                    (cancellation_event is not None and cancellation_event.is_set())
+                    or (gate_handle is not None and gate_handle.cancelled)
+                    or (review_run is not None and review_run.cancel_requested.is_set())
+                ),
+            )
+        except InterruptedError:
+            finish_background_review_run(agent, review_run)
+            return
         busy = live_turn_registry.backend_busy_reason(exclude=idle_gate_exclude)
         if busy:
             logger.debug(

@@ -77,6 +77,9 @@ DEFAULT_CONFIG = {
         # call, not a whole turn, so a long agentic turn keeps giving the slot
         # back between tool calls.
         "backend_scheduler": {
+            # Explicit shared reservation, optional and exact-endpoint scoped.
+            "external_pause_file": None,
+            "external_pause_base_url": None,
             # auto  — engage only for a local endpoint (loopback, private
             #         range, Tailscale, container DNS). Hosted providers have
             #         their own concurrency and rate limits and are left

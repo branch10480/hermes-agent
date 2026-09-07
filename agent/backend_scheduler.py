@@ -477,7 +477,53 @@ def _wait_for_grant(
 # Public API
 # ---------------------------------------------------------------------------
 
-def acquire(
+@contextmanager
+def yield_for_external_pause(base_url, *, should_abort=None):
+    """An auxiliary call must not hold a foreground permit while suspended."""
+    from agent import external_pause
+    state = _thread_state()
+    held = state.ticket
+    depth = state.depth
+    suspended = held is not None
+    if suspended:
+        # Park the complete nesting stack; none of its providers is executing.
+        state.depth = 1
+        release(held)
+    try:
+        yield
+    finally:
+        if suspended and not (should_abort and should_abort()):
+            replacement = acquire(
+                _AuxiliaryCaller(base_url=base_url, session_id=held.session),
+                priority=held.priority, should_abort=should_abort,
+            )
+            if replacement is not None:
+                # Outer context managers still own `held`. Preserve its object
+                # identity so their finally releases the newly acquired permit.
+                with _lock:
+                    held.__dict__.update(replacement.__dict__)
+                    _active[held.seq] = held
+                    state.ticket, state.depth = held, depth
+
+
+def acquire(agent=None, *, priority=None, on_wait=None, should_abort=None, config=None):
+    """Keep external reservation waits outside the priority queue and its budget."""
+    from agent import external_pause
+    cfg = config if config is not None else settings()
+    endpoint = getattr(agent, "base_url", "")
+    while True:
+        external_pause.wait(endpoint, should_abort=should_abort)
+        ticket = _acquire(agent, priority=priority, on_wait=on_wait,
+                          should_abort=should_abort, config=cfg)
+        if not external_pause.active(endpoint):
+            if should_abort and should_abort():
+                release(ticket)
+                raise InterruptedError("backend admission cancelled")
+            return ticket
+        release(ticket)
+
+
+def _acquire(
     agent: Any = None,
     *,
     priority: Optional[int] = None,
@@ -784,6 +830,8 @@ def acquire_auxiliary(
             should_abort=should_abort,
             config=cfg,
         )
+    except InterruptedError:
+        raise
     except Exception:
         logger.debug("auxiliary backend admission failed", exc_info=True)
         return None

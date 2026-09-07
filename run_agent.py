@@ -2174,7 +2174,8 @@ class AIAgent:
                 self._background_review_cancel_event = cancel_event
                 return True
 
-        if delay <= 0 and not _busy_reason():
+        from agent.external_pause import active as external_busy
+        if delay <= 0 and not external_busy(getattr(self, "base_url", "")) and not _busy_reason():
             self._cancel_background_review_timer()
             if _launch_allowed() and _install_cancel_event():
                 _start_review_thread()
@@ -2185,8 +2186,10 @@ class AIAgent:
         # up to ``idle_gate_max_wait_seconds`` (<= 0 waits indefinitely). Giving
         # up is cheap: the next turn that trips the nudge interval spawns the
         # review again.
+        from agent.external_pause import PauseClock, active as external_busy
+        idle_clock = PauseClock(getattr(self, "base_url", ""))
         deadline = (
-            time.monotonic() + gate_max_wait
+            idle_clock() + gate_max_wait
             if gate_enabled and gate_max_wait > 0
             else None
         )
@@ -2203,7 +2206,9 @@ class AIAgent:
                     if getattr(self, "_background_review_timer", None) is not timer_ref:
                         return
                     self._background_review_timer = None
-            busy = _busy_reason()
+            externally_paused = external_busy(getattr(self, "base_url", ""))
+            budget_now = idle_clock()
+            busy = "external inference reservation" if externally_paused else _busy_reason()
             if not busy:
                 # Keep ``_background_review_cancel_event`` installed until the
                 # review fork registers itself. A foreground turn arriving after
@@ -2211,7 +2216,7 @@ class AIAgent:
                 # cancel the launch without racing a hidden API call.
                 _start_review_thread()
                 return
-            if deadline is not None and time.monotonic() >= deadline:
+            if not externally_paused and deadline is not None and budget_now >= deadline:
                 logger.debug(
                     "background review gave up waiting for an idle backend: %s",
                     busy,

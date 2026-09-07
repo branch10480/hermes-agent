@@ -714,7 +714,8 @@ class CompressionCommitFence:
         # ContextCompressor._call_summary_llm). Waiters use it to distinguish
         # a SLOW-but-alive summary model from a HUNG one, so slow models are
         # not killed by a fixed wall-clock deadline while tokens are moving.
-        self._last_progress = time.monotonic()
+        self._clock = time.monotonic
+        self._last_progress = self._clock()
         self._progress_observed = False
         self._deadline: float | None = None
         self._retain_cancelled_lock_until_worker_done = False
@@ -726,7 +727,7 @@ class CompressionCommitFence:
         seconds = float(seconds)
         if seconds <= 0:
             raise ValueError("total compression ceiling must be positive")
-        self._deadline = time.monotonic() + seconds
+        self._deadline = self._clock() + seconds
 
     def touch_progress(self) -> None:
         """Record forward progress (e.g. a streamed summary token arriving).
@@ -735,7 +736,7 @@ class CompressionCommitFence:
         :meth:`seconds_since_progress`. A bare float store is atomic in
         CPython, so no lock is needed.
         """
-        self._last_progress = time.monotonic()
+        self._last_progress = self._clock()
         self._progress_observed = True
 
     @property
@@ -746,11 +747,11 @@ class CompressionCommitFence:
     @property
     def deadline_exceeded(self) -> bool:
         deadline = self._deadline
-        return deadline is not None and time.monotonic() >= deadline
+        return deadline is not None and self._clock() >= deadline
 
     def seconds_since_progress(self) -> float:
         """Seconds since the worker last reported forward progress."""
-        return max(0.0, time.monotonic() - self._last_progress)
+        return max(0.0, self._clock() - self._last_progress)
 
     def cancel_before_commit(self, cancel_event: Any = None) -> bool:
         """Cancel a pending commit, or wait for an active commit to finish.
@@ -1477,6 +1478,14 @@ def run_compress_context_with_progress_timeout(
     ceiling = max(float(total_ceiling_seconds), float(idle_timeout_seconds))
     idle = float(idle_timeout_seconds)
     fence = fence if fence is not None else CompressionCommitFence()
+    if telemetry_agent is not None:
+        from agent import external_pause, backend_scheduler
+        endpoint = backend_scheduler.auxiliary_endpoint(
+            "compression", main_base_url=getattr(telemetry_agent, "base_url", "")
+        )
+        if external_pause.configured_path(endpoint) is not None:
+            fence._clock = external_pause.WaitClock()
+    budget_clock = fence._clock
     fence.set_total_ceiling_seconds(ceiling)
     # Sync mirror of gateway session-hygiene's run_in_executor(None, ...) +
     # wait_for loop (gateway/run.py): offload compress_context onto the shared
@@ -1526,7 +1535,13 @@ def run_compress_context_with_progress_timeout(
                 "Skipping stale compression job: fence cancelled before start"
             )
             return messages, ""
-        return worker(worker_fence)
+        from agent import external_pause
+        clock = worker_fence._clock
+        token = external_pause.wait_clock.set(clock if isinstance(clock, external_pause.WaitClock) else None)
+        try:
+            return worker(worker_fence)
+        finally:
+            external_pause.wait_clock.reset(token)
 
     # Bare pool workers start with an empty ContextVar map; propagate the
     # parent conversation/approval context into the worker.
@@ -1538,7 +1553,7 @@ def run_compress_context_with_progress_timeout(
         _release_compression_admission()
         raise
     future.add_done_callback(_release_compression_admission)
-    wait_started = time.monotonic()
+    wait_started = budget_clock()
     # F2: EVERY host unwind (KeyboardInterrupt, task cancellation, unexpected
     # exception while waiting) must revoke future commit admission before the
     # host resumes, or a detached worker could later commit and mutate durable
@@ -1548,7 +1563,7 @@ def run_compress_context_with_progress_timeout(
     handled_exit = False
     try:
         while True:
-            waited = time.monotonic() - wait_started
+            waited = budget_clock() - wait_started
             remaining_ceiling = ceiling - waited
             if remaining_ceiling <= 0:
                 break
@@ -1558,14 +1573,18 @@ def run_compress_context_with_progress_timeout(
             # previous slice would allow silence to approach 2x the budget.
             since_progress = fence.seconds_since_progress()
             wait_slice = min(
-                max(idle - since_progress, 0.005), remaining_ceiling
+                max(idle - since_progress, 0.005), remaining_ceiling,
+                1.0 if hasattr(budget_clock, "paused") else remaining_ceiling
             )
             try:
                 result = future.result(timeout=wait_slice)
                 handled_exit = True
                 return result
             except concurrent.futures.TimeoutError:
-                waited = time.monotonic() - wait_started
+                if getattr(budget_clock, "paused", False):
+                    budget_clock()
+                    continue
+                waited = budget_clock() - wait_started
                 since_progress = fence.seconds_since_progress()
                 if (
                     not fence.deadline_exceeded
@@ -1588,7 +1607,7 @@ def run_compress_context_with_progress_timeout(
         future.cancel()
 
         total_exhausted = (
-            time.monotonic() - wait_started >= ceiling or fence.deadline_exceeded
+            budget_clock() - wait_started >= ceiling or fence.deadline_exceeded
         )
         if total_exhausted:
             # A total-ceiling candidate can still be unwinding a healthy
@@ -1638,7 +1657,7 @@ def run_compress_context_with_progress_timeout(
             overrun_surfaced = False
             overrun_reports = 0
             while True:
-                waited = time.monotonic() - wait_started
+                waited = budget_clock() - wait_started
                 remaining = ceiling - waited
                 if remaining <= 0:
                     # Ceiling breached while the commit is in flight. Wait in
@@ -1719,7 +1738,7 @@ def run_compress_context_with_progress_timeout(
                     min(_CANCELLED_WORKER_TEARDOWN_GRACE_SECONDS, ceiling),
                 )
         fence.release_cancelled_compression_lock()
-        waited = time.monotonic() - wait_started
+        waited = budget_clock() - wait_started
         since_progress = fence.seconds_since_progress()
         # The durable lease is free again (above), so a fallback attempt can
         # acquire it immediately. Run it BEFORE on_timeout: that callback
