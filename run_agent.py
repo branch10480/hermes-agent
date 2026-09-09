@@ -7933,6 +7933,138 @@ class AIAgent:
 
         return changed
 
+    def _tool_images_relocate_preemptively(self) -> bool:
+        """True when this session learned that the active (provider, model)
+        rejects image parts inside ``role: "tool"`` messages but accepts them
+        in ``role: "user"`` messages (see
+        ``_try_relocate_tool_image_parts_to_user_message``)."""
+        key = (
+            (getattr(self, "provider", "") or "").strip().lower(),
+            (getattr(self, "model", "") or "").strip(),
+        )
+        learned = getattr(self, "_tool_image_relocation_models", None)
+        return bool(learned and key in learned)
+
+    def _remember_tool_image_relocation(self) -> None:
+        """Record the active (provider, model) as needing tool-image
+        relocation.  Called only after a relocated retry actually succeeded,
+        so an unrelated 400 on a provider that accepts tool images never
+        changes this session's request shape."""
+        key = (
+            (getattr(self, "provider", "") or "").strip().lower(),
+            (getattr(self, "model", "") or "").strip(),
+        )
+        if not key[1]:
+            return
+        if not hasattr(self, "_tool_image_relocation_models"):
+            self._tool_image_relocation_models = set()
+        self._tool_image_relocation_models.add(key)
+
+    def _try_relocate_tool_image_parts_to_user_message(self, api_messages: list) -> bool:
+        """Move image parts out of tool messages into the following user message.
+
+        Some OpenAI-compatible local servers (antirez/ds4 ``ds4-server``) only
+        accept image parts on ``role: "user"`` messages and answer a generic
+        HTTP 400 ``invalid JSON request`` when a ``role: "tool"`` message
+        carries ``image_url`` content.  Unlike
+        ``_try_strip_image_parts_from_tool_messages`` this keeps the pixels
+        visible to a vision-capable model: every image-bearing tool message
+        is downgraded to its text part(s), and the collected image parts are
+        placed in one ``role: "user"`` message right after the tool-result
+        block they came from.  When a real user message already follows the
+        block the images are prepended to it instead of inserting a second
+        user message, so the tool_call / tool_result pairing and strict role
+        alternation both stay intact.
+
+        Operates on the per-call ``api_messages`` list only: entries are
+        clones of canonical history and ``content`` is replaced on a fresh
+        dict rather than mutated, so stored history keeps the multimodal
+        tool result.  Nothing is learned here — the caller records the
+        (provider, model) via ``_remember_tool_image_relocation`` once the
+        relocated retry succeeds.
+
+        Returns True when at least one tool message was rewritten.
+        """
+        if not isinstance(api_messages, list):
+            return False
+
+        rewritten: list = []
+        pending_images: list = []
+        pending_names: list = []
+        changed = False
+
+        def _note() -> Dict[str, Any]:
+            names = ", ".join(dict.fromkeys(pending_names)) or "tool"
+            return {
+                "type": "text",
+                "text": f"[Image(s) from the preceding {names} result(s).]",
+            }
+
+        def _flush(next_msg: Any) -> bool:
+            """Emit pending images; returns True if merged into ``next_msg``."""
+            if not pending_images:
+                return False
+            parts = [_note(), *pending_images]
+            merged = False
+            if isinstance(next_msg, dict) and next_msg.get("role") == "user":
+                existing = next_msg.get("content", "")
+                if isinstance(existing, str):
+                    if existing:
+                        parts.append({"type": "text", "text": existing})
+                elif isinstance(existing, list):
+                    parts.extend(existing)
+                user_copy = dict(next_msg)
+                user_copy["content"] = parts
+                rewritten.append(user_copy)
+                merged = True
+            else:
+                rewritten.append({"role": "user", "content": parts})
+            pending_images.clear()
+            pending_names.clear()
+            return merged
+
+        for msg in api_messages:
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                if not _flush(msg):
+                    rewritten.append(msg)
+                continue
+            content = msg.get("content")
+            if not self._content_has_image_parts(content):
+                rewritten.append(msg)
+                continue
+
+            text_parts: List[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    if part.strip():
+                        text_parts.append(part.strip())
+                    continue
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if ptype in {"image_url", "input_image"}:
+                    pending_images.append(part)
+                elif ptype in {"text", "input_text"}:
+                    text = str(part.get("text") or "").strip()
+                    if text:
+                        text_parts.append(text)
+            pending_names.append(str(msg.get("name") or "tool"))
+
+            new_msg = dict(msg)
+            new_msg["content"] = (
+                "\n\n".join(text_parts)
+                if text_parts
+                else "[image attached in the following user message]"
+            )
+            rewritten.append(new_msg)
+            changed = True
+        _flush(None)
+
+        if not changed:
+            return False
+        api_messages[:] = rewritten
+        return True
+
     def _anthropic_preserve_dots(self) -> bool:
         """True when using an anthropic-compatible endpoint that preserves dots in model names.
         Alibaba/DashScope keeps dots (e.g. qwen3.5-plus).

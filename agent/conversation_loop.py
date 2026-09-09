@@ -3187,6 +3187,14 @@ def _run_conversation_core(
                 turn_id=turn_id,
             )
 
+        # Servers that reject image parts on tool messages (learned from an
+        # earlier 400 this session) get the images moved to a user message
+        # up front, so every screenshot after the first one costs no extra
+        # round trip.  Runs before the user-merge pass below so the
+        # relocated user message folds into an adjacent real user turn.
+        if agent._tool_images_relocate_preemptively():
+            agent._try_relocate_tool_image_parts_to_user_message(api_messages)
+
         # Drop thinking-only assistant turns (reasoning but no visible
         # output and no tool_calls) and merge any adjacent user messages
         # left behind. Prevents Anthropic 400s ("The final block in an
@@ -5412,6 +5420,11 @@ def _run_conversation_core(
                         )
                 
                 _retry.has_retried_429 = False  # Reset on success
+                if _retry.tool_image_relocation_pending:
+                    # The relocated retry went through: remember the
+                    # (provider, model) so later requests relocate up front.
+                    _retry.tool_image_relocation_pending = False
+                    agent._remember_tool_image_relocation()
                 # Note: don't clear the retry buffer here — an "API call
                 # success" only means we got bytes back, not that we got
                 # usable content. Empty responses still loop through the
@@ -5896,6 +5909,37 @@ def _run_conversation_core(
                             "image-corrupt recovery: no image parts found to "
                             "strip; surfacing original error."
                         )
+
+                # Tool-image relocation recovery: servers such as ds4-server
+                # accept image parts only on user messages and answer a
+                # generic 400 ("invalid JSON request") for image-bearing tool
+                # messages, so no message pattern identifies them.  On a 400
+                # that no image-specific branch above claimed, and whose
+                # request carried images inside tool messages, move those
+                # images to the following user message (keeping them visible
+                # to the model) and retry once.  The (provider, model) is
+                # remembered for preemptive relocation only after that retry
+                # succeeds (see the success path), so unrelated 400s on
+                # providers that accept tool images never reshape later
+                # requests.
+                if (
+                    status_code == 400
+                    and classified.reason not in (
+                        FailoverReason.image_too_large,
+                        FailoverReason.image_corrupt,
+                        FailoverReason.multimodal_tool_content_unsupported,
+                    )
+                    and not _retry.tool_image_relocation_retry_attempted
+                ):
+                    _retry.tool_image_relocation_retry_attempted = True
+                    if agent._try_relocate_tool_image_parts_to_user_message(api_messages):
+                        _retry.tool_image_relocation_pending = True
+                        agent._vprint(
+                            f"{agent.log_prefix}📐 Provider rejected image parts in tool "
+                            f"messages — moved them to a user message and retrying...",
+                            force=True,
+                        )
+                        continue
 
                 # Anthropic OAuth subscription rejected the 1M-context beta
                 # header ("long context beta is not yet available for this

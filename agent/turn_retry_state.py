@@ -61,6 +61,10 @@ class TurnRetryState:
     native_compaction_reject_retry_attempted: bool = False
     image_shrink_retry_attempted: bool = False
     multimodal_tool_content_retry_attempted: bool = False
+    tool_image_relocation_retry_attempted: bool = False
+    # Set when a relocated retry is in flight; the success path turns it
+    # into a remembered (provider, model) so later requests relocate up front.
+    tool_image_relocation_pending: bool = False
     oauth_1m_beta_retry_attempted: bool = False
     llama_cpp_grammar_retry_attempted: bool = False
 

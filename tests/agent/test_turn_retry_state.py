@@ -26,6 +26,8 @@ EXPECTED_FIELDS = {
     "native_compaction_reject_retry_attempted",
     "image_shrink_retry_attempted",
     "multimodal_tool_content_retry_attempted",
+    "tool_image_relocation_retry_attempted",
+    "tool_image_relocation_pending",
     "oauth_1m_beta_retry_attempted",
     "llama_cpp_grammar_retry_attempted",
     "primary_recovery_attempted",
