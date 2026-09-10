@@ -6,6 +6,7 @@ import base64
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 
 from agent.image_routing import (
     _coerce_capability_bool,
@@ -313,6 +314,39 @@ class TestBuildNativeContentParts:
         assert text_part["text"].count("[Image attached at:") == 2
         assert str(img1) in text_part["text"]
         assert str(img2) in text_part["text"]
+
+    @pytest.mark.parametrize("fmt,suffix", [("WEBP", ".webp"), ("GIF", ".gif")])
+    def test_webp_and_gif_are_transcoded_to_png(self, tmp_path: Path, fmt, suffix):
+        """WebP/GIF must not reach the model as-is.
+
+        Cloud providers accept them, but the local ds4-server only decodes
+        PNG/JPEG data URIs and rejects anything else with a non-retryable
+        HTTP 400 ("invalid JSON request") -- a Discord WebP upload used to
+        kill the whole turn. PNG/JPEG is the intersection, so both formats
+        go through the Pillow transcode like AVIF/HEIC/BMP.
+        """
+        from PIL import Image
+
+        img = tmp_path / f"sticker{suffix}"
+        Image.new("RGB", (4, 4), "red").save(img, format=fmt)
+        parts, skipped = build_native_content_parts("look", [str(img)])
+        assert skipped == []
+        image_part = next(p for p in parts if p.get("type") == "image_url")
+        url = image_part["image_url"]["url"]
+        assert url.startswith("data:image/png;base64,")
+        assert base64.b64decode(url.split(",", 1)[1]).startswith(b"\x89PNG\r\n\x1a\n")
+
+    def test_jpeg_passes_through_untouched(self, tmp_path: Path):
+        from PIL import Image
+
+        img = tmp_path / "photo.jpg"
+        Image.new("RGB", (4, 4), "blue").save(img, format="JPEG")
+        parts, skipped = build_native_content_parts("look", [str(img)])
+        assert skipped == []
+        image_part = next(p for p in parts if p.get("type") == "image_url")
+        url = image_part["image_url"]["url"]
+        assert url.startswith("data:image/jpeg;base64,")
+        assert base64.b64decode(url.split(",", 1)[1]) == img.read_bytes()
 
 
 

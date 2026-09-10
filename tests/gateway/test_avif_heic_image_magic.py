@@ -286,3 +286,24 @@ class TestVisionToolsAcceptsIsoBmff:
         out_path, mime, err = _normalize_to_supported_image(src, "image/png")
 
         assert (out_path, mime, err) == (src, "image/png", None)
+
+    @pytest.mark.parametrize("fmt,mime", [("WEBP", "image/webp"), ("GIF", "image/gif")])
+    def test_webp_and_gif_are_transcoded_to_png(self, tmp_path, fmt, mime):
+        """WebP/GIF are outside the PNG/JPEG intersection every backend takes.
+
+        Anthropic ingests them, but the local ds4-server only decodes
+        PNG/JPEG data URIs and answers anything else with a non-retryable
+        HTTP 400 ("invalid JSON request"), which baked into history would
+        wedge the session. Normalisation therefore transcodes them too.
+        """
+        from PIL import Image
+
+        src = tmp_path / f"sticker.{fmt.lower()}"
+        Image.new("RGB", (4, 4), "red").save(src, format=fmt)
+
+        out_path, out_mime, err = _normalize_to_supported_image(src, mime)
+
+        assert err is None
+        assert out_mime == "image/png"
+        assert out_path is not None and out_path != src
+        assert out_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")

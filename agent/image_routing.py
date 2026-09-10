@@ -710,11 +710,19 @@ def _sniff_mime_from_bytes(raw: bytes) -> Optional[str]:
     return None
 
 
-# Formats every major vision provider (Anthropic, OpenAI, Gemini, Bedrock)
-# accepts natively. Anything outside this set has to be transcoded to PNG
-# before we declare media_type, otherwise the provider returns HTTP 400
-# ("Could not process image" / "Unsupported image media type") and the
-# whole turn fails with no salvage path.
+# Formats every vision backend we route to accepts natively. Anything
+# outside this set has to be transcoded to PNG before we declare
+# media_type, otherwise the provider returns HTTP 400 ("Could not process
+# image" / "Unsupported image media type") and the whole turn fails with
+# no salvage path.
+#
+# Cloud providers (Anthropic, OpenAI, Gemini, Bedrock) also ingest GIF and
+# WebP, but the local ds4-server (castle's DeepSeek V4 Vision engine) only
+# decodes PNG/JPEG data URIs and rejects everything else as
+# "invalid JSON request" (HTTP 400, non-retryable). A Discord WebP upload
+# therefore killed the whole turn. PNG/JPEG is the intersection, so GIF and
+# WebP are transcoded too; cloud providers only ever used the first GIF
+# frame anyway, so nothing is lost.
 #
 # Discord (and a few other chat platforms) freely accept attachments in
 # formats outside this set -- AVIF screenshots from Chromium, HEIC from
@@ -722,7 +730,7 @@ def _sniff_mime_from_bytes(raw: bytes) -> Optional[str]:
 # do hit this in practice. SVG is vector and Pillow cannot rasterize it;
 # it is skipped (logged) rather than transcoded.
 _UNIVERSALLY_SUPPORTED_MIMES = frozenset({
-    "image/png", "image/jpeg", "image/gif", "image/webp",
+    "image/png", "image/jpeg",
 })
 
 
@@ -814,11 +822,12 @@ def _file_to_data_url(path: Path) -> Optional[str]:
     quality tax just because one other provider is stricter.
 
     Format compatibility IS handled here: if the sniffed MIME isn't one
-    of ``_UNIVERSALLY_SUPPORTED_MIMES`` (i.e. it's something like AVIF,
-    HEIC, BMP, TIFF, or ICO that some providers reject outright), we
-    transcode to PNG with Pillow before declaring media_type. This fixes
+    of ``_UNIVERSALLY_SUPPORTED_MIMES`` (i.e. it's something like WebP,
+    GIF, AVIF, HEIC, BMP, TIFF, or ICO that some backend rejects outright),
+    we transcode to PNG with Pillow before declaring media_type. This fixes
     the user-visible "Could not process image" HTTP 400 from Anthropic on
-    Discord-attached AVIF/HEIC/BMP files.
+    Discord-attached AVIF/HEIC/BMP files and the "invalid JSON request"
+    HTTP 400 from the local ds4-server on Discord-attached WebP/GIF files.
 
     Returns None if the file can't be read OR if the format isn't
     universally supported AND Pillow can't transcode it (Pillow missing,

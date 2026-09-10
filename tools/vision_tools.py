@@ -294,9 +294,20 @@ def _detect_image_mime_type_from_bytes(data: bytes) -> Optional[str]:
 # immutable conversation history and re-sent every turn, embedding an
 # unsupported media_type permanently wedges the session (retries re-send the
 # same bad bytes).  We MUST normalize to one of these before embedding.
+#
+# Kept to the PNG/JPEG intersection rather than Anthropic's full
+# jpeg/png/gif/webp list: the local ds4-server (castle's DeepSeek V4 Vision
+# engine) only decodes PNG/JPEG data URIs and answers anything else with a
+# non-retryable HTTP 400 ("invalid JSON request"). GIF/WebP go through the
+# same Pillow transcode as BMP/TIFF (first frame for animations, which is
+# all the cloud providers used anyway).
 _ANTHROPIC_SUPPORTED_MEDIA_TYPES = frozenset(
-    {"image/jpeg", "image/png", "image/gif", "image/webp"}
+    {"image/jpeg", "image/png"}
 )
+
+# Formats Pillow decodes natively that we transcode anyway (see above). They
+# get the full animation-bounded decode validation before transcode.
+_PILLOW_NATIVE_TRANSCODE_MIMES = frozenset({"image/gif", "image/webp"})
 
 
 def _rasterize_svg_to_png(svg_path: Path, out_path: Path) -> bool:
@@ -364,6 +375,17 @@ def _normalize_to_supported_image(
     """
     if detected_mime in _ANTHROPIC_SUPPORTED_MEDIA_TYPES:
         return image_path, detected_mime, None
+
+    if detected_mime in _PILLOW_NATIVE_TRANSCODE_MIMES:
+        # GIF/WebP are transcoded only because the local ds4-server cannot
+        # decode them, and they are the formats that can carry animations.
+        # Run the frame-bounded full decode validation on the ORIGINAL bytes
+        # before Pillow touches them for transcode, so a truncated or
+        # oversized animation is rejected up front and the "every frame
+        # validated before history" gate (#76896) keeps its contract.
+        decode_error = _validate_raster_image_decodable(image_path)
+        if decode_error:
+            return None, None, decode_error
 
     out_dir = get_hermes_dir("cache/vision", "temp_vision_images")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1310,8 +1332,9 @@ async def _vision_analyze_native(
         await asyncio.to_thread(temp_image_path.write_bytes, resolved.data)
         should_cleanup = True
 
-        # Normalize unsupported formats (SVG, BMP, ...) to PNG BEFORE embedding.
-        # Anthropic only accepts jpeg/png/gif/webp; an unsupported media_type
+        # Normalize unsupported formats (SVG, BMP, WebP, GIF, ...) to PNG BEFORE
+        # embedding. Anthropic only accepts jpeg/png/gif/webp and the local
+        # ds4-server only png/jpeg; an unsupported media_type
         # baked into immutable history wedges the session with a 400 on every
         # resume.  Convert here so it can never enter history. Offloaded — the
         # rasterizers/Pillow are blocking.
