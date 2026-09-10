@@ -786,6 +786,107 @@ def _transcode_to_png(raw: bytes) -> Optional[bytes]:
         return None
 
 
+# The local ds4-server (castle's DeepSeek V4 Vision engine) decodes images
+# with the dependency-free IRIS decoders, which reject two common variants
+# that every cloud provider accepts: progressive (SOF2) JPEG -- what
+# Discord's CDN, Chromium and most photo pipelines emit -- and 16-bit PNG.
+# Either one answers with a non-retryable HTTP 400 ("invalid or unsupported
+# JPEG image" / "... PNG image") that kills the whole turn. Rewrite them to
+# baseline JPEG / 8-bit PNG before they are embedded.
+_JPEG_SOF_BASELINE = 0xC0
+
+
+def _jpeg_sof_marker(raw: bytes) -> Optional[int]:
+    """Return the SOFn marker code of a JPEG stream (0xC0 baseline, 0xC2
+    progressive, ...) or None when no SOF precedes the first scan."""
+    if not raw.startswith(b"\xff\xd8"):
+        return None
+    i, n = 2, len(raw)
+    while i + 4 <= n:
+        if raw[i] != 0xFF:
+            i += 1
+            continue
+        marker = raw[i + 1]
+        if marker == 0xFF:  # fill byte
+            i += 1
+            continue
+        if marker in (0x01, 0xD8) or 0xD0 <= marker <= 0xD7:  # standalone
+            i += 2
+            continue
+        if marker in (0xD9, 0xDA):  # EOI / SOS before any SOF
+            return None
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            return marker
+        seg_len = int.from_bytes(raw[i + 2:i + 4], "big")
+        if seg_len < 2:
+            return None
+        i += 2 + seg_len
+    return None
+
+
+def _jpeg_needs_baseline(raw: bytes) -> bool:
+    sof = _jpeg_sof_marker(raw)
+    return sof is not None and sof != _JPEG_SOF_BASELINE
+
+
+def _png_bit_depth(raw: bytes) -> Optional[int]:
+    if len(raw) >= 29 and raw.startswith(b"\x89PNG\r\n\x1a\n") and raw[12:16] == b"IHDR":
+        return raw[24]
+    return None
+
+
+def _reencode_jpeg_baseline(raw: bytes) -> Optional[bytes]:
+    """Re-encode a JPEG as baseline (sequential DCT) with Pillow.
+
+    EXIF orientation is applied to the pixels first because the EXIF block
+    is dropped on save; the picture stays upright for every backend.
+    Returns None if Pillow is missing or cannot decode the input.
+    """
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:
+        return None
+    try:
+        from io import BytesIO
+
+        with Image.open(BytesIO(raw)) as im:
+            upright = ImageOps.exif_transpose(im) or im
+            if upright.mode != "RGB":
+                upright = upright.convert("RGB")
+            buf = BytesIO()
+            upright.save(buf, format="JPEG", quality=92, progressive=False, optimize=False)
+            return buf.getvalue()
+    except Exception as exc:
+        logger.info("image_routing: Pillow could not re-encode JPEG as baseline -- %s", exc)
+        return None
+
+
+def _normalize_supported_raster(
+    raw: bytes, mime: str
+) -> Tuple[Optional[bytes], str, Optional[str]]:
+    """Rewrite PNG/JPEG variants the local vision decoder cannot read.
+
+    Returns ``(bytes, mime, note)``. ``note`` is None when the input was
+    left untouched, otherwise a short description of the rewrite. ``bytes``
+    is None when a rewrite was needed but failed; the caller should skip
+    the image rather than embed something the backend will reject.
+    """
+    if mime == "image/jpeg" and _jpeg_needs_baseline(raw):
+        out = _reencode_jpeg_baseline(raw)
+        if out is not None:
+            return out, "image/jpeg", "progressive JPEG -> baseline JPEG"
+        out = _transcode_to_png(raw)
+        if out is not None:
+            return out, "image/png", "progressive JPEG -> PNG"
+        return None, mime, "progressive JPEG could not be re-encoded"
+    if mime == "image/png" and _png_bit_depth(raw) == 16:
+        out = _transcode_to_png(raw)
+        if out is not None:
+            return out, "image/png", "16-bit PNG -> 8-bit PNG"
+        return None, mime, "16-bit PNG could not be re-encoded"
+    return raw, mime, None
+
+
 def _guess_mime(path: Path, raw: Optional[bytes] = None) -> str:
     """Return image MIME type for *path*.
 
@@ -868,6 +969,20 @@ def _file_to_data_url(path: Path) -> Optional[str]:
         )
         raw = transcoded
         mime = "image/png"
+    else:
+        raw, mime, note = _normalize_supported_raster(raw, mime)
+        if raw is None:
+            logger.warning(
+                "image_routing: %s could not be re-encoded for the vision "
+                "backend (%s); skipping this attachment.",
+                path, note,
+            )
+            return None
+        if note:
+            logger.info(
+                "image_routing: re-encoded %s (%s) for decoder compatibility",
+                path.name, note,
+            )
     b64 = base64.b64encode(raw).decode("ascii")
     return f"data:{mime};base64,{b64}"
 

@@ -287,6 +287,46 @@ class TestVisionToolsAcceptsIsoBmff:
 
         assert (out_path, mime, err) == (src, "image/png", None)
 
+    def test_progressive_jpeg_is_rewritten_as_baseline(self, tmp_path):
+        """The local ds4-server rejects progressive JPEG (and 16-bit PNG)
+        with a non-retryable 400, so normalisation rewrites those variants
+        even though the media_type itself is supported."""
+        from PIL import Image
+
+        from agent.image_routing import _jpeg_sof_marker
+
+        src = tmp_path / "cdn.jpg"
+        Image.new("RGB", (16, 16), "red").save(src, format="JPEG", progressive=True)
+
+        out_path, mime, err = _normalize_to_supported_image(src, "image/jpeg")
+
+        assert err is None
+        assert mime == "image/jpeg"
+        assert out_path is not None and out_path != src
+        assert _jpeg_sof_marker(out_path.read_bytes()) == 0xC0
+
+    def test_baseline_jpeg_is_passed_through_untouched(self, tmp_path):
+        from PIL import Image
+
+        src = tmp_path / "photo.jpg"
+        Image.new("RGB", (16, 16), "blue").save(src, format="JPEG")
+
+        assert _normalize_to_supported_image(src, "image/jpeg") == (src, "image/jpeg", None)
+
+    def test_16bit_png_is_rewritten_as_8bit(self, tmp_path):
+        from PIL import Image
+
+        src = tmp_path / "depth.png"
+        Image.new("I;16", (16, 16), 1000).save(src, format="PNG")
+        assert src.read_bytes()[24] == 16
+
+        out_path, mime, err = _normalize_to_supported_image(src, "image/png")
+
+        assert err is None
+        assert mime == "image/png"
+        assert out_path is not None and out_path != src
+        assert out_path.read_bytes()[24] == 8
+
     @pytest.mark.parametrize("fmt,mime", [("WEBP", "image/webp"), ("GIF", "image/gif")])
     def test_webp_and_gif_are_transcoded_to_png(self, tmp_path, fmt, mime):
         """WebP/GIF are outside the PNG/JPEG intersection every backend takes.

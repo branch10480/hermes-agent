@@ -374,7 +374,29 @@ def _normalize_to_supported_image(
     unsupported media_type can never reach the provider and wedge the session.
     """
     if detected_mime in _ANTHROPIC_SUPPORTED_MEDIA_TYPES:
-        return image_path, detected_mime, None
+        # Even PNG/JPEG have variants the local ds4-server decoder rejects
+        # (progressive JPEG, 16-bit PNG). Shared helper with the native
+        # image-attach path so both routes hand the backend the same bytes.
+        from agent.image_routing import _normalize_supported_raster
+
+        fixed, fixed_mime, note = _normalize_supported_raster(
+            image_path.read_bytes(), detected_mime,
+        )
+        if fixed is None:
+            return (
+                None,
+                None,
+                f"Image could not be re-encoded for the vision backend ({note}). "
+                "Convert it to a baseline JPEG or 8-bit PNG and try again.",
+            )
+        if note is None:
+            return image_path, detected_mime, None
+        out_dir = get_hermes_dir("cache/vision", "temp_vision_images")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        suffix = ".jpg" if fixed_mime == "image/jpeg" else ".png"
+        out_path = out_dir / f"converted_{uuid.uuid4()}{suffix}"
+        out_path.write_bytes(fixed)
+        return out_path, fixed_mime, None
 
     if detected_mime in _PILLOW_NATIVE_TRANSCODE_MIMES:
         # GIF/WebP are transcoded only because the local ds4-server cannot

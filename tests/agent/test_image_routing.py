@@ -336,6 +336,54 @@ class TestBuildNativeContentParts:
         assert url.startswith("data:image/png;base64,")
         assert base64.b64decode(url.split(",", 1)[1]).startswith(b"\x89PNG\r\n\x1a\n")
 
+    def test_progressive_jpeg_is_reencoded_as_baseline(self, tmp_path: Path):
+        """The local ds4-server JPEG decoder rejects progressive (SOF2)
+        streams with a non-retryable 400; Discord's CDN emits them routinely."""
+        from PIL import Image
+
+        from agent.image_routing import _jpeg_sof_marker
+
+        img = tmp_path / "cdn.jpg"
+        Image.new("RGB", (16, 16), "red").save(img, format="JPEG", progressive=True)
+        assert _jpeg_sof_marker(img.read_bytes()) == 0xC2
+        parts, skipped = build_native_content_parts("look", [str(img)])
+        assert skipped == []
+        url = next(p for p in parts if p.get("type") == "image_url")["image_url"]["url"]
+        assert url.startswith("data:image/jpeg;base64,")
+        assert _jpeg_sof_marker(base64.b64decode(url.split(",", 1)[1])) == 0xC0
+
+    def test_progressive_jpeg_reencode_keeps_exif_orientation(self, tmp_path: Path):
+        """The EXIF block is dropped on re-encode, so orientation is baked
+        into the pixels first -- a rotated phone photo must not flip."""
+        from PIL import Image
+
+        img = tmp_path / "phone.jpg"
+        exif = Image.Exif()
+        exif[0x0112] = 6  # rotate 90 CW on display
+        Image.new("RGB", (20, 10), "red").save(
+            img, format="JPEG", progressive=True, exif=exif.tobytes()
+        )
+        parts, _ = build_native_content_parts("look", [str(img)])
+        url = next(p for p in parts if p.get("type") == "image_url")["image_url"]["url"]
+        from io import BytesIO
+
+        with Image.open(BytesIO(base64.b64decode(url.split(",", 1)[1]))) as out:
+            assert out.size == (10, 20)
+            assert not out.getexif().get(0x0112)
+
+    def test_16bit_png_is_reencoded_as_8bit(self, tmp_path: Path):
+        """The local ds4-server PNG decoder rejects 16-bit samples."""
+        from PIL import Image
+
+        img = tmp_path / "depth.png"
+        Image.new("I;16", (16, 16), 1000).save(img, format="PNG")
+        assert img.read_bytes()[24] == 16
+        parts, skipped = build_native_content_parts("look", [str(img)])
+        assert skipped == []
+        url = next(p for p in parts if p.get("type") == "image_url")["image_url"]["url"]
+        assert url.startswith("data:image/png;base64,")
+        assert base64.b64decode(url.split(",", 1)[1])[24] == 8
+
     def test_jpeg_passes_through_untouched(self, tmp_path: Path):
         from PIL import Image
 
