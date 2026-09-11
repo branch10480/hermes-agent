@@ -198,6 +198,15 @@ VALID_HOOKS: Set[str] = {
     # bounded by agent.max_verify_nudges.
     "pre_verify",
     "pre_api_request",
+    # Per-request tool visibility. Fired once per provider attempt with the
+    # names of the tools about to be serialized; a callback returns an
+    # iterable of names to omit from the wire request (or None). Only the
+    # request payload changes: agent.tools, tool execution and pre_tool_call
+    # gating are untouched, so a hidden tool the model still names is
+    # validated and gated exactly as before. Plugins decide per session
+    # (model / platform), which keeps the serialized tool prefix stable for
+    # prompt caching.
+    "filter_api_tools",
     "post_api_request",
     "api_request_error",
     # Context-pressure/checkpoint lifecycle. The core supplies generic timing
@@ -449,6 +458,7 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
     "pre_llm_call",
     "post_llm_call",
     "pre_api_request",
+    "filter_api_tools",
     "post_api_request",
     "api_request_error",
     "pre_verify",

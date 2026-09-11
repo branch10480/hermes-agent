@@ -609,6 +609,58 @@ def _backend_queue_notice(agent: Any):
     return _notice
 
 
+def _api_tool_name(tool: Any) -> str:
+    """Name of an OpenAI-style (``function.name``) or flat (``name``) tool schema."""
+    if not isinstance(tool, dict):
+        return ""
+    function = tool.get("function")
+    if isinstance(function, dict) and isinstance(function.get("name"), str):
+        return function["name"]
+    name = tool.get("name")
+    return name if isinstance(name, str) else ""
+
+
+def _filter_api_tools_for_request(
+    agent: Any, tools: Any, *, task_id: str = ""
+) -> Any:
+    """Drop tool schemas that a ``filter_api_tools`` plugin hook hides.
+
+    The hook sees the names about to be serialized and returns names to omit
+    from this request only. ``agent.tools`` and tool execution are untouched:
+    a hidden tool the model still names is validated and gated exactly as
+    before. Fail-open — a missing hook, a bad return value or an exception
+    keeps the full list.
+    """
+    if not tools:
+        return tools
+    try:
+        from hermes_cli.lifecycle import has_hook, invoke_hook
+
+        if not has_hook("filter_api_tools"):
+            return tools
+        names = [_api_tool_name(tool) for tool in tools]
+        results = invoke_hook(
+            "filter_api_tools",
+            session_id=getattr(agent, "session_id", "") or "",
+            task_id=task_id or "",
+            platform=getattr(agent, "platform", "") or "",
+            model=getattr(agent, "model", "") or "",
+            tool_names=list(names),
+        )
+    except Exception:
+        logger.debug(
+            "filter_api_tools hook failed; sending the full tool list", exc_info=True
+        )
+        return tools
+    hidden = set()
+    for result in results or ():
+        if isinstance(result, (list, tuple, set, frozenset)):
+            hidden.update(name for name in result if isinstance(name, str) and name)
+    if not hidden:
+        return tools
+    return [tool for tool, name in zip(tools, names) if name not in hidden]
+
+
 def _proactive_prune_armed(compressor: Any, observed_tokens: int) -> bool:
     """True when the deterministic prune's own trigger would let it run.
 
@@ -3255,6 +3307,10 @@ def _run_conversation_core(
             if thinking_budget_recovery_active or tool_guardrail_recovery_active
             else agent.tools
         )
+        if tools_for_api:
+            tools_for_api = _filter_api_tools_for_request(
+                agent, tools_for_api, task_id=effective_task_id
+            )
         if agent._use_prompt_caching and agent.provider != "moa":
             from agent.prompt_caching import (
                 envelope_tool_part_cache_markers_supported,
